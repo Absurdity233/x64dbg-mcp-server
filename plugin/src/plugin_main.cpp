@@ -13,6 +13,7 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 #include "util/trace_state.h"
+#include "util/event_log.h"
 #include "resources/plugin_icon.h"
 #include "ui/settings_dialog.h"
 #include "ui/about_dialog.h"
@@ -88,6 +89,118 @@ static void cb_start_trace(CBTYPE, void* cb_info) {
 
 static void cb_stop_trace(CBTYPE, void*) {
     mcp::trace_set_active(false, "");
+}
+
+// ============================================================================
+// Debugger event capture
+//
+// These run on the debugger thread, so they only copy data out of the callback
+// struct - never call the Bridge API, which could deadlock on this thread.
+// ============================================================================
+
+static void cb_init_debug(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_INITDEBUG*>(cb_info);
+    event_log::clear();
+    event_log::push("session_start", {
+        {"file", info && info->szFileName ? info->szFileName : ""}
+    });
+}
+
+static void cb_stop_debug(CBTYPE, void*) {
+    event_log::push("session_stop");
+}
+
+static void cb_attached(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_ATTACH*>(cb_info);
+    event_log::clear();
+    event_log::push("session_attach", {
+        {"pid", info ? static_cast<unsigned>(info->dwProcessId) : 0u}
+    });
+}
+
+static void cb_breakpoint(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_BREAKPOINT*>(cb_info);
+    if (!info || !info->breakpoint) {
+        event_log::push("breakpoint");
+        return;
+    }
+
+    const auto& bp = *info->breakpoint;
+    char addr[32];
+    snprintf(addr, sizeof(addr), "0x%llX", static_cast<unsigned long long>(bp.addr));
+
+    event_log::push("breakpoint", {
+        {"address",   addr},
+        {"name",      bp.name},
+        {"module",    bp.mod},
+        {"type",      static_cast<int>(bp.type)},
+        {"hit_count", bp.hitCount},
+        {"log_text",  bp.logText}
+    });
+}
+
+static void cb_exception(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_EXCEPTION*>(cb_info);
+    if (!info || !info->Exception) {
+        event_log::push("exception");
+        return;
+    }
+
+    const auto& ex = *info->Exception;
+    char code[32];
+    snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned>(ex.ExceptionRecord.ExceptionCode));
+
+    char address[32];
+    snprintf(address, sizeof(address), "0x%llX",
+             reinterpret_cast<unsigned long long>(ex.ExceptionRecord.ExceptionAddress));
+
+    event_log::push("exception", {
+        {"code",            code},
+        {"address",         address},
+        {"first_chance",    ex.dwFirstChance != 0},
+        {"nested",          ex.dwFirstChance == 0}
+    });
+}
+
+static void cb_paused(CBTYPE, void*) {
+    event_log::push("paused");
+}
+
+static void cb_resumed(CBTYPE, void*) {
+    event_log::push("resumed");
+}
+
+static void cb_system_breakpoint(CBTYPE, void*) {
+    event_log::push("system_breakpoint");
+}
+
+static void cb_create_process(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_CREATEPROCESS*>(cb_info);
+    event_log::push("process_create", {
+        {"file", info && info->DebugFileName ? info->DebugFileName : ""}
+    });
+}
+
+static void cb_exit_process(CBTYPE, void*) {
+    event_log::push("process_exit");
+}
+
+static void cb_create_thread(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_CREATETHREAD*>(cb_info);
+    event_log::push("thread_create", {
+        {"tid", info ? static_cast<unsigned>(info->dwThreadId) : 0u}
+    });
+}
+
+static void cb_load_dll(CBTYPE, void* cb_info) {
+    auto* info = static_cast<PLUG_CB_LOADDLL*>(cb_info);
+    event_log::push("dll_load", {
+        {"module", info && info->modname ? info->modname : ""}
+    });
+}
+
+static void cb_step(CBTYPE, void*) {
+    event_log::push("stepped");
 }
 
 // ============================================================================
@@ -285,6 +398,22 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init_struct) {
     _plugin_registercallback(g_plugin_handle, CB_STARTTRACE, cb_start_trace);
     _plugin_registercallback(g_plugin_handle, CB_STOPTRACE, cb_stop_trace);
 
+    // Debugger event capture. Registered by name here because only CBMENUENTRY
+    // is exported from plugin.def.
+    _plugin_registercallback(g_plugin_handle, CB_INITDEBUG, cb_init_debug);
+    _plugin_registercallback(g_plugin_handle, CB_STOPDEBUG, cb_stop_debug);
+    _plugin_registercallback(g_plugin_handle, CB_ATTACH, cb_attached);
+    _plugin_registercallback(g_plugin_handle, CB_BREAKPOINT, cb_breakpoint);
+    _plugin_registercallback(g_plugin_handle, CB_EXCEPTION, cb_exception);
+    _plugin_registercallback(g_plugin_handle, CB_PAUSEDEBUG, cb_paused);
+    _plugin_registercallback(g_plugin_handle, CB_RESUMEDEBUG, cb_resumed);
+    _plugin_registercallback(g_plugin_handle, CB_SYSTEMBREAKPOINT, cb_system_breakpoint);
+    _plugin_registercallback(g_plugin_handle, CB_CREATEPROCESS, cb_create_process);
+    _plugin_registercallback(g_plugin_handle, CB_EXITPROCESS, cb_exit_process);
+    _plugin_registercallback(g_plugin_handle, CB_CREATETHREAD, cb_create_thread);
+    _plugin_registercallback(g_plugin_handle, CB_LOADDLL, cb_load_dll);
+    _plugin_registercallback(g_plugin_handle, CB_STEPPED, cb_step);
+
     return true;
 }
 
@@ -293,6 +422,19 @@ PLUG_EXPORT bool plugstop() {
     _plugin_unregistercommand(g_plugin_handle, "mcpserver");
     _plugin_unregistercallback(g_plugin_handle, CB_STARTTRACE);
     _plugin_unregistercallback(g_plugin_handle, CB_STOPTRACE);
+    _plugin_unregistercallback(g_plugin_handle, CB_INITDEBUG);
+    _plugin_unregistercallback(g_plugin_handle, CB_STOPDEBUG);
+    _plugin_unregistercallback(g_plugin_handle, CB_ATTACH);
+    _plugin_unregistercallback(g_plugin_handle, CB_BREAKPOINT);
+    _plugin_unregistercallback(g_plugin_handle, CB_EXCEPTION);
+    _plugin_unregistercallback(g_plugin_handle, CB_PAUSEDEBUG);
+    _plugin_unregistercallback(g_plugin_handle, CB_RESUMEDEBUG);
+    _plugin_unregistercallback(g_plugin_handle, CB_SYSTEMBREAKPOINT);
+    _plugin_unregistercallback(g_plugin_handle, CB_CREATEPROCESS);
+    _plugin_unregistercallback(g_plugin_handle, CB_EXITPROCESS);
+    _plugin_unregistercallback(g_plugin_handle, CB_CREATETHREAD);
+    _plugin_unregistercallback(g_plugin_handle, CB_LOADDLL);
+    _plugin_unregistercallback(g_plugin_handle, CB_STEPPED);
 
     // Stop the HTTP server
     g_server.stop();

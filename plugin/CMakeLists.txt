@@ -17,8 +17,18 @@ else()
     set(DBG_LIB "x32dbg")
 endif()
 
-# vcpkg dependencies
-find_package(nlohmann_json CONFIG REQUIRED)
+# nlohmann_json is header-only. Prefer a vcpkg-provided package when present,
+# otherwise fall back to the vendored copy in third_party/ so the plugin builds
+# without vcpkg.
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found via package manager - using vendored header")
+    add_library(nlohmann_json INTERFACE)
+    target_include_directories(nlohmann_json INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+endif()
 
 # Source files
 set(SOURCES
@@ -27,6 +37,7 @@ set(SOURCES
     src/http/c_http_router.cpp
     src/bridge/c_bridge_executor.cpp
     src/util/format_utils.cpp
+    src/util/event_log.cpp
     src/handlers/debug_handler.cpp
     src/handlers/register_handler.cpp
     src/handlers/memory_handler.cpp

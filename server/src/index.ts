@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { config } from './config.js';
 import { httpClient } from './http_client.js';
+import { ensureX64dbg } from './launcher.js';
 import { registerAllTools } from './tools/index.js';
 
 // Single source of truth for the version: package.json (next to dist/ in the
@@ -18,7 +19,27 @@ function getVersion(): string {
   }
 }
 
+/**
+ * Command-line overrides. Kept intentionally tiny - the launcher is a thin
+ * wrapper, not a CLI. Supported:
+ *   --x64dbg=<path>   path to x64dbg.exe (or its folder)
+ *   --no-launch       never start x64dbg; only connect to a running instance
+ */
+function applyCliArgs(argv: string[]): { launch: boolean } {
+  let launch = true;
+  for (const arg of argv) {
+    if (arg.startsWith('--x64dbg=')) {
+      config.x64dbgPath = arg.slice('--x64dbg='.length);
+    } else if (arg === '--no-launch') {
+      launch = false;
+    }
+  }
+  return { launch };
+}
+
 async function main() {
+  const { launch } = applyCliArgs(process.argv.slice(2));
+
   const server = new McpServer({
     name: 'x64dbg',
     version: getVersion(),
@@ -35,6 +56,17 @@ async function main() {
   console.error(`[x64dbg-mcp] Server started (23 tools), plugin expected at ${config.host}:${config.port}`);
   const timeout_desc = config.timeout > 0 ? `${config.timeout}ms` : 'none (waits indefinitely)';
   console.error(`[x64dbg-mcp] Timeout: ${timeout_desc}, Retries: ${config.retries}`);
+
+  // Start x64dbg in the background if it is not already up. Deliberately not
+  // awaited: the MCP handshake must not block on a GUI process launching.
+  if (launch) {
+    void ensureX64dbg().then(({ launched, ok }) => {
+      if (!ok && !launched) {
+        console.error('[x64dbg-mcp] x64dbg is not running and could not be started. ' +
+          'Set X64DBG_PATH or pass --x64dbg=<path>.');
+      }
+    });
+  }
 
   // Graceful shutdown
   const cleanup = () => {

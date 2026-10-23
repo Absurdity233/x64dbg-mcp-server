@@ -1,5 +1,6 @@
 #include "http/c_http_router.h"
 #include "bridge/c_bridge_executor.h"
+#include "util/event_log.h"
 #include "util/format_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -73,13 +74,23 @@ void register_command_routes(c_http_router& router) {
         });
     });
 
-    // GET /api/command/events - Get debug event count
-    router.get("/api/command/events", [](const s_http_request&) -> s_http_response {
-        auto events = DbgFunctions()->GetDbgEvents();
+    // GET /api/command/events?since=<seq> - Buffered debugger events
+    //
+    // Returns every event newer than <seq>. Clients keep the highest seq they
+    // have seen and pass it back, which gives them a resumable event stream
+    // without SSE or long-polling sockets.
+    router.get("/api/command/events", [](const s_http_request& req) -> s_http_response {
+        uint64_t since_seq = 0;
+        const auto raw = req.get_query("since");
+        if (!raw.empty()) {
+            try {
+                since_seq = std::stoull(raw);
+            } catch (...) {
+                return s_http_response::bad_request("'since' must be a non-negative integer");
+            }
+        }
 
-        return s_http_response::ok({
-            {"event_count", events}
-        });
+        return s_http_response::ok(event_log::since(since_seq));
     });
 
     // POST /api/command/init_script - Set debuggee init script

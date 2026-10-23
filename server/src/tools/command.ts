@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { drain, describe } from '../events.js';
 import { requireString } from './util.js';
 
 export function registerCommandTools(server: McpServer) {
@@ -43,9 +44,20 @@ export function registerCommandTools(server: McpServer) {
         case 'get_hash':
           data = await httpClient.get('/api/command/hash');
           break;
-        case 'get_events':
-          data = await httpClient.get('/api/command/events');
-          break;
+        case 'get_events': {
+          const { events, dropped } = await drain();
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                count: events.length,
+                dropped,
+                summary: events.map(describe),
+                events,
+              }, null, 2),
+            }],
+          };
+        }
       }
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }

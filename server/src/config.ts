@@ -19,6 +19,12 @@ export const config = {
   // Optional auth token. When set, it must match the plugin's configured token
   // (Settings > Token). Sent as "Authorization: Bearer <token>". Empty = no auth.
   token: process.env.X64DBG_MCP_TOKEN ?? '',
+  // How often to poll the plugin's event buffer while waiting for a matching
+  // event. Lower = snappier, higher = less CPU on the plugin's single thread.
+  eventPollMs: parseInt(process.env.X64DBG_MCP_EVENT_POLL_MS ?? '150', 10),
+  // Optional path to x64dbg.exe. When set (or when --x64dbg=<path> is passed),
+  // the launcher starts x64dbg if it is not already running.
+  x64dbgPath: process.env.X64DBG_PATH ?? '',
 };
 
 export function getBaseUrl(): string {
