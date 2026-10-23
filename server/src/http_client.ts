@@ -21,6 +21,10 @@ export class HttpClient {
   private last_successful_request = 0;
   private consecutive_failures = 0;
   private health_check_interval: ReturnType<typeof setInterval> | null = null;
+  // Set when /api/health answers 401. Distinguishes "plugin not running" from
+  // "plugin running but rejecting our token" so we fail fast instead of
+  // polling for two minutes with a misleading message.
+  private auth_rejected = false;
 
   constructor() {
     this.base_url = getBaseUrl();
@@ -95,11 +99,20 @@ export class HttpClient {
       if (response.ok) {
         const was_disconnected = this.state !== 'connected';
         this.state = 'connected';
+        this.auth_rejected = false;
         this.consecutive_failures = 0;
         if (was_disconnected) {
           console.error(`[x64dbg-mcp] Plugin connection established at ${this.base_url}`);
         }
         return true;
+      }
+
+      if (response.status === 401) {
+        this.auth_rejected = true;
+        console.error(
+          '[x64dbg-mcp] Plugin rejected the auth token. Set X64DBG_MCP_TOKEN to the ' +
+          'token configured in the plugin (Plugins > x64dbg MCP Server > Settings).'
+        );
       }
       return false;
     } catch {
@@ -123,6 +136,15 @@ export class HttpClient {
     // Quick check first
     if (await this.check_health()) return;
 
+    // The plugin is up but our credentials are wrong - retrying cannot help.
+    if (this.auth_rejected) {
+      throw new Error(
+        `x64dbg plugin at ${this.base_url} rejected the auth token (HTTP 401). ` +
+        `Set X64DBG_MCP_TOKEN to match the token in the plugin's settings ` +
+        `(Plugins > x64dbg MCP Server > Settings).`
+      );
+    }
+
     // Plugin not available - enter wait loop
     this.state = 'reconnecting';
     console.error(
@@ -139,6 +161,14 @@ export class HttpClient {
       if (await this.check_health()) {
         console.error(`[x64dbg-mcp] Plugin came online after ~${poll_count * 2}s`);
         return;
+      }
+
+      // Token was rotated while we were waiting - stop immediately.
+      if (this.auth_rejected) {
+        throw new Error(
+          `x64dbg plugin at ${this.base_url} rejected the auth token (HTTP 401). ` +
+          `Set X64DBG_MCP_TOKEN to match the plugin's configured token.`
+        );
       }
 
       // Log progress every 10s
@@ -211,6 +241,15 @@ export class HttpClient {
         if (!parsed.success) {
           const err_msg = parsed.error?.message ?? 'Unknown plugin error';
           const err_code = parsed.error?.code ?? 500;
+
+          if (err_code === 401) {
+            this.auth_rejected = true;
+            throw new Error(
+              `Plugin rejected the auth token (401). Set X64DBG_MCP_TOKEN to match the ` +
+              `token configured in Plugins > x64dbg MCP Server > Settings.`
+            );
+          }
+
           throw new Error(`Plugin error (${err_code}): ${err_msg}`);
         }
 
@@ -222,6 +261,11 @@ export class HttpClient {
         return parsed.data as T;
       } catch (err) {
         last_error = err instanceof Error ? err : new Error(String(err));
+
+        // Auth failures never resolve on their own - retrying just spins.
+        if (this.auth_rejected) {
+          throw last_error;
+        }
 
         // Don't retry on definite plugin responses - they are deterministic, and
         // retrying a non-idempotent POST (memory/write, patches/apply, breakpoints/set)
