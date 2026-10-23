@@ -1,67 +1,66 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerSearchTools(server: McpServer) {
   server.tool(
     'x64dbg_search',
-    'Pattern/string search, symbol autocomplete, or get string at address',
+    'Search. Actions: pattern (AOB), string, string_at, symbol_auto_complete, encode_type.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({
-          action: z.literal("pattern"),
-          query: z.string().describe("Byte pattern (e.g. '48 89 5C ??')"),
-          address: z.string().optional().describe("Start address"),
-          size: z.string().optional().describe("Size of range"),
-          max_results: z.number().optional().default(1000)
-        }),
-        z.object({
-          action: z.literal("string"),
-          query: z.string().describe("Text string to search for"),
-          module: z.string().optional().default(""),
-          encoding: z.enum(['utf8', 'ascii', 'unicode']).optional().default("utf8")
-        }),
-        z.object({
-          action: z.literal("string_at"),
-          query: z.string().describe("Address"),
-          encoding: z.enum(['auto', 'ascii', 'unicode']).optional().default("auto"),
-          max_length: z.number().optional().default(256)
-        }),
-        z.object({
-          action: z.literal("symbol_auto_complete"),
-          query: z.string().describe("Partial symbol name"),
-          max_results: z.number().optional().default(256)
-        }),
-        z.object({
-          action: z.literal("encode_type"),
-          query: z.string().describe("Address"),
-          size: z.string().optional().default("1")
-        })
-      ])
+      action: z.enum(['pattern', 'string', 'string_at', 'symbol_auto_complete', 'encode_type'])
+        .describe('Operation to perform'),
+      query: z.string().optional().describe("pattern: byte pattern (e.g. '48 89 5C ??'); string/symbol_auto_complete: text; string_at/encode_type: address"),
+      address: z.string().optional().describe('pattern: start address'),
+      size: z.string().optional().describe('pattern/encode_type: range size'),
+      max_results: z.number().optional().describe('pattern/symbol_auto_complete: result cap'),
+      module: z.string().optional().describe('string: module to search (empty = all)'),
+      encoding: z.enum(['utf8', 'ascii', 'unicode', 'auto']).optional().describe('string/string_at: text encoding'),
+      max_length: z.number().optional().describe('string_at: maximum string length (default 256)'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'pattern':
-          const body: Record<string, unknown> = { pattern: action.query, max_results: action.max_results };
-          if (action.address) body.address = action.address;
-          if (action.size) body.size = action.size;
-          data = await httpClient.post('/api/search/pattern', body);
-          break;
-        case 'string':
-          data = await httpClient.post('/api/search/string', { text: action.query, module: action.module, encoding: action.encoding });
-          break;
-        case 'string_at':
-          data = await httpClient.get('/api/search/string_at', { address: action.query, encoding: action.encoding, max_length: String(action.max_length) });
-          break;
-        case 'symbol_auto_complete':
-          data = await httpClient.post('/api/search/auto_complete', { search: action.query, max_results: action.max_results });
-          break;
-        case 'encode_type':
-          data = await httpClient.get('/api/search/encode_type', { address: action.query, size: action.size });
-          break;
+    async (args) => {
+      switch (args.action) {
+        case 'pattern': {
+          const body: Record<string, unknown> = {
+            pattern: requireString(args.query, 'query'),
+            max_results: args.max_results ?? 1000,
+          };
+          if (args.address) body.address = args.address;
+          if (args.size) body.size = args.size;
+          const data = await httpClient.post('/api/search/pattern', body);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'string': {
+          const data = await httpClient.post('/api/search/string', {
+            text: requireString(args.query, 'query'),
+            module: args.module ?? '',
+            encoding: args.encoding ?? 'utf8',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'string_at': {
+          const data = await httpClient.get('/api/search/string_at', {
+            address: requireString(args.query, 'query'),
+            encoding: args.encoding ?? 'auto',
+            max_length: String(args.max_length ?? 256),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'symbol_auto_complete': {
+          const data = await httpClient.post('/api/search/auto_complete', {
+            search: requireString(args.query, 'query'),
+            max_results: args.max_results ?? 256,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'encode_type': {
+          const data = await httpClient.get('/api/search/encode_type', {
+            address: requireString(args.query, 'query'),
+            size: args.size ?? '1',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

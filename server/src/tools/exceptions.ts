@@ -1,34 +1,43 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerExceptionTools(server: McpServer) {
   server.tool(
     'x64dbg_exceptions',
-    'Manage exception breakpoints, list Windows exception codes, or skip exceptions',
+    'Exception breakpoints. Actions: set, delete, list, list_codes, skip.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({
-          action: z.literal("set"),
-          code: z.string().describe("Exception code (hex, e.g. C0000005)"),
-          chance: z.enum(['first', 'second', 'all']).optional().default("first")
-        }),
-        z.object({ action: z.literal("delete"), code: z.string() }),
-        z.object({ action: z.literal("list") }),
-        z.object({ action: z.literal("list_codes") }),
-        z.object({ action: z.literal("skip") })
-      ])
+      action: z.enum(['set', 'delete', 'list', 'list_codes', 'skip']).describe('Operation to perform'),
+      code: z.string().optional().describe('Exception code in hex, e.g. C0000005'),
+      chance: z.enum(['first', 'second', 'all']).optional().describe('set: break chance (default first)'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'set': data = await httpClient.post('/api/exceptions/set_bp', { code: action.code, chance: action.chance }); break;
-        case 'delete': data = await httpClient.post('/api/exceptions/delete_bp', { code: action.code }); break;
-        case 'list': data = await httpClient.get('/api/exceptions/list_bps'); break;
-        case 'list_codes': data = await httpClient.get('/api/exceptions/list_codes'); break;
-        case 'skip': data = await httpClient.post('/api/exceptions/skip'); break;
+    async (args) => {
+      switch (args.action) {
+        case 'set': {
+          const data = await httpClient.post('/api/exceptions/set_bp', {
+            code: requireString(args.code, 'code'),
+            chance: args.chance ?? 'first',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'delete': {
+          const data = await httpClient.post('/api/exceptions/delete_bp', { code: requireString(args.code, 'code') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'list': {
+          const data = await httpClient.get('/api/exceptions/list_bps');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'list_codes': {
+          const data = await httpClient.get('/api/exceptions/list_codes');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'skip': {
+          const data = await httpClient.post('/api/exceptions/skip');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

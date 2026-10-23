@@ -1,50 +1,48 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerThreadTools(server: McpServer) {
   server.tool(
     'x64dbg_threads',
-    'Thread operations: list, get current/specific/teb/name, or switch/suspend/resume',
+    'Thread operations. Actions: list, current, count, info, teb, name, switch, suspend, resume.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("list") }),
-        z.object({ action: z.literal("current") }),
-        z.object({ action: z.literal("count") }),
-        z.object({ action: z.literal("info"), tid: z.string().describe("Thread ID (decimal)") }),
-        z.object({ action: z.literal("teb"), tid: z.string() }),
-        z.object({ action: z.literal("name"), tid: z.string() }),
-        z.object({ action: z.literal("switch"), id: z.string().describe("Thread ID (decimal)") }),
-        z.object({ action: z.literal("suspend"), id: z.string() }),
-        z.object({ action: z.literal("resume"), id: z.string() })
-      ])
+      action: z.enum(['list', 'current', 'count', 'info', 'teb', 'name', 'switch', 'suspend', 'resume'])
+        .describe('Operation to perform'),
+      tid: z.string().optional().describe('Thread ID (decimal) for info/teb/name'),
+      id: z.string().optional().describe('Thread ID (decimal) for switch/suspend/resume'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'list':
-          data = await httpClient.get('/api/threads/list');
-          break;
-        case 'current':
-          data = await httpClient.get('/api/threads/current');
-          break;
-        case 'count':
-          data = await httpClient.get('/api/threads/count');
-          break;
-        case 'info':
-          data = await httpClient.get('/api/threads/get', { id: action.tid });
-          break;
+    async (args) => {
+      switch (args.action) {
+        case 'list': {
+          const data = await httpClient.get('/api/threads/list');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'current': {
+          const data = await httpClient.get('/api/threads/current');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'count': {
+          const data = await httpClient.get('/api/threads/count');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'info': {
+          const data = await httpClient.get('/api/threads/get', { id: requireString(args.tid, 'tid') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
         case 'teb':
-        case 'name':
-          data = await httpClient.get(`/api/threads/${action.action}`, { tid: action.tid });
-          break;
+        case 'name': {
+          const data = await httpClient.get(`/api/threads/${args.action}`, { tid: requireString(args.tid, 'tid') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
         case 'switch':
         case 'suspend':
-        case 'resume':
-          data = await httpClient.post(`/api/threads/${action.action}`, { id: action.id });
-          break;
+        case 'resume': {
+          const data = await httpClient.post(`/api/threads/${args.action}`, { id: requireString(args.id, 'id') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

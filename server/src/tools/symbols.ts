@@ -1,58 +1,75 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerSymbolTools(server: McpServer) {
   server.tool(
     'x64dbg_symbols',
-    'Symbol, label, comment, and bookmark operations',
+    'Symbols, labels, comments, bookmarks. Actions: resolve, address, search, list_module, get_label, set_label, get_comment, set_comment, bookmark.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("resolve"), name: z.string() }),
-        z.object({ action: z.literal("address"), address: z.string() }),
-        z.object({ action: z.literal("search"), pattern: z.string(), module: z.string().optional() }),
-        z.object({ action: z.literal("list_module"), module: z.string() }),
-        z.object({ action: z.literal("get_label"), address: z.string() }),
-        z.object({ action: z.literal("set_label"), address: z.string(), text: z.string() }),
-        z.object({ action: z.literal("get_comment"), address: z.string() }),
-        z.object({ action: z.literal("set_comment"), address: z.string(), text: z.string() }),
-        z.object({ action: z.literal("bookmark"), address: z.string(), set: z.boolean().optional().default(true) })
-      ])
+      action: z.enum([
+        'resolve', 'address', 'search', 'list_module',
+        'get_label', 'set_label', 'get_comment', 'set_comment', 'bookmark',
+      ]).describe('Operation to perform'),
+
+      name: z.string().optional().describe('resolve: symbol name'),
+      address: z.string().optional().describe('address-based actions'),
+      pattern: z.string().optional().describe('search: symbol pattern (substring)'),
+      module: z.string().optional().describe('search/list_module: module name'),
+      text: z.string().optional().describe('set_label/set_comment: new text'),
+      set: z.boolean().optional().describe('bookmark: true to set (default), false to clear'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'resolve':
-          data = await httpClient.get('/api/symbols/resolve', { name: action.name });
-          break;
-        case 'address':
-          data = await httpClient.get('/api/symbols/at', { address: action.address });
-          break;
-        case 'search':
-          let searchParams: any = { pattern: action.pattern };
-          if (action.module) searchParams.module = action.module;
-          data = await httpClient.get('/api/symbols/search', searchParams);
-          break;
-        case 'list_module':
-          data = await httpClient.get('/api/symbols/list', { module: action.module });
-          break;
-        case 'get_label':
-          data = await httpClient.get('/api/labels/get', { address: action.address });
-          break;
-        case 'set_label':
-          data = await httpClient.post('/api/labels/set', { address: action.address, text: action.text });
-          break;
-        case 'get_comment':
-          data = await httpClient.get('/api/comments/get', { address: action.address });
-          break;
-        case 'set_comment':
-          data = await httpClient.post('/api/comments/set', { address: action.address, text: action.text });
-          break;
-        case 'bookmark':
-          data = await httpClient.post('/api/bookmarks/set', { address: action.address, set: action.set });
-          break;
+    async (args) => {
+      switch (args.action) {
+        case 'resolve': {
+          const data = await httpClient.get('/api/symbols/resolve', { name: requireString(args.name, 'name') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'address': {
+          const data = await httpClient.get('/api/symbols/at', { address: requireString(args.address, 'address') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'search': {
+          const params: Record<string, string> = { pattern: requireString(args.pattern, 'pattern') };
+          if (args.module) params.module = args.module;
+          const data = await httpClient.get('/api/symbols/search', params);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'list_module': {
+          const data = await httpClient.get('/api/symbols/list', { module: requireString(args.module, 'module') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'get_label': {
+          const data = await httpClient.get('/api/labels/get', { address: requireString(args.address, 'address') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'set_label': {
+          const data = await httpClient.post('/api/labels/set', {
+            address: requireString(args.address, 'address'),
+            text: requireString(args.text, 'text'),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'get_comment': {
+          const data = await httpClient.get('/api/comments/get', { address: requireString(args.address, 'address') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'set_comment': {
+          const data = await httpClient.post('/api/comments/set', {
+            address: requireString(args.address, 'address'),
+            text: requireString(args.text, 'text'),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'bookmark': {
+          const data = await httpClient.post('/api/bookmarks/set', {
+            address: requireString(args.address, 'address'),
+            set: args.set ?? true,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

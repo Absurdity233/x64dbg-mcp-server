@@ -1,34 +1,45 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerControlFlowTools(server: McpServer) {
   server.tool(
     'x64dbg_control_flow',
-    'Get CFG/branch/loop info or manage function definitions',
+    'Control-flow analysis. Actions: cfg, branch_dest, is_jump_taken, loops, func_type, add_function, delete_function.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("cfg"), address: z.string().optional().default("cip") }),
-        z.object({ action: z.literal("branch_dest"), address: z.string().optional().default("cip") }),
-        z.object({ action: z.literal("is_jump_taken"), address: z.string().optional().default("cip") }),
-        z.object({ action: z.literal("loops"), address: z.string().optional().default("cip") }),
-        z.object({ action: z.literal("func_type"), address: z.string().optional().default("cip") }),
-        z.object({ action: z.literal("add_function"), start: z.string(), end: z.string() }),
-        z.object({ action: z.literal("delete_function"), address: z.string() })
-      ])
+      action: z.enum(['cfg', 'branch_dest', 'is_jump_taken', 'loops', 'func_type', 'add_function', 'delete_function'])
+        .describe('Operation to perform'),
+      address: z.string().optional().describe('Address to analyse (default cip); delete_function: function start'),
+      start: z.string().optional().describe('add_function: function start address'),
+      end: z.string().optional().describe('add_function: function end address'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'cfg': data = await httpClient.get('/api/cfg/function', { address: action.address }); break;
-        case 'branch_dest': data = await httpClient.get('/api/cfg/branch_dest', { address: action.address }); break;
-        case 'is_jump_taken': data = await httpClient.get('/api/cfg/is_jump_taken', { address: action.address }); break;
-        case 'loops': data = await httpClient.get('/api/cfg/loops', { address: action.address }); break;
-        case 'func_type': data = await httpClient.get('/api/cfg/func_type', { address: action.address }); break;
-        case 'add_function': data = await httpClient.post('/api/cfg/add_function', { start: action.start, end: action.end }); break;
-        case 'delete_function': data = await httpClient.post('/api/cfg/delete_function', { address: action.address }); break;
+    async (args) => {
+      switch (args.action) {
+        case 'cfg':
+        case 'branch_dest':
+        case 'is_jump_taken':
+        case 'loops':
+        case 'func_type': {
+          // 'cfg' maps to /api/cfg/function (the CFG-producing route).
+          const route = args.action === 'cfg' ? 'function' : args.action;
+          const data = await httpClient.get(`/api/cfg/${route}`, { address: args.address ?? 'cip' });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'add_function': {
+          const data = await httpClient.post('/api/cfg/add_function', {
+            start: requireString(args.start, 'start'),
+            end: requireString(args.end, 'end'),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'delete_function': {
+          const data = await httpClient.post('/api/cfg/delete_function', {
+            address: requireString(args.address, 'address'),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

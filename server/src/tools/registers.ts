@@ -1,41 +1,44 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerRegisterTools(server: McpServer) {
   server.tool(
     'x64dbg_registers',
-    'Get or set CPU register values (all, specific, flags, avx512, set)',
+    'CPU registers. Actions: get_all, get_flags, get_avx512, get_specific, set.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("get_all") }),
-        z.object({ action: z.literal("get_flags") }),
-        z.object({ action: z.literal("get_avx512") }),
-        z.object({
-          action: z.literal("get_specific"),
-          name: z.string().describe("Register name (e.g. 'rax', 'eip', 'dr0')")
-        }),
-        z.object({
-          action: z.literal("set"),
-          name: z.string().describe("Register name (e.g. 'rax', 'rcx')"),
-          value: z.string().describe("New value (hex string, e.g. '0x1234' or expression)")
-        })
-      ])
+      action: z.enum(['get_all', 'get_flags', 'get_avx512', 'get_specific', 'set'])
+        .describe('Operation to perform'),
+      name: z.string().optional().describe("get_specific/set: register name (e.g. 'rax', 'eip', 'dr0')"),
+      value: z.string().optional().describe("set: new value (hex string or expression)"),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'get_all': data = await httpClient.get('/api/registers/all'); break;
-        case 'get_flags': data = await httpClient.get('/api/registers/flags'); break;
-        case 'get_avx512': data = await httpClient.get('/api/registers/avx512'); break;
-        case 'get_specific':
-          data = await httpClient.get('/api/registers/get', { name: action.name });
-          break;
-        case 'set':
-          data = await httpClient.post('/api/registers/set', { name: action.name, value: action.value });
-          break;
+    async (args) => {
+      switch (args.action) {
+        case 'get_all': {
+          const data = await httpClient.get('/api/registers/all');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'get_flags': {
+          const data = await httpClient.get('/api/registers/flags');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'get_avx512': {
+          const data = await httpClient.get('/api/registers/avx512');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'get_specific': {
+          const data = await httpClient.get('/api/registers/get', { name: requireString(args.name, 'name') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'set': {
+          const data = await httpClient.post('/api/registers/set', {
+            name: requireString(args.name, 'name'),
+            value: requireString(args.value, 'value'),
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

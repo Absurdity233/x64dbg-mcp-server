@@ -5,24 +5,31 @@ import { httpClient } from '../http_client.js';
 export function registerAntiDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_antidebug',
-    'Anti-debugging analysis: Read PEB/TEB/DEP, or hide debugger',
+    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("peb"), pid: z.string().optional() }),
-        z.object({ action: z.literal("teb"), tid: z.string().optional() }),
-        z.object({ action: z.literal("dep") }),
-        z.object({ action: z.literal("hide_debugger") })
-      ])
+      action: z.enum(['peb', 'teb', 'dep', 'hide_debugger']).describe('Operation to perform'),
+      pid: z.string().optional().describe('peb: process id (default current)'),
+      tid: z.string().optional().describe('teb: thread id (default current)'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'peb': data = await httpClient.get('/api/antidebug/peb', { pid: action.pid || '' }); break;
-        case 'teb': data = await httpClient.get('/api/antidebug/teb', { tid: action.tid || '' }); break;
-        case 'dep': data = await httpClient.get('/api/antidebug/dep_status'); break;
-        case 'hide_debugger': data = await httpClient.post('/api/antidebug/hide_debugger'); break;
+    async (args) => {
+      switch (args.action) {
+        case 'peb': {
+          const data = await httpClient.get('/api/antidebug/peb', { pid: args.pid ?? '' });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'teb': {
+          const data = await httpClient.get('/api/antidebug/teb', { tid: args.tid ?? '' });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'dep': {
+          const data = await httpClient.get('/api/antidebug/dep_status');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'hide_debugger': {
+          const data = await httpClient.post('/api/antidebug/hide_debugger');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

@@ -1,38 +1,54 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerDumpingTools(server: McpServer) {
   server.tool(
     'x64dbg_dumping',
-    'Dump modules, fix IAT, or get PE header/sections/imports/exports',
+    'PE analysis, module dumping and IAT repair. Actions: pe_header, sections, imports, exports, entry_point, relocations, dump_module, fix_iat, export_patch_file.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("pe_header"), address: z.string() }),
-        z.object({ action: z.literal("sections"), module: z.string() }),
-        z.object({ action: z.literal("imports"), module: z.string() }),
-        z.object({ action: z.literal("exports"), module: z.string() }),
-        z.object({ action: z.literal("entry_point"), module: z.string() }),
-        z.object({ action: z.literal("relocations"), address: z.string() }),
-        z.object({ action: z.literal("dump_module"), module: z.string(), file: z.string().optional().default("") }),
-        z.object({ action: z.literal("fix_iat"), oep: z.string() }),
-        z.object({ action: z.literal("export_patch_file"), filename: z.string().describe("Output path for .1337 patch file") })
-      ])
+      action: z.enum([
+        'pe_header', 'sections', 'imports', 'exports', 'entry_point',
+        'relocations', 'dump_module', 'fix_iat', 'export_patch_file',
+      ]).describe('Operation to perform'),
+
+      address: z.string().optional().describe('pe_header/relocations: address inside the PE'),
+      module: z.string().optional().describe('module-based actions'),
+      file: z.string().optional().describe('dump_module: output path (default module-derived)'),
+      oep: z.string().optional().describe('fix_iat: original entry point address'),
+      filename: z.string().optional().describe('export_patch_file: output path for the .1337 patch file'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'pe_header': data = await httpClient.get('/api/dump/pe_header', { address: action.address }); break;
-        case 'sections': data = await httpClient.get('/api/dump/sections', { module: action.module }); break;
-        case 'imports': data = await httpClient.get('/api/dump/imports', { module: action.module }); break;
-        case 'exports': data = await httpClient.get('/api/dump/exports', { module: action.module }); break;
-        case 'entry_point': data = await httpClient.get('/api/dump/entry_point', { module: action.module }); break;
-        case 'relocations': data = await httpClient.get('/api/dump/relocations', { address: action.address }); break;
-        case 'dump_module': data = await httpClient.post('/api/dump/module', { module: action.module, file: action.file }); break;
-        case 'fix_iat': data = await httpClient.post('/api/dump/fix_iat', { oep: action.oep }); break;
-        case 'export_patch_file': data = await httpClient.post('/api/patches/export_file', { filename: action.filename }); break;
+    async (args) => {
+      switch (args.action) {
+        case 'pe_header':
+        case 'relocations': {
+          const data = await httpClient.get(`/api/dump/${args.action}`, { address: requireString(args.address, 'address') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'sections':
+        case 'imports':
+        case 'exports':
+        case 'entry_point': {
+          const data = await httpClient.get(`/api/dump/${args.action}`, { module: requireString(args.module, 'module') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'dump_module': {
+          const data = await httpClient.post('/api/dump/module', {
+            module: requireString(args.module, 'module'),
+            file: args.file ?? '',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'fix_iat': {
+          const data = await httpClient.post('/api/dump/fix_iat', { oep: requireString(args.oep, 'oep') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'export_patch_file': {
+          const data = await httpClient.post('/api/patches/export_file', { filename: requireString(args.filename, 'filename') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }

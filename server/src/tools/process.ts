@@ -1,32 +1,33 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { requireString } from './util.js';
 
 export function registerProcessTools(server: McpServer) {
   server.tool(
     'x64dbg_process',
-    'Get process info (basic, detailed, cmdline, elevated, dbversion) or set cmdline',
+    'Process info. Actions: basic, detailed, cmdline, elevated, dbversion, set_cmdline.',
     {
-      action: z.discriminatedUnion("action", [
-        z.object({ action: z.literal("basic") }),
-        z.object({ action: z.literal("detailed") }),
-        z.object({ action: z.literal("cmdline") }),
-        z.object({ action: z.literal("elevated") }),
-        z.object({ action: z.literal("dbversion") }),
-        z.object({ action: z.literal("set_cmdline"), cmdline: z.string() })
-      ])
+      action: z.enum(['basic', 'detailed', 'cmdline', 'elevated', 'dbversion', 'set_cmdline'])
+        .describe('Operation to perform'),
+      cmdline: z.string().optional().describe('set_cmdline: new command line'),
     },
-    async ({ action }) => {
-      let data: any;
-      switch (action.action) {
-        case 'basic': data = await httpClient.get('/api/process/info'); break;
-        case 'detailed': data = await httpClient.get('/api/process/details'); break;
-        case 'cmdline': data = await httpClient.get('/api/process/cmdline'); break;
-        case 'elevated': data = await httpClient.get('/api/process/elevated'); break;
-        case 'dbversion': data = await httpClient.get('/api/process/dbversion'); break;
-        case 'set_cmdline': data = await httpClient.post('/api/process/set_cmdline', { cmdline: action.cmdline }); break;
+    async (args) => {
+      switch (args.action) {
+        case 'basic':
+        case 'detailed':
+        case 'cmdline':
+        case 'elevated':
+        case 'dbversion': {
+          const route = args.action === 'basic' || args.action === 'detailed' ? 'info' : args.action;
+          const data = await httpClient.get(`/api/process/${route}`);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'set_cmdline': {
+          const data = await httpClient.post('/api/process/set_cmdline', { cmdline: requireString(args.cmdline, 'cmdline') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
 }
