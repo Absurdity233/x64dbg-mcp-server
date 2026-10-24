@@ -52,3 +52,10 @@ anticheat_analysis.md
 .claude/
 
 server/update_readmes.js
+
+# Vendored x64dbg plugin SDK import libs (needed to build offline; github.com
+# is unreachable on this machine so fetch-sdk.ps1 cannot be relied on)
+!plugin/sdk/*.lib
+!plugin/sdk/jansson/*.lib
+!plugin/sdk/lz4/*.lib
+!plugin/sdk/XEDParse/*.lib
