@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -66,6 +67,39 @@ bool get_data_directory(c_bridge_executor& bridge, duint base, int index,
     std::memcpy(&dir_rva, pe->data() + dd_off, 4);
     std::memcpy(&dir_size, pe->data() + dd_off + 4, 4);
     return true;
+}
+
+// Is the Scylla plugin installed next to x64dbg?
+//
+// Checked on disk rather than through the command table because
+// DbgCmdExecDirect's return value is unreliable for commands that do not exist
+// (a garbage command returns true on x32dbg). Scylla ships as Scylla_x64.dp64 /
+// Scylla_x86.dp32; a bare Scylla.exe next to the debugger is also treated as
+// present so a portable install is not misreported.
+bool scylla_plugin_present() {
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, path, MAX_PATH) == 0) return false;
+
+    std::string dir(path);
+    const auto slash = dir.find_last_of("\\/");
+    if (slash == std::string::npos) return false;
+    dir.resize(slash);
+
+    const char* candidates[] = {
+        "\\plugins\\Scylla_x64.dp64",
+        "\\plugins\\Scylla_x86.dp32",
+        "\\plugins\\Scylla_x64.dll",
+        "\\plugins\\Scylla_x86.dll",
+        "\\Scylla_x64.exe",
+        "\\Scylla.exe",
+    };
+    for (const auto* rel : candidates) {
+        const DWORD attr = GetFileAttributesA((dir + rel).c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -468,7 +502,14 @@ void register_dumping_routes(c_http_router& router) {
         });
     });
 
-    // POST /api/dump/fix_iat - IAT reconstruction (uses x64dbg Scylla)
+    // POST /api/dump/fix_iat - IAT reconstruction via the Scylla plugin
+    //
+    // Scylla is a separate plugin and is often not installed. Two traps here:
+    // the old version ignored the command result and always reported success,
+    // and DbgCmdExecDirect's return value is not trustworthy for unknown
+    // commands either (verified: a garbage command returned true on x32dbg).
+    // So the plugin is detected by looking for its module in the plugin
+    // directory rather than by probing the command table.
     router.post("/api/dump/fix_iat", [](const s_http_request& req) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.require_paused()) {
@@ -482,14 +523,30 @@ void register_dumping_routes(c_http_router& router) {
             return s_http_response::bad_request("Missing 'oep' (original entry point) field");
         }
 
-        // Use Scylla plugin commands
-        auto cmd = "scylla iatAutoFix " + oep;
-        auto success = bridge.exec_command(cmd);
+        const bool scylla_loaded = scylla_plugin_present();
+        if (!scylla_loaded) {
+            return s_http_response::conflict(
+                "The Scylla plugin is not loaded, so IAT reconstruction is unavailable. "
+                "Install Scylla (Scylla_x64.dp64 / Scylla_x86.dp32) into the x64dbg "
+                "plugins directory and restart x64dbg. Note that ScyllaHide is a "
+                "different plugin - it hides the debugger, it does not rebuild the IAT.");
+        }
+
+        const auto cmd = "scylla iatAutoFix " + oep;
+        if (!bridge.exec_command(cmd)) {
+            return s_http_response::internal_error(
+                "Scylla is loaded but rejected 'iatAutoFix " + oep +
+                "'. Check that the OEP is inside the main module and that the "
+                "process is paused.");
+        }
 
         return s_http_response::ok({
-            {"success", success},
+            {"success", true},
             {"oep", oep},
-            {"message", "IAT fix attempted via Scylla"}
+            {"verified", false},
+            {"message", "Scylla accepted the IAT fix request. That confirms the command "
+                        "ran, not that the IAT is correct - dump the module and validate "
+                        "the result before relying on it."}
         });
     });
 
@@ -571,6 +628,284 @@ void register_dumping_routes(c_http_router& router) {
             {"patch_count", patch_count},
             {"filename",    filename},
             {"error",       std::string(error)}
+        });
+    });
+
+    // POST /api/dump/rebuild - Rebuild a runnable PE image from the live process
+    //
+    // `dump/module` is a flat copy of the mapped image: section headers still
+    // carry their in-memory VirtualAddress layout, SizeOfRawData does not match
+    // what is on disk, and AddressOfEntryPoint still points at the packer stub.
+    // A loader will not map that, and tools that parse it (IDA, pefile) read
+    // garbage. This route walks the mapped image, copies each section's real
+    // bytes to a file-aligned offset, rewrites the headers, and optionally
+    // patches in the OEP.
+    //
+    // Body: { "module": "target.exe", "file": "out.exe", "oep": "0x140001000",
+    //         "fix_section_flags": true }
+    router.post("/api/dump/rebuild", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) return s_http_response::bad_request("Invalid JSON body");
+
+        const auto module_name = body.value("module", "");
+        const auto file_path = body.value("file", "");
+        const auto oep_expr = body.value("oep", "");
+        const bool fix_flags = body.value("fix_section_flags", true);
+
+        if (module_name.empty()) return s_http_response::bad_request("Missing 'module'");
+        if (file_path.empty()) return s_http_response::bad_request("Missing 'file'");
+
+        const auto base = bridge.get_module_base(module_name);
+        if (base == 0) return s_http_response::not_found("Module not found: " + module_name);
+
+        // ---- headers -------------------------------------------------------
+        auto dos = bridge.read_memory(base, 0x40);
+        if (!dos.has_value() || dos->size() < 0x40 || (*dos)[0] != 'M' || (*dos)[1] != 'Z') {
+            return s_http_response::internal_error("Not a PE image at module base");
+        }
+        uint32_t e_lfanew = 0;
+        std::memcpy(&e_lfanew, dos->data() + 0x3C, 4);
+
+        // PE sig + COFF + optional header (large enough for PE32 and PE32+).
+        auto headers = bridge.read_memory(base + e_lfanew, 24 + 240);
+        if (!headers.has_value() || headers->size() < 24 + 112) {
+            return s_http_response::internal_error("Cannot read PE headers");
+        }
+        const uint8_t* pe = headers->data();
+        if (pe[0] != 'P' || pe[1] != 'E') {
+            return s_http_response::internal_error("Bad PE signature");
+        }
+
+        uint16_t num_sections = 0;
+        std::memcpy(&num_sections, headers->data() + 6, 2);
+        uint16_t opt_size = 0;
+        std::memcpy(&opt_size, headers->data() + 20, 2);
+        if (num_sections == 0 || num_sections > 96) {
+            return s_http_response::internal_error("Implausible section count");
+        }
+
+        const size_t opt_off = 24;
+        uint16_t magic = 0;
+        std::memcpy(&magic, headers->data() + opt_off, 2);
+        const bool pe32plus = (magic == 0x20B);
+
+        uint32_t file_align = 0, sect_align = 0, size_of_image = 0;
+        uint32_t size_of_headers = 0, entry_rva = 0;
+        std::memcpy(&entry_rva, headers->data() + opt_off + 16, 4);
+        std::memcpy(&sect_align, headers->data() + opt_off + 32, 4);
+        std::memcpy(&file_align, headers->data() + opt_off + 36, 4);
+        std::memcpy(&size_of_image, headers->data() + opt_off + 56, 4);
+        std::memcpy(&size_of_headers, headers->data() + opt_off + 60, 4);
+
+        if (file_align == 0 || file_align > 0x10000 || (file_align & (file_align - 1))) {
+            // Packers sometimes leave this bogus. 0x200 is the universal default
+            // for x86/x64 images and is what every loader accepts.
+            file_align = 0x200;
+        }
+        if (sect_align == 0) sect_align = 0x1000;
+
+        // The output buffer starts at the module base, so every offset into it is
+        // an RVA. The PE header is not at RVA 0 - it starts at e_lfanew, which is
+        // why the section table is e_lfanew + 24 + SizeOfOptionalHeader.
+        const size_t section_table_off = e_lfanew + opt_off + opt_size;
+        const size_t headers_size = section_table_off + static_cast<size_t>(num_sections) * 40;
+        const size_t header_bytes = headers_size > size_of_headers ? headers_size : size_of_headers;
+        std::vector<uint8_t> out(header_bytes, 0);
+
+        auto img = bridge.read_memory(base, out.size());
+        if (!img.has_value()) {
+            return s_http_response::internal_error("Cannot read image headers from process");
+        }
+        std::memcpy(out.data(), img->data(), out.size());
+
+        // ---- sections ------------------------------------------------------
+        struct sec_info {
+            std::string name;
+            uint32_t va, vsize, raw_ptr, raw_size;
+            uint32_t characteristics;
+        };
+        std::vector<sec_info> secs;
+        secs.reserve(num_sections);
+
+        for (uint16_t i = 0; i < num_sections; ++i) {
+            const size_t off = section_table_off + static_cast<size_t>(i) * 40;
+            if (off + 40 > out.size()) break;
+
+            sec_info s{};
+            char name[9] = {};
+            std::memcpy(name, out.data() + off, 8);
+            s.name = name;
+
+            std::memcpy(&s.vsize,   out.data() + off + 8,  4);
+            std::memcpy(&s.va,      out.data() + off + 12, 4);
+            std::memcpy(&s.raw_size, out.data() + off + 16, 4);
+            std::memcpy(&s.raw_ptr,  out.data() + off + 20, 4);
+            std::memcpy(&s.characteristics, out.data() + off + 36, 4);
+
+            // A zero VirtualSize means "same as raw size"; a zero raw size means
+            // the section occupies only virtual space (e.g. .bss).
+            const uint32_t span = s.vsize ? s.vsize : s.raw_size;
+            if (span == 0 || s.va == 0) continue;
+
+            // Round the on-disk size up to FileAlignment.
+            uint32_t disk_size = (span + file_align - 1) & ~(file_align - 1);
+            s.raw_size = disk_size;
+
+            // Skip sections that point outside the mapped image.
+            if (static_cast<uint64_t>(s.va) + span > size_of_image + sect_align) {
+                s.raw_size = 0;
+            }
+            secs.push_back(s);
+        }
+        if (secs.empty()) return s_http_response::internal_error("No usable sections");
+
+        // Assign file offsets in VA order, starting after the headers.
+        std::sort(secs.begin(), secs.end(),
+                  [](const sec_info& a, const sec_info& b) { return a.va < b.va; });
+
+        size_t raw_cursor = (out.size() + file_align - 1) & ~(static_cast<size_t>(file_align) - 1);
+        for (auto& s : secs) {
+            if (s.raw_size == 0) { s.raw_ptr = 0; continue; }
+            s.raw_ptr = static_cast<uint32_t>(raw_cursor);
+            raw_cursor += s.raw_size;
+        }
+
+        out.resize(raw_cursor, 0);
+
+        // Copy each section's bytes out of the mapped image.
+        nlohmann::json section_report = nlohmann::json::array();
+        size_t copied = 0, unreadable = 0;
+
+        for (const auto& s : secs) {
+            if (s.raw_size == 0) continue;
+
+            const uint32_t span = s.vsize ? s.vsize : s.raw_size;
+            const uint32_t copy_len = std::min<uint32_t>(span, s.raw_size);
+
+            auto data = bridge.read_memory(base + s.va, copy_len);
+            if (data.has_value() && data->size() == copy_len) {
+                std::memcpy(out.data() + s.raw_ptr, data->data(), copy_len);
+                copied++;
+            } else {
+                // Leave zeros rather than aborting: a partially dumped image is
+                // still useful, as long as the caller knows which parts are junk.
+                unreadable++;
+            }
+
+            section_report.push_back({
+                {"name",   s.name},
+                {"va",     format_utils::format_address(s.va)},
+                {"vsize",  s.vsize},
+                {"raw_ptr", format_utils::format_address(s.raw_ptr)},
+                {"raw_size", s.raw_size},
+                {"readable", data.has_value() && data->size() == copy_len}
+            });
+        }
+
+        // ---- rewrite the section table -------------------------------------
+        // Each header entry is matched back to its layout record by VA+name, so
+        // the table keeps its original order. Reordering it would break the
+        // section indices that data directories (resources, relocations, TLS)
+        // refer to.
+        for (uint16_t i = 0; i < num_sections; ++i) {
+            const size_t off = section_table_off + static_cast<size_t>(i) * 40;
+            if (off + 40 > out.size()) break;
+
+            char name[9] = {};
+            std::memcpy(name, out.data() + off, 8);
+            uint32_t va = 0;
+            std::memcpy(&va, out.data() + off + 12, 4);
+
+            for (const auto& s : secs) {
+                if (s.va != va || s.name != name) continue;
+
+                std::memcpy(out.data() + off + 16, &s.raw_size, 4);
+                std::memcpy(out.data() + off + 20, &s.raw_ptr, 4);
+
+                if (fix_flags) {
+                    // Memory-only permissions must not survive into the file:
+                    // a section marked MEM_WRITE|MEM_EXECUTE on disk makes some
+                    // scanners and loaders reject the image, and IMAGE_SCN_MEM_WRITE
+                    // on .text is a strong packed-file tell.
+                    uint32_t chars = s.characteristics;
+                    chars &= ~IMAGE_SCN_MEM_WRITE;
+                    if (chars & IMAGE_SCN_MEM_EXECUTE) chars |= IMAGE_SCN_MEM_READ;
+                    std::memcpy(out.data() + off + 36, &chars, 4);
+                }
+                break;
+            }
+        }
+
+        // SizeOfImage must cover the highest section end, page-aligned.
+        uint32_t max_end = 0;
+        for (const auto& s : secs) {
+            const uint32_t end = s.va + ((s.vsize ? s.vsize : s.raw_size) );
+            if (end > max_end) max_end = end;
+        }
+        uint32_t new_image_size = (max_end + sect_align - 1) & ~(sect_align - 1);
+        std::memcpy(out.data() + e_lfanew + opt_off + 56, &new_image_size, 4);
+
+        // SizeOfHeaders must cover the whole header region, padded to FileAlignment.
+        uint32_t new_headers = static_cast<uint32_t>(
+            (headers_size + file_align - 1) & ~(static_cast<size_t>(file_align) - 1));
+        std::memcpy(out.data() + e_lfanew + opt_off + 60, &new_headers, 4);
+
+        // ---- OEP -----------------------------------------------------------
+        nlohmann::json oep_report = nlohmann::json::object();
+        bool oep_applied = false;
+
+        if (!oep_expr.empty()) {
+            const duint oep_va = bridge.eval_expression(oep_expr);
+            if (oep_va > base) {
+                uint32_t oep_rva = static_cast<uint32_t>(oep_va - base);
+                std::memcpy(out.data() + e_lfanew + opt_off + 16, &oep_rva, 4);
+                oep_report = {{"address", format_utils::format_address(oep_va)},
+                              {"rva", format_utils::format_address(oep_rva)}};
+                oep_applied = true;
+            } else {
+                oep_report = {{"error", "OEP expression did not resolve inside the module"},
+                              {"expression", oep_expr}};
+            }
+        } else {
+            oep_report = {{"value", format_utils::format_address(entry_rva)},
+                          {"note", "unchanged - original entry still points at the "
+                                   "packer stub. Pass 'oep' to set the real one."}};
+        }
+
+        // ---- write ---------------------------------------------------------
+        std::ofstream f(file_path, std::ios::binary | std::ios::trunc);
+        if (!f) return s_http_response::internal_error("Cannot open output file: " + file_path);
+        f.write(reinterpret_cast<const char*>(out.data()),
+                static_cast<std::streamsize>(out.size()));
+        const bool wrote = f.good();
+        f.close();
+
+        if (!wrote) return s_http_response::internal_error("Failed writing " + file_path);
+
+        return s_http_response::ok({
+            {"success",        true},
+            {"module",         module_name},
+            {"file",           file_path},
+            {"bytes",          out.size()},
+            {"pe32plus",       pe32plus},
+            {"file_alignment", file_align},
+            {"section_alignment", sect_align},
+            {"size_of_image",  new_image_size},
+            {"size_of_headers", new_headers},
+            {"sections",       section_report},
+            {"sections_copied", copied},
+            {"sections_unreadable", unreadable},
+            {"oep",            oep_report},
+            {"oep_applied",    oep_applied},
+            {"note", unreadable
+                ? "Some sections could not be read; they were zero-filled."
+                : "All sections copied. The IAT is NOT rebuilt by this route - "
+                  "run fix_iat (requires Scylla) before the image can run standalone."}
         });
     });
 

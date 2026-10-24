@@ -2,6 +2,7 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -9,8 +10,148 @@
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
+#include "_scriptapi_module.h"
 
 namespace handlers {
+
+namespace {
+
+// Instruction encodings that anti-VM / anti-debug code uses to inspect the
+// machine itself. Scanning for these is how you find the checks; the scan only
+// reports locations, it does not alter behaviour.
+struct probe_pattern {
+    const char* name;
+    const char* why;
+    std::vector<uint8_t> bytes;
+    bool wildcard_tail;   // trailing operand bytes vary, match the opcode only
+};
+
+// Only unambiguous encodings belong here. A single-byte opcode such as `in`
+// (0xEC) matches arbitrary displacement/immediate bytes in unrelated code -
+// scanning winver.exe that way produced 20 "VMware backdoor" hits, none of them
+// real. Multi-byte opcodes whose second byte is part of a fixed pattern are
+// what make a scan usable; `in` is reachable only through the two-byte form
+// with the port operand checked.
+const std::vector<probe_pattern>& vm_probes() {
+    static const std::vector<probe_pattern> patterns = {
+        {"cpuid",  "hypervisor-present bit and vendor leaf (0x40000000)", {0x0F, 0xA2}, false},
+        {"rdtsc",  "timing delta; the classic single-step / sandbox check", {0x0F, 0x31}, false},
+        {"rdtscp", "timing delta with serialisation", {0x0F, 0x01, 0xF9}, false},
+        {"smsw",   "SMSW stores CR0; the VM86/monitor bit differs", {0x0F, 0x01, 0xE0}, false},
+        {"str",    "STR reads the task register; 0 under a hypervisor", {0x0F, 0x00, 0xC8}, false},
+        {"sldt",   "LDT selector; VM86 reveals", {0x0F, 0x00, 0xC0}, false},
+        // sidt/sgdt/sldt take a memory operand, so the ModRM byte varies. Match
+        // the fixed 0F 01 + ModRM-prefix and let the caller see the address.
+        {"sidt",   "IDT base; hypervisors relocate it", {0x0F, 0x01, 0x0D}, true},
+        {"sgdt",   "GDT base; hypervisors relocate it", {0x0F, 0x01, 0x05}, true},
+        {"sidt",   "IDT base (register form)", {0x0F, 0x01, 0x1D}, true},
+    };
+    return patterns;
+}
+
+// Scan the given module's executable sections for the probe instructions.
+nlohmann::json scan_probes(c_bridge_executor& bridge, const std::string& module_name,
+                           size_t max_hits_per_pattern) {
+    const auto base = bridge.get_module_base(module_name);
+    if (base == 0) return nlohmann::json{{"error", "module not found: " + module_name}};
+
+    // Walk the section table for executable regions.
+    auto dos = bridge.read_memory(base, 0x40);
+    if (!dos.has_value() || dos->size() < 0x40) {
+        return nlohmann::json{{"error", "cannot read DOS header"}};
+    }
+    uint32_t e_lfanew = 0;
+    std::memcpy(&e_lfanew, dos->data() + 0x3C, 4);
+
+    auto pe = bridge.read_memory(base + e_lfanew, 24);
+    if (!pe.has_value() || pe->size() < 24) {
+        return nlohmann::json{{"error", "cannot read PE header"}};
+    }
+    uint16_t num_sections = 0, opt_size = 0;
+    std::memcpy(&num_sections, pe->data() + 6, 2);
+    std::memcpy(&opt_size, pe->data() + 20, 2);
+    if (num_sections == 0 || num_sections > 96) {
+        return nlohmann::json{{"error", "implausible section count"}};
+    }
+
+    const duint section_table = base + e_lfanew + 24 + opt_size;
+    auto sec_headers = bridge.read_memory(section_table, static_cast<size_t>(num_sections) * 40);
+    if (!sec_headers.has_value()) {
+        return nlohmann::json{{"error", "cannot read section table"}};
+    }
+
+    nlohmann::json results = nlohmann::json::array();
+    size_t total = 0;
+
+    for (uint16_t i = 0; i < num_sections; ++i) {
+        const size_t off = static_cast<size_t>(i) * 40;
+        uint32_t va = 0, vsize = 0, raw_size = 0, chars = 0;
+        char name[9] = {};
+        std::memcpy(name, sec_headers->data() + off, 8);
+        std::memcpy(&vsize, sec_headers->data() + off + 8, 4);
+        std::memcpy(&va, sec_headers->data() + off + 12, 4);
+        std::memcpy(&raw_size, sec_headers->data() + off + 16, 4);
+        std::memcpy(&chars, sec_headers->data() + off + 36, 4);
+
+        if (!(chars & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+        const uint32_t span = vsize ? vsize : raw_size;
+        if (span == 0 || span > 64u * 1024 * 1024) continue;
+
+        auto code = bridge.read_memory(base + va, span);
+        if (!code.has_value()) continue;
+        const auto& buf = *code;
+
+        for (const auto& p : vm_probes()) {
+            size_t hits = 0;
+            if (buf.size() < p.bytes.size()) continue;
+
+            for (size_t k = 0; k + p.bytes.size() <= buf.size(); ++k) {
+                if (std::memcmp(buf.data() + k, p.bytes.data(), p.bytes.size()) != 0) continue;
+
+                // A raw byte match is not an instruction: the same bytes occur
+                // inside displacements, immediates and data. Confirm by asking
+                // the disassembler what actually starts at this address, and
+                // require the mnemonic to agree.
+                const duint at = base + va + k;
+                DISASM_INSTR di{};
+                DbgDisasmAt(at, &di);
+                if (di.instr_size <= 0 ||
+                    _stricmp(di.instruction, p.name) != 0) {
+                    continue;
+                }
+
+                if (hits < max_hits_per_pattern) {
+                    results.push_back({
+                        {"instruction", p.name},
+                        {"detects",     p.why},
+                        {"section",     name},
+                        {"address",     format_utils::format_address(at)},
+                        {"offset",      format_utils::format_hex(va + k)},
+                        {"disasm",      std::string(di.instruction)}
+                    });
+                }
+                ++hits;
+                ++total;
+                k += p.bytes.size() - 1;
+            }
+        }
+    }
+
+    return nlohmann::json{
+        {"module",        module_name},
+        {"base",          format_utils::format_address(base)},
+        {"hits",          results},
+        {"count",         results.size()},
+        {"total_matches", total},
+        {"truncated",     results.size() < total},
+        {"note",          "Locations only - nothing was patched or faked. Set a "
+                          "breakpoint on an address above and inspect the registers "
+                          "when it fires to see what the check decides."}
+    };
+}
+
+} // namespace
 
 void register_antidebug_routes(c_http_router& router) {
     // GET /api/antidebug/peb?pid= - Read PEB info
@@ -156,30 +297,75 @@ void register_antidebug_routes(c_http_router& router) {
         }
 
         nlohmann::json changes = nlohmann::json::array();
+        nlohmann::json failed = nlohmann::json::array();
 
-        // Zero out BeingDebugged (PEB + 0x2)
-        std::vector<uint8_t> zero_byte = {0x00};
-        auto result = bridge.write_memory(peb_addr + 0x2, zero_byte);
-        if (result.has_value()) {
-            changes.push_back({{"field", "BeingDebugged"}, {"offset", "0x2"}, {"value", 0}});
-        }
+        // Write, then read back. A successful DbgMemWrite only means the write
+        // call returned; the target's own code (or a protection layer) can put
+        // the value straight back, and reporting "hidden" in that case would be
+        // a lie the caller then relies on.
+        auto poke_verified = [&](duint addr, size_t size, const std::string& field) {
+            std::vector<uint8_t> zeros(size, 0);
+            const auto before = bridge.read_memory(addr, size);
+            if (!before.has_value()) {
+                failed.push_back({{"field", field}, {"reason", "read failed before write"}});
+                return;
+            }
 
-        // Zero out NtGlobalFlag
+            const auto w = bridge.write_memory(addr, zeros);
+            if (!w.has_value()) {
+                failed.push_back({{"field", field}, {"reason", w.error()}});
+                return;
+            }
+
+            const auto after = bridge.read_memory(addr, size);
+            if (!after.has_value()) {
+                failed.push_back({{"field", field}, {"reason", "read failed after write"}});
+                return;
+            }
+
+            const bool all_zero = std::all_of(after->begin(), after->end(),
+                                              [](uint8_t b) { return b == 0; });
+            if (all_zero) {
+                changes.push_back({
+                    {"field", field},
+                    {"address", format_utils::format_address(addr)},
+                    {"was", format_utils::format_hex(
+                        static_cast<duint>(before->size() == 1 ? (*before)[0]
+                                             : before->size() == 4
+                                                 ? *reinterpret_cast<const uint32_t*>(before->data())
+                                                 : 0))},
+                    {"value", 0},
+                    {"verified", true}
+                });
+            } else {
+                failed.push_back({
+                    {"field", field},
+                    {"address", format_utils::format_address(addr)},
+                    {"reason", "value came back non-zero after the write "
+                               "(another thread or a protection layer restored it)"}
+                });
+            }
+        };
+
+        poke_verified(peb_addr + 0x2, 1, "BeingDebugged");
+
 #ifdef _WIN64
         constexpr duint ntglobalflag_offset = 0xBC;
 #else
         constexpr duint ntglobalflag_offset = 0x68;
 #endif
-        std::vector<uint8_t> zero_dword = {0x00, 0x00, 0x00, 0x00};
-        result = bridge.write_memory(peb_addr + ntglobalflag_offset, zero_dword);
-        if (result.has_value()) {
-            changes.push_back({{"field", "NtGlobalFlag"}, {"offset", format_utils::format_hex(ntglobalflag_offset)}, {"value", 0}});
-        }
+        poke_verified(peb_addr + ntglobalflag_offset, 4, "NtGlobalFlag");
+
+        const bool all_ok = failed.empty();
 
         return s_http_response::ok({
             {"peb_address", format_utils::format_address(peb_addr)},
             {"changes", changes},
-            {"message", "Debugger hidden from PEB checks"}
+            {"failed", failed},
+            {"success", all_ok},
+            {"message", all_ok
+                ? "Debugger hidden from PEB checks (verified by read-back)"
+                : "Some PEB fields could not be cleared - see 'failed'"}
         });
     });
 
@@ -281,6 +467,43 @@ void register_antidebug_routes(c_http_router& router) {
             {"skipped", skipped},
             {"message", "Anti-debug hardening applied"}
         });
+    });
+
+    // GET /api/antidebug/vm_probes?module=&max_hits= - Locate anti-VM probes
+    //
+    // Finds cpuid / rdtsc / sidt / str and friends in the module's executable
+    // sections. This is a discovery aid: knowing where a target inspects the
+    // machine is what lets you breakpoint it and read the decision, instead of
+    // guessing why behaviour differs between hosts.
+    router.get("/api/antidebug/vm_probes", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto module_name = req.get_query("module", "");
+        if (module_name.empty()) {
+            char main_name[MAX_MODULE_SIZE] = {};
+            if (!Script::Module::GetMainModuleName(main_name) || main_name[0] == '\0') {
+                return s_http_response::bad_request(
+                    "Missing 'module' and the main module name is unavailable");
+            }
+            module_name = main_name;
+        }
+
+        size_t max_hits = 200;
+        const auto raw_max = req.get_query("max_hits", "");
+        if (!raw_max.empty()) {
+            try {
+                max_hits = static_cast<size_t>(std::stoul(raw_max));
+            } catch (...) {
+                return s_http_response::bad_request("'max_hits' must be a number");
+            }
+            if (max_hits == 0) max_hits = 1;
+            if (max_hits > 2000) max_hits = 2000;
+        }
+
+        return s_http_response::ok(scan_probes(bridge, module_name, max_hits));
     });
 
     // GET /api/antidebug/dep_status - DEP enabled status

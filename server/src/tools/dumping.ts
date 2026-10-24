@@ -6,18 +6,19 @@ import { requireString } from './util.js';
 export function registerDumpingTools(server: McpServer) {
   server.tool(
     'x64dbg_dumping',
-    'PE analysis, module dumping and IAT repair. Actions: pe_header, sections, imports, exports, entry_point, relocations, dump_module, fix_iat, export_patch_file, detect_oep.',
+    'PE analysis, module dumping and IAT repair. Actions: pe_header, sections, imports, exports, entry_point, relocations, dump_module (flat memory copy), rebuild (loader-valid PE with realigned sections, fixed sizes and optional OEP), fix_iat (requires the Scylla plugin; fails loudly when absent), export_patch_file, detect_oep.',
     {
       action: z.enum([
         'pe_header', 'sections', 'imports', 'exports', 'entry_point',
-        'relocations', 'dump_module', 'fix_iat', 'export_patch_file', 'detect_oep',
+        'relocations', 'dump_module', 'rebuild', 'fix_iat', 'export_patch_file', 'detect_oep',
       ]).describe('Operation to perform'),
 
       address: z.string().optional().describe('pe_header/relocations: address inside the PE'),
       module: z.string().optional().describe('module-based actions'),
-      file: z.string().optional().describe('dump_module: output path (default module-derived)'),
-      oep: z.string().optional().describe('fix_iat: original entry point address'),
+      file: z.string().optional().describe('dump_module/rebuild: output path'),
+      oep: z.string().optional().describe('fix_iat/rebuild: original entry point address'),
       filename: z.string().optional().describe('export_patch_file: output path for the .1337 patch file'),
+      fix_section_flags: z.boolean().optional().describe('rebuild: clear MEM_WRITE from section flags (default true)'),
     },
     async (args) => {
       switch (args.action) {
@@ -37,6 +38,15 @@ export function registerDumpingTools(server: McpServer) {
           const data = await httpClient.post('/api/dump/module', {
             module: requireString(args.module, 'module'),
             file: args.file ?? '',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'rebuild': {
+          const data = await httpClient.post('/api/dump/rebuild', {
+            module: requireString(args.module, 'module'),
+            file: requireString(args.file, 'file'),
+            oep: args.oep ?? '',
+            fix_section_flags: args.fix_section_flags ?? true,
           });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
