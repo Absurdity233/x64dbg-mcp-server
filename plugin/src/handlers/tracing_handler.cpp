@@ -2,6 +2,7 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 #include "util/trace_state.h"
+#include "util/trace_auto.h"
 
 #include <string>
 #include <windows.h>
@@ -184,6 +185,60 @@ void register_tracing_routes(c_http_router& router) {
             {"file", file},
             {"note", "each trace row carries the thread id and GetTickCount() as the last two columns"}
         });
+    });
+
+    // POST /api/trace/auto - Continuous tracing across pauses
+    //
+    // A run-trace stops at the first pause and can only be started while
+    // paused, so covering a flow that hits breakpoints means re-arming after
+    // every one of them. This runs that loop on a worker thread and writes
+    // numbered segments.
+    //
+    // Body: { "dir": "...", "prefix": "seg", "condition": "0",
+    //         "max_steps": "100000", "log_text": "...", "hold_ms": 0,
+    //         "max_segments": 0 }
+    router.post("/api/trace/auto", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        mcp::trace_auto_config cfg;
+        cfg.dir = body.value("dir", "");
+        if (cfg.dir.empty()) {
+            return s_http_response::bad_request("Missing 'dir' (segment output directory)");
+        }
+        cfg.prefix      = body.value("prefix", "seg");
+        cfg.condition   = body.value("condition", "0");
+        cfg.max_steps   = body.value("max_steps", "");
+        cfg.log_text    = body.value("log_text",
+                                     "{p:cip},{p:rax},{tid()},{GetTickCount()}");
+        cfg.hold_ms     = body.value("hold_ms", 0);
+        cfg.max_segments = body.value("max_segments", 0u);
+
+        if (cfg.hold_ms < 0) cfg.hold_ms = 0;
+
+        mcp::trace_auto_start(cfg);
+
+        return s_http_response::ok({
+            {"success", true},
+            {"dir", cfg.dir},
+            {"note", "the target resumes on its own as each segment is armed; "
+                     "call trace_auto_stop to regain control"}
+        });
+    });
+
+    // POST /api/trace/auto/status - Progress of continuous tracing
+    router.get("/api/trace/auto/status", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(mcp::trace_auto_status());
+    });
+
+    // POST /api/trace/auto/stop - Stop continuous tracing
+    router.post("/api/trace/auto/stop", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(mcp::trace_auto_stop());
     });
 
     // POST /api/trace/step_filter - Restrict tracing to a module or address range

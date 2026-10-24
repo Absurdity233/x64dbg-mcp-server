@@ -13,6 +13,7 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 #include "util/trace_state.h"
+#include "util/trace_auto.h"
 #include "util/event_log.h"
 #include "resources/plugin_icon.h"
 #include "ui/settings_dialog.h"
@@ -249,7 +250,10 @@ static void cb_exception(CBTYPE, void* cb_info) {
 
 static void cb_paused(CBTYPE, void*) {
     // A run-trace only advances while the target runs; pausing ends it.
+    // trace_auto_notify_paused only signals a condition variable, so it is safe
+    // on the debugger thread.
     mcp::trace_mark_stopped();
+    mcp::trace_auto_notify_paused();
     event_log::push("paused");
 }
 
@@ -507,6 +511,8 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init_struct) {
 }
 
 PLUG_EXPORT bool plugstop() {
+    // Join the continuous-trace worker before anything it calls disappears.
+    mcp::trace_auto_shutdown();
     // Unregister command + callbacks
     _plugin_unregistercommand(g_plugin_handle, "mcpserver");
     _plugin_unregistercallback(g_plugin_handle, CB_INITDEBUG);

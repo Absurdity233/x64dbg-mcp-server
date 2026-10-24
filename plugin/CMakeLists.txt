@@ -37,6 +37,7 @@ set(SOURCES
     src/http/c_http_router.cpp
     src/bridge/c_bridge_executor.cpp
     src/util/format_utils.cpp
+    src/util/trace_auto.cpp
     src/util/event_log.cpp
     src/handlers/debug_handler.cpp
     src/handlers/register_handler.cpp

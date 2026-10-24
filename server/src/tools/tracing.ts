@@ -6,12 +6,13 @@ import { requireString } from './util.js';
 export function registerTracingTools(server: McpServer) {
   server.tool(
     'x64dbg_tracing',
-    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id and GetTickCount() in every row; the tick is what makes event alignment exact), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id). A run-trace only advances while the target runs: pausing ends it, so restart the trace after each resume.',
+    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id and GetTickCount() in every row; the tick is what makes event alignment exact), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id), auto (continuous tracing across pauses, written to numbered segments), auto_status, auto_stop. A run-trace only advances while the target runs: pausing ends it, which is what auto exists to work around.',
     {
       action: z.enum([
         'into', 'over', 'run', 'stop', 'status', 'animate',
         'conditional_run', 'log_setup', 'hitcount', 'type', 'set_type',
         'trace_thread', 'step_filter', 'trace_all_threads',
+        'auto', 'auto_status', 'auto_stop',
       ]).describe('Operation to perform'),
 
       condition: z.string().optional().describe('Break condition expression (into/over/conditional_run/log_setup)'),
@@ -29,6 +30,10 @@ export function registerTracingTools(server: McpServer) {
       tid: z.union([z.string(), z.number()]).optional().describe('trace_thread: thread id to switch to before tracing'),
       filter: z.string().optional().describe("step_filter: 'user', 'system', 'none', or a module name to restrict tracing to"),
       mode: z.enum(['into', 'over']).optional().describe('trace_thread: trace mode (default into)'),
+      dir: z.string().optional().describe('auto: directory for numbered segment files (required)'),
+      prefix: z.string().optional().describe('auto: segment file prefix (default seg)'),
+      hold_ms: z.number().optional().describe('auto: dwell time after each pause before re-arming (default 0)'),
+      max_segments: z.number().optional().describe('auto: stop after this many segments (0 = unlimited)'),
     },
     async (args) => {
       const { action } = args;
@@ -104,6 +109,26 @@ export function registerTracingTools(server: McpServer) {
           const data = await httpClient.post('/api/trace/step_filter', {
             filter: requireString(args.filter, 'filter'),
           });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'auto': {
+          const data = await httpClient.post('/api/trace/auto', {
+            dir: requireString(args.dir, 'dir'),
+            prefix: args.prefix ?? 'seg',
+            condition: args.condition ?? '0',
+            max_steps: args.max_steps ?? '',
+            log_text: args.log_text ?? '',
+            hold_ms: args.hold_ms ?? 0,
+            max_segments: args.max_segments ?? 0,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'auto_status': {
+          const data = await httpClient.get('/api/trace/auto/status');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'auto_stop': {
+          const data = await httpClient.post('/api/trace/auto/stop');
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'set_type': {
