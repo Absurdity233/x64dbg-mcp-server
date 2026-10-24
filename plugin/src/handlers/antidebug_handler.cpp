@@ -506,6 +506,114 @@ void register_antidebug_routes(c_http_router& router) {
         return s_http_response::ok(scan_probes(bridge, module_name, max_hits));
     });
 
+    // POST /api/antidebug/probe_breakpoints - Instrument every anti-VM probe
+    //
+    // Scanning tells you where the checks are; this makes them observable.
+    // Each hit gets a silent logging breakpoint that records the registers and
+    // the result the instruction produces, so the event log becomes a timeline
+    // of "which check ran, when, and what it decided" - which is the part that
+    // actually explains a behaviour difference between hosts.
+    //
+    // Silent + fast_resume so the target keeps running; nothing is modified.
+    //
+    // Body: { "module": "...", "max_hits": 200, "log_text": "...",
+    //         "resume": true }
+    router.post("/api/antidebug/probe_breakpoints", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        std::string module_name = body.value("module", "");
+        if (module_name.empty()) {
+            char main_name[MAX_MODULE_SIZE] = {};
+            if (!Script::Module::GetMainModuleName(main_name) || main_name[0] == '\0') {
+                return s_http_response::bad_request("Missing 'module' and no main module");
+            }
+            module_name = main_name;
+        }
+
+        size_t max_hits = body.value("max_hits", static_cast<size_t>(200));
+        if (max_hits == 0) max_hits = 1;
+        if (max_hits > 500) max_hits = 500;   // one breakpoint per instruction
+
+        // Default log captures what the check itself computes: cip, all four
+        // scratch registers (the CPUID result lands in eax/ebx/ecx/edx) and the
+        // thread, so a hit is attributable without pausing.
+        const auto log_text = body.value(
+            "log_text",
+            std::string("{p:cip} cpuid/rdtsc rax={p:rax} rbx={p:rbx} "
+                        "rcx={p:rcx} rdx={p:rdx} tid={tid()} tick={GetTickCount()}"));
+
+        const auto scan = scan_probes(bridge, module_name, max_hits);
+        if (scan.contains("error")) {
+            return s_http_response::internal_error(scan["error"].get<std::string>());
+        }
+
+        nlohmann::json armed = nlohmann::json::array();
+        nlohmann::json failed = nlohmann::json::array();
+
+        for (const auto& hit : scan["hits"]) {
+            const auto addr = hit["address"].get<std::string>();
+
+            // Software breakpoint: the probe instructions are real code, not
+            // guarded memory, so an 0xCC is appropriate here - unlike the
+            // memory breakpoints that fault on a self-modifying unpacker.
+            if (!bridge.exec_command("bp " + addr)) {
+                failed.push_back({{"address", addr}, {"reason", "bp rejected"}});
+                continue;
+            }
+
+            bridge.exec_command("SetBreakpointSilent " + addr + ", 1");
+            bridge.exec_command("SetBreakpointLog " + addr + ", \"" + log_text + "\"");
+            // Log and continue: the point is a timeline, not a stop.
+            bridge.exec_command("SetBreakpointFastResume " + addr + ", 1");
+            // Name it so the event-log entry identifies the instruction.
+            bridge.exec_command("SetBreakpointName " + addr + ", \"vmprobe:" +
+                                hit["instruction"].get<std::string>() + "\"");
+
+            armed.push_back({
+                {"instruction", hit["instruction"]},
+                {"address",     addr},
+                {"section",     hit["section"]},
+                {"detects",     hit["detects"]}
+            });
+        }
+
+        // Optionally start the target so the probes actually fire.
+        const bool resume = body.value("resume", true);
+        if (resume && !armed.empty() && !bridge.is_running()) {
+            bridge.exec_command_async("run");
+        }
+
+        nlohmann::json out = {
+            {"module",   module_name},
+            {"armed",    armed},
+            {"count",    armed.size()},
+            {"failed",   failed},
+            {"resumed",  resume && !armed.empty()},
+            {"log_text", log_text},
+            {"note", "Each hit is written to the event log (x64dbg_command "
+                     "get_events / wait_for_event, type 'breakpoint'). Nothing "
+                     "was patched: the checks still run and still decide."}
+        };
+
+        // fast_resume does not take effect for every instruction: measured on
+        // 2026.05.27, an rdtscp breakpoint with silent=1 and fast_resume=1 still
+        // paused the target on all 10 hits, while cpuid breakpoints resumed.
+        // Say so rather than letting the caller discover the target stopped.
+        if (!armed.empty()) {
+            out["warning"] =
+                "Some probes may still pause the target (fast_resume is not honoured "
+                "for every instruction). If it stops, check trace/debug state and "
+                "run again; hits already logged are kept.";
+        }
+        return s_http_response::ok(out);
+    });
+
     // GET /api/antidebug/dep_status - DEP enabled status
     router.get("/api/antidebug/dep_status", [](const s_http_request&) -> s_http_response {
         auto& bridge = get_bridge();

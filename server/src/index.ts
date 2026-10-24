@@ -1,23 +1,12 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { config } from './config.js';
 import { httpClient } from './http_client.js';
 import { ensureX64dbg } from './launcher.js';
+import { checkPluginCompat } from './compat.js';
+import { getVersion } from './version.js';
 import { registerAllTools } from './tools/index.js';
-
-// Single source of truth for the version: package.json (next to dist/ in the
-// published package), so the reported version never drifts from the release.
-function getVersion(): string {
-  try {
-    const pkgUrl = new URL('../package.json', import.meta.url);
-    const pkg = JSON.parse(readFileSync(pkgUrl, 'utf8')) as { version?: string };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
 
 /**
  * Command-line overrides. Kept intentionally tiny - the launcher is a thin
@@ -110,6 +99,16 @@ async function main() {
       }
     });
   }
+
+  // Compare the installed plugin's version and route table against what this
+  // server expects. Runs after the handshake and after the launcher has had a
+  // moment, and only warns - a pinned older plugin is a legitimate setup, and
+  // this must never block startup.
+  setTimeout(() => {
+    void checkPluginCompat(getVersion()).then((compat) => {
+      console.error(`[x64dbg-mcp] ${compat.message}`);
+    });
+  }, 1500);
 
   // Graceful shutdown
   const cleanup = () => {

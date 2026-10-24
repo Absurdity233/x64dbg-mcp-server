@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
 project(x64dbg_mcp LANGUAGES CXX)
 
+# The plugin and the MCP server ship as separate artifacts, so their version
+# strings have to be comparable or /api/meta cannot detect a mismatch. The
+# server's package.json is the single source; both sides read it.
+set(SERVER_PACKAGE_JSON "${CMAKE_CURRENT_SOURCE_DIR}/../server/package.json")
+if(EXISTS "${SERVER_PACKAGE_JSON}")
+    file(READ "${SERVER_PACKAGE_JSON}" _pkg)
+    string(REGEX MATCH "\"version\"[ \t\r\n]*:[ \t\r\n]*\"([^\"]+)\"" _m "${_pkg}")
+    set(PROJECT_VERSION_STR "${CMAKE_MATCH_1}")
+else()
+    set(PROJECT_VERSION_STR "0.0.0-unknown")
+endif()
+message(STATUS "Plugin version: ${PROJECT_VERSION_STR}")
+add_compile_definitions(PLUGIN_VERSION_STR="${PROJECT_VERSION_STR}")
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

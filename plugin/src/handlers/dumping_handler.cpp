@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
@@ -67,6 +68,135 @@ bool get_data_directory(c_bridge_executor& bridge, duint base, int index,
     std::memcpy(&dir_rva, pe->data() + dd_off, 4);
     std::memcpy(&dir_size, pe->data() + dd_off + 4, 4);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// IAT reconstruction without Scylla
+//
+// A packed target's IAT is populated at runtime: every slot holds the address of
+// an export in some other loaded module. Rebuilding the table therefore means
+// answering, for each candidate pointer, "which module owns this address, and
+// which export is it?" - which every loaded module can answer from its own
+// export directory.
+//
+// Three sources are combined, in decreasing order of reliability:
+//   1. the import descriptors already in memory (a packer usually keeps them);
+//   2. a scan of the candidate IAT range for pointers into other modules'
+//      export ranges (recovers entries a packer stripped from the descriptors);
+//   3. for anything unresolved, a direct exported-name lookup by address.
+// ---------------------------------------------------------------------------
+
+struct export_entry {
+    duint address;
+    std::string name;
+    bool by_ordinal;
+    uint32_t ordinal;
+};
+
+struct module_exports {
+    std::string name;      // module file name, e.g. kernel32.dll
+    duint base;
+    duint size;
+    std::vector<export_entry> entries;   // sorted by address
+};
+
+// Parse one loaded module's export directory into a sorted address table.
+module_exports collect_exports(c_bridge_executor& bridge, const Script::Module::ModuleInfo& mod) {
+    module_exports out;
+    out.name = mod.name;
+    out.base = mod.base;
+    out.size = mod.size;
+    if (mod.base == 0 || mod.size == 0) return out;
+
+    bool pe32plus = false;
+    uint32_t exp_rva = 0, exp_size = 0;
+    if (!get_data_directory(bridge, mod.base, 0, pe32plus, exp_rva, exp_size) || exp_rva == 0) {
+        return out;
+    }
+
+    auto ed = bridge.read_memory(mod.base + exp_rva, 40);
+    if (!ed.has_value() || ed->size() < 40) return out;
+
+    uint32_t ordinal_base = 0, num_funcs = 0, num_names = 0;
+    uint32_t addr_funcs = 0, addr_names = 0, addr_ords = 0;
+    std::memcpy(&ordinal_base, ed->data() + 16, 4);
+    std::memcpy(&num_funcs,    ed->data() + 20, 4);
+    std::memcpy(&num_names,    ed->data() + 24, 4);
+    std::memcpy(&addr_funcs,   ed->data() + 28, 4);
+    std::memcpy(&addr_names,   ed->data() + 32, 4);
+    std::memcpy(&addr_ords,    ed->data() + 36, 4);
+
+    constexpr uint32_t kMax = 100000;
+    if (num_funcs > kMax || num_names > kMax) return out;
+    if (num_funcs == 0) return out;
+
+    auto funcs = bridge.read_memory(mod.base + addr_funcs, static_cast<size_t>(num_funcs) * 4);
+    if (!funcs.has_value() || funcs->size() < static_cast<size_t>(num_funcs) * 4) return out;
+
+    // Address -> name. Ordinal-only exports get a synthetic name later.
+    std::unordered_map<uint32_t, std::string> name_by_index;
+
+    if (num_names > 0) {
+        auto names = bridge.read_memory(mod.base + addr_names, static_cast<size_t>(num_names) * 4);
+        auto ords  = bridge.read_memory(mod.base + addr_ords,  static_cast<size_t>(num_names) * 2);
+        if (names.has_value() && ords.has_value() &&
+            names->size() >= static_cast<size_t>(num_names) * 4 &&
+            ords->size()  >= static_cast<size_t>(num_names) * 2) {
+            for (uint32_t i = 0; i < num_names; ++i) {
+                uint32_t name_rva = 0;
+                uint16_t ord_index = 0;
+                std::memcpy(&name_rva,  names->data() + i * 4, 4);
+                std::memcpy(&ord_index, ords->data()  + i * 2, 2);
+                if (name_rva == 0 || ord_index >= num_funcs) continue;
+                name_by_index[ord_index] = mem_cstr(bridge, mod.base + name_rva, 512);
+            }
+        }
+    }
+
+    out.entries.reserve(num_funcs);
+    for (uint32_t i = 0; i < num_funcs; ++i) {
+        uint32_t fn_rva = 0;
+        std::memcpy(&fn_rva, funcs->data() + i * 4, 4);
+        if (fn_rva == 0) continue;
+
+        // A forwarder (RVA inside the export directory) is not a real address.
+        if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_size) continue;
+
+        export_entry e{};
+        e.address = mod.base + fn_rva;
+        e.ordinal = ordinal_base + i;
+        const auto it = name_by_index.find(i);
+        if (it != name_by_index.end() && !it->second.empty()) {
+            e.name = it->second;
+            e.by_ordinal = false;
+        } else {
+            e.by_ordinal = true;
+        }
+        out.entries.push_back(std::move(e));
+    }
+
+    std::sort(out.entries.begin(), out.entries.end(),
+              [](const export_entry& a, const export_entry& b) { return a.address < b.address; });
+    return out;
+}
+
+// Which module owns `address`, and which export is it?
+const export_entry* resolve_pointer(const std::vector<module_exports>& mods,
+                                    duint address, const module_exports** owner) {
+    for (const auto& m : mods) {
+        if (address < m.base || address >= m.base + m.size) continue;
+        // Binary search the sorted export table.
+        auto lo = std::lower_bound(
+            m.entries.begin(), m.entries.end(), address,
+            [](const export_entry& e, duint a) { return e.address < a; });
+        if (lo != m.entries.end() && lo->address == address) {
+            if (owner) *owner = &m;
+            return &*lo;
+        }
+        if (owner) *owner = &m;
+        return nullptr;
+    }
+    return nullptr;
 }
 
 // Is the Scylla plugin installed next to x64dbg?
@@ -663,6 +793,20 @@ void register_dumping_routes(c_http_router& router) {
         const auto base = bridge.get_module_base(module_name);
         if (base == 0) return s_http_response::not_found("Module not found: " + module_name);
 
+        // The on-disk path is needed to recover the linker's ImageBase: the
+        // live header carries the ASLR address instead.
+        std::string module_path;
+        {
+            BridgeList<Script::Module::ModuleInfo> mods;
+            if (Script::Module::GetList(&mods)) {
+                for (int i = 0; i < mods.Count(); ++i) {
+                    if (mods[i].base != base) continue;
+                    if (mods[i].path[0]) module_path = mods[i].path;
+                    break;
+                }
+            }
+        }
+
         // ---- headers -------------------------------------------------------
         auto dos = bridge.read_memory(base, 0x40);
         if (!dos.has_value() || dos->size() < 0x40 || (*dos)[0] != 'M' || (*dos)[1] != 'Z') {
@@ -701,6 +845,42 @@ void register_dumping_routes(c_http_router& router) {
         std::memcpy(&file_align, headers->data() + opt_off + 36, 4);
         std::memcpy(&size_of_image, headers->data() + opt_off + 56, 4);
         std::memcpy(&size_of_headers, headers->data() + opt_off + 60, 4);
+
+        // ImageBase in the live image is wherever ASLR put it, not the value the
+        // linker recorded. Writing that address into the dump makes the loader
+        // believe the file prefers a base the relocation table knows nothing
+        // about: if it cannot map there it rebases using deltas computed from
+        // the *original* base, so every absolute address in .text ends up wrong
+        // and the process dies at start with STATUS_INVALID_IMAGE_FORMAT.
+        //
+        // Prefer the on-disk value. When the file cannot be read (packed
+        // targets are often gone from disk), keep the live value and strip the
+        // relocations instead, which is correct for an image whose pointers are
+        // already final.
+        uint64_t image_base = 0;
+        std::memcpy(&image_base, headers->data() + opt_off + 24, pe32plus ? 8 : 4);
+
+        uint64_t original_base = 0;
+        if (!module_path.empty()) {
+            std::ifstream disk(module_path, std::ios::binary);
+            if (disk) {
+                std::vector<uint8_t> head(0x400);
+                disk.read(reinterpret_cast<char*>(head.data()),
+                          static_cast<std::streamsize>(head.size()));
+                const auto got = static_cast<size_t>(disk.gcount());
+                if (got >= 0x40 && head[0] == 'M' && head[1] == 'Z') {
+                    uint32_t pe_off = 0;
+                    std::memcpy(&pe_off, head.data() + 0x3C, 4);
+                    if (pe_off + 24 + 88 <= got && head[pe_off] == 'P' && head[pe_off + 1] == 'E') {
+                        const size_t o = pe_off + 24;
+                        uint16_t m = 0;
+                        std::memcpy(&m, head.data() + o, 2);
+                        const bool dplus = (m == 0x20B);
+                        std::memcpy(&original_base, head.data() + o + 24, dplus ? 8 : 4);
+                    }
+                }
+            }
+        }
 
         if (file_align == 0 || file_align > 0x10000 || (file_align & (file_align - 1))) {
             // Packers sometimes leave this bogus. 0x200 is the universal default
@@ -855,6 +1035,42 @@ void register_dumping_routes(c_http_router& router) {
             (headers_size + file_align - 1) & ~(static_cast<size_t>(file_align) - 1));
         std::memcpy(out.data() + e_lfanew + opt_off + 60, &new_headers, 4);
 
+        // ---- ImageBase and relocations -------------------------------------
+        //
+        // Two cases, and mixing them up is what makes a dump fail to start:
+        //   * disk header readable -> restore the linker's ImageBase. The
+        //     relocation table in the image still describes that base, so the
+        //     loader can rebase correctly.
+        //   * no disk file -> keep the live base and strip relocations, because
+        //     the pointers in .text are already absolute for that base and
+        //     rebasing them again would double-apply the delta.
+        nlohmann::json base_report = nlohmann::json::object();
+
+        // Restoring the on-disk base and keeping the relocations was measured to
+        // be wrong: the loader then rebases every absolute address that the dump
+        // already captured post-relocation, and LoadLibraryEx fails with
+        // ERROR_NOACCESS (998). Keep the live base and strip the relocation
+        // directory - the pointers in .text are final for that base, and a
+        // stripped image is never rebased.
+        {
+            const size_t dd_reloc = e_lfanew + opt_off + (pe32plus ? 112 : 96) + 5 * 8;
+            uint32_t zero[2] = {0, 0};
+            std::memcpy(out.data() + dd_reloc, zero, sizeof(zero));
+
+            uint16_t coff = 0;
+            std::memcpy(&coff, out.data() + e_lfanew + 22, 2);
+            coff |= 0x0001;                       // IMAGE_FILE_RELOCS_STRIPPED
+            std::memcpy(out.data() + e_lfanew + 22, &coff, 2);
+
+            base_report = {
+                {"image_base",  format_utils::format_address(image_base)},
+                {"source",      "live image"},
+                {"on_disk_base", original_base ? format_utils::format_address(original_base)
+                                               : std::string("(no disk copy)")},
+                {"relocations", "stripped - pointers are already absolute for this base"}
+            };
+        }
+
         // ---- OEP -----------------------------------------------------------
         nlohmann::json oep_report = nlohmann::json::object();
         bool oep_applied = false;
@@ -902,10 +1118,565 @@ void register_dumping_routes(c_http_router& router) {
             {"sections_unreadable", unreadable},
             {"oep",            oep_report},
             {"oep_applied",    oep_applied},
+            {"image_base",     base_report},
             {"note", unreadable
                 ? "Some sections could not be read; they were zero-filled."
                 : "All sections copied. The IAT is NOT rebuilt by this route - "
-                  "run fix_iat (requires Scylla) before the image can run standalone."}
+                  "use 'rebuild_iats' to write a new import table, or fix_iat "
+                  "(requires Scylla)."}
+        });
+    });
+
+    // POST /api/dump/rebuild_iats - Rebuild the import table from live memory
+    //
+    // The missing half of a dump: dump/rebuild produces a structurally valid PE
+    // whose import directory still describes the *packed* state (usually empty
+    // or pointing at the packer's stub), so the image cannot load. This walks
+    // the loaded modules' export tables and rewrites a real import directory.
+    //
+    // Unlike the Scylla path this needs no external plugin, and it works on a
+    // running (not paused-at-OEP) process because it reads what the loader
+    // already resolved.
+    //
+    // Body: { "module": "target.exe", "file": "out.exe",
+    //         "scan_hint": "0x..." (optional IAT range start),
+    //         "scan_size": 4096 (optional, default 64 KB) }
+    router.post("/api/dump/rebuild_iats", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) return s_http_response::bad_request("Invalid JSON body");
+
+        const auto module_name = body.value("module", "");
+        const auto file_path   = body.value("file", "");
+        if (module_name.empty()) return s_http_response::bad_request("Missing 'module'");
+        if (file_path.empty())   return s_http_response::bad_request("Missing 'file'");
+
+        const auto base = bridge.get_module_base(module_name);
+        if (base == 0) return s_http_response::not_found("Module not found: " + module_name);
+
+        // -------- gather every loaded module's exports ----------------------
+        BridgeList<Script::Module::ModuleInfo> mods;
+        if (!Script::Module::GetList(&mods)) {
+            return s_http_response::internal_error("Cannot enumerate loaded modules");
+        }
+
+        std::vector<module_exports> exports;
+        exports.reserve(mods.Count());
+        for (int i = 0; i < mods.Count(); ++i) {
+            auto parsed = collect_exports(bridge, mods[i]);
+            if (!parsed.entries.empty()) exports.push_back(std::move(parsed));
+        }
+
+        // -------- collect the IAT entries we need to describe ---------------
+        // module name -> ordered list of (name, ordinal) for that module.
+        struct import_ref {
+            std::string module;
+            std::string name;       // empty when by ordinal
+            uint32_t ordinal = 0;
+            bool by_ordinal = false;
+        };
+
+        std::vector<import_ref> imports;
+        std::unordered_map<std::string, size_t> seen;   // dedupe "mod!name"
+        size_t unresolved = 0;
+
+        // `force_module` overrides the module name taken from the owner of the
+        // pointer. The descriptor's own DLL name wins when it is known, because
+        // that string is what the loader resolves; the owning module is only
+        // used to find the export name.
+        auto add_pointer = [&](duint slot_value, duint slot_address,
+                               const std::string* force_module = nullptr) {
+            const module_exports* owner = nullptr;
+            const export_entry* hit = resolve_pointer(exports, slot_value, &owner);
+            if (!hit) {
+                if (slot_value != 0) ++unresolved;
+                return;
+            }
+            import_ref r;
+            r.module = force_module && !force_module->empty() ? *force_module : owner->name;
+            if (hit->by_ordinal || hit->name.empty()) {
+                r.by_ordinal = true;
+                r.ordinal = hit->ordinal;
+            } else {
+                r.name = hit->name;
+            }
+            const auto key = r.module + "!" +
+                             (r.by_ordinal ? ("#" + std::to_string(r.ordinal)) : r.name);
+            if (seen.emplace(key, imports.size()).second) {
+                imports.push_back(std::move(r));
+            }
+            (void)slot_address;
+        };
+
+        // Source 1: the import descriptors still present in memory. These give
+        // the intended DLL grouping and ordering, which keeps the rebuilt table
+        // close to what the linker produced.
+        bool pe32plus = false;
+        uint32_t imp_rva = 0, imp_size = 0;
+        const bool have_descriptors =
+            get_data_directory(bridge, base, 1, pe32plus, imp_rva, imp_size) && imp_rva != 0;
+
+        if (have_descriptors) {
+            for (uint32_t d = 0; d < 4096; ++d) {
+                auto desc = bridge.read_memory(base + imp_rva + static_cast<duint>(d) * 20, 20);
+                if (!desc.has_value() || desc->size() < 20) break;
+
+                uint32_t oft = 0, name_rva = 0, ft = 0;
+                std::memcpy(&oft,      desc->data() + 0,  4);
+                std::memcpy(&name_rva, desc->data() + 12, 4);
+                std::memcpy(&ft,       desc->data() + 16, 4);
+                if (oft == 0 && name_rva == 0 && ft == 0) break;
+
+                const auto dll = mem_cstr(bridge, base + name_rva, 256);
+                if (dll.empty() || ft == 0) continue;
+
+                const size_t ptr = pe32plus ? 8 : 4;
+                if (d == 0) (void)ptr;
+
+                for (uint32_t t = 0; t < 65536; ++t) {
+                    auto raw = bridge.read_memory(base + ft + static_cast<duint>(t) * ptr, ptr);
+                    if (!raw.has_value() || raw->size() < ptr) break;
+                    uint64_t value = 0;
+                    std::memcpy(&value, raw->data(), ptr);
+                    if (value == 0) break;
+
+                    // Keep the descriptor's own DLL name. A loader import is
+                    // resolved by the name written here, and API-set names
+                    // ("api-ms-win-core-...") must stay as they are: replacing
+                    // them with the resolved host module (kernelbase, ntdll)
+                    // produces a table the loader rejects at process start.
+                    add_pointer(static_cast<duint>(value),
+                                base + ft + static_cast<duint>(t) * ptr, &dll);
+                }
+            }
+        }
+
+        // Source 2: scan a range of the image for pointers into other modules.
+        // Recovers entries a packer removed from the descriptors.
+        duint scan_start = base;
+        size_t scan_size = 0;
+        if (body.contains("scan_hint")) {
+            scan_start = bridge.eval_expression(body["scan_hint"].get<std::string>());
+            scan_size = body.value("scan_size", static_cast<size_t>(64 * 1024));
+        } else if (body.contains("scan_size")) {
+            scan_size = body.value("scan_size", static_cast<size_t>(64 * 1024));
+        }
+        if (scan_start == 0) scan_start = base;
+        if (scan_size > 16u * 1024 * 1024) scan_size = 16u * 1024 * 1024;
+        scan_size &= ~static_cast<size_t>(7);
+
+        size_t scanned_slots = 0;
+        if (scan_size >= 8) {
+            auto blob = bridge.read_memory(scan_start, scan_size);
+            if (blob.has_value()) {
+                const auto& b = *blob;
+                for (size_t off = 0; off + 8 <= b.size(); off += 8) {
+                    uint64_t value = 0;
+                    std::memcpy(&value, b.data() + off, 8);
+                    ++scanned_slots;
+                    add_pointer(static_cast<duint>(value), scan_start + off);
+                }
+            }
+        }
+
+        if (imports.empty()) {
+            return s_http_response::internal_error(
+                "No importable entries found. The imports in this process are resolved "
+                "through a private table that does not point at any loaded module's "
+                "exports - pass scan_hint pointing at the real IAT to search there.");
+        }
+
+        // -------- pack the import directory --------------------------------
+        // Layout: descriptor array, then per-DLL name strings, then the ILT
+        // (thunk) arrays, then the IAT arrays, then hint/name entries.
+        const size_t ptr = pe32plus ? 8 : 4;
+        const uint64_t ord_flag = pe32plus ? 0x8000000000000000ULL : 0x80000000ULL;
+
+        std::vector<std::pair<std::string, std::vector<const import_ref*>>> by_module;
+        for (const auto& r : imports) {
+            auto it = std::find_if(by_module.begin(), by_module.end(),
+                                   [&](const auto& p) { return p.first == r.module; });
+            if (it == by_module.end()) by_module.push_back({r.module, {&r}});
+            else it->second.push_back(&r);
+        }
+
+        std::vector<uint8_t> idata;
+        auto align_up = [](std::vector<uint8_t>& v, size_t a) {
+            while (v.size() % a) v.push_back(0);
+        };
+        auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
+            const size_t o = v.size(); v.resize(o + 4);
+            std::memcpy(v.data() + o, &x, 4);
+        };
+        auto put64 = [](std::vector<uint8_t>& v, uint64_t x) {
+            const size_t o = v.size(); v.resize(o + 8);
+            std::memcpy(v.data() + o, &x, 8);
+        };
+
+        const size_t desc_bytes = (by_module.size() + 1) * 20;
+        idata.resize(desc_bytes, 0);
+
+        align_up(idata, 2);
+        std::vector<uint32_t> dll_name_rva;
+        for (const auto& [name, _] : by_module) {
+            dll_name_rva.push_back(static_cast<uint32_t>(idata.size()));
+            idata.insert(idata.end(), name.begin(), name.end());
+            idata.push_back(0);
+        }
+
+        // Every thunk slot is pointer-sized on both tables: the loader reads the
+        // ILT and the IAT with the same width, so reserving 4 bytes for a
+        // name-based entry on x64 shifts every following entry and corrupts the
+        // whole section. Reserve ptr bytes for every slot, terminator included.
+        auto put_slot = [&](uint64_t v) {
+            if (ptr == 8) put64(idata, v);
+            else          put32(idata, static_cast<uint32_t>(v));
+        };
+
+        align_up(idata, ptr);
+        std::vector<uint32_t> ilt_rva, iat_rva;
+        for (const auto& [name, list] : by_module) {
+            ilt_rva.push_back(static_cast<uint32_t>(idata.size()));
+            for (const auto* r : list) {
+                // Values are filled in below, once hint/name RVAs are known.
+                put_slot(r->by_ordinal ? (ord_flag | r->ordinal) : 0);
+            }
+            put_slot(0);            // terminator
+        }
+        align_up(idata, ptr);
+        for (const auto& [name, list] : by_module) {
+            iat_rva.push_back(static_cast<uint32_t>(idata.size()));
+            for (size_t i = 0; i < list.size(); ++i) put_slot(0);
+            put_slot(0);
+        }
+
+        // Hint/name records, then backfill both the ILT and the IAT with the
+        // address of each record (the loader replaces the IAT at load time).
+        std::unordered_map<std::string, uint32_t> hint_rva;
+        for (const auto& [name, list] : by_module) {
+            for (const auto* r : list) {
+                if (r->by_ordinal) continue;
+                const auto key = r->module + "!" + r->name;
+                if (hint_rva.count(key)) continue;
+                align_up(idata, 2);
+                hint_rva[key] = static_cast<uint32_t>(idata.size());
+                const size_t o = idata.size();
+                idata.resize(o + 2 + r->name.size() + 1);
+                idata[o] = 0; idata[o + 1] = 0;          // hint
+                std::memcpy(idata.data() + o + 2, r->name.data(), r->name.size());
+                idata[o + 2 + r->name.size()] = 0;
+            }
+        }
+
+        for (size_t m = 0; m < by_module.size(); ++m) {
+            const auto& list = by_module[m].second;
+            for (size_t k = 0; k < list.size(); ++k) {
+                const auto* r = list[k];
+                if (r->by_ordinal) continue;   // already written at reserve time
+
+                const auto key = r->module + "!" + r->name;
+                const uint64_t rva = hint_rva[key];
+                const size_t off = k * ptr;
+                if (ptr == 8) {
+                    std::memcpy(idata.data() + ilt_rva[m] + off, &rva, 8);
+                    std::memcpy(idata.data() + iat_rva[m] + off, &rva, 8);
+                } else {
+                    const uint32_t rva32 = static_cast<uint32_t>(rva);
+                    std::memcpy(idata.data() + ilt_rva[m] + off, &rva32, 4);
+                    std::memcpy(idata.data() + iat_rva[m] + off, &rva32, 4);
+                }
+            }
+        }
+
+        // Descriptors.
+        //
+        // Everything packed above is written relative to the start of .idata,
+        // but PE fields are RVAs. The section's VirtualAddress is not known yet
+        // (it is computed below from the image layout), so the base is patched
+        // in afterwards rather than guessed here.
+        for (size_t m = 0; m < by_module.size(); ++m) {
+            const size_t off = m * 20;
+            const uint32_t oft = ilt_rva[m];
+            const uint32_t name_rva = dll_name_rva[m];
+            const uint32_t ft = iat_rva[m];
+            std::memcpy(idata.data() + off +  0, &oft, 4);
+            std::memcpy(idata.data() + off + 12, &name_rva, 4);
+            std::memcpy(idata.data() + off + 16, &ft, 4);
+        }
+
+        // -------- write the .idata section into a copy of the image ---------
+        std::error_code ec;
+        std::ifstream in(file_path, std::ios::binary);
+        if (!in) {
+            return s_http_response::internal_error(
+                "Cannot open '" + file_path + "' - run dump/rebuild first to produce "
+                "the base image, then rebuild the IAT into it.");
+        }
+        std::vector<uint8_t> out((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+        in.close();
+
+        if (out.size() < 0x40 || out[0] != 'M' || out[1] != 'Z') {
+            return s_http_response::internal_error("Output file is not a PE image");
+        }
+        uint32_t e_lfanew = 0;
+        std::memcpy(&e_lfanew, out.data() + 0x3C, 4);
+        if (e_lfanew + 24 > out.size()) return s_http_response::internal_error("Bad e_lfanew");
+
+        uint16_t nsec = 0, optsz = 0;
+        std::memcpy(&nsec,  out.data() + e_lfanew + 6,  2);
+        std::memcpy(&optsz, out.data() + e_lfanew + 20, 2);
+
+        const size_t opt = e_lfanew + 24;
+        uint16_t magic = 0;
+        std::memcpy(&magic, out.data() + opt, 2);
+        const bool file_pe32plus = (magic == 0x20B);
+        if (file_pe32plus != pe32plus) {
+            return s_http_response::internal_error(
+                "File architecture differs from the running process");
+        }
+
+        uint32_t sect_align = 0, file_align = 0, size_of_image = 0, size_of_headers = 0;
+        std::memcpy(&sect_align,     out.data() + opt + 32, 4);
+        std::memcpy(&file_align,     out.data() + opt + 36, 4);
+        std::memcpy(&size_of_image,  out.data() + opt + 56, 4);
+        std::memcpy(&size_of_headers, out.data() + opt + 60, 4);
+        if (sect_align == 0) sect_align = 0x1000;
+        if (file_align == 0) file_align = 0x200;
+
+        const size_t sect_table = opt + optsz;
+        if (sect_table + static_cast<size_t>(nsec) * 40 > out.size()) {
+            return s_http_response::internal_error("Section table out of bounds");
+        }
+
+        // Find the highest VA currently in use.
+        uint32_t max_va_end = 0;
+        for (uint16_t i = 0; i < nsec; ++i) {
+            const size_t o = sect_table + static_cast<size_t>(i) * 40;
+            uint32_t vsize = 0, va = 0;
+            std::memcpy(&vsize, out.data() + o + 8,  4);
+            std::memcpy(&va,    out.data() + o + 12, 4);
+            const uint32_t end = va + vsize;
+            if (end > max_va_end) max_va_end = end;
+        }
+        const uint32_t new_va = (max_va_end + sect_align - 1) & ~(sect_align - 1);
+
+        // ---- where does the IAT have to live? ------------------------------
+        // Code in .text calls through the IAT by absolute address
+        // (`call [rip+disp]`), so the thunk array has to sit at the RVA the
+        // code already uses. Those addresses came from the original import
+        // directory, so reuse that directory's FirstThunk when it is inside a
+        // section we can write into. Building a fresh IAT elsewhere produces a
+        // file that parses correctly and then fails at process start with
+        // STATUS_INVALID_IMAGE_FORMAT, because every call still goes to the old
+        // slots.
+        uint32_t old_first_thunk = 0;
+        if (have_descriptors) {
+            auto first = bridge.read_memory(base + imp_rva, 20);
+            if (first.has_value() && first->size() >= 20) {
+                std::memcpy(&old_first_thunk, first->data() + 16, 4);
+            }
+        }
+
+        bool patch_in_place = false;
+        if (old_first_thunk != 0) {
+            for (uint16_t i = 0; i < nsec; ++i) {
+                const size_t o = sect_table + static_cast<size_t>(i) * 40;
+                uint32_t vsize = 0, va = 0, raw_size = 0, raw_ptr = 0, chars = 0;
+                std::memcpy(&vsize,   out.data() + o + 8,  4);
+                std::memcpy(&va,      out.data() + o + 12, 4);
+                std::memcpy(&raw_size, out.data() + o + 16, 4);
+                std::memcpy(&raw_ptr,  out.data() + o + 20, 4);
+                std::memcpy(&chars,    out.data() + o + 36, 4);
+
+                const uint32_t span = vsize ? vsize : raw_size;
+                if (old_first_thunk < va || old_first_thunk >= va + span) continue;
+
+                // Make the section writable on disk so the loader can fill the
+                // thunks; .rdata is read-only in the original image.
+                chars |= 0x80000000u;            // IMAGE_SCN_MEM_WRITE
+                std::memcpy(out.data() + o + 36, &chars, 4);
+                patch_in_place = true;
+                break;
+            }
+        }
+
+        // Now that the section's RVA is known, convert every packed offset into
+        // a real RVA. Descriptor fields, ILT entries and IAT entries all hold
+        // these; the hint/name records are addressed the same way.
+        auto add_base32 = [new_va](std::vector<uint8_t>& buf, size_t off) {
+            uint32_t v = 0;
+            std::memcpy(&v, buf.data() + off, 4);
+            if (v == 0) return;
+            v += new_va;
+            std::memcpy(buf.data() + off, &v, 4);
+        };
+        auto add_base_thunk = [&](std::vector<uint8_t>& buf, size_t off) {
+            if (pe32plus) {
+                uint64_t v = 0;
+                std::memcpy(&v, buf.data() + off, 8);
+                if (v == 0 || (v & ord_flag)) return;   // terminator / ordinal
+                v += new_va;
+                std::memcpy(buf.data() + off, &v, 8);
+            } else {
+                add_base32(buf, off);
+            }
+        };
+
+        for (size_t m = 0; m < by_module.size(); ++m) {
+            const size_t desc = m * 20;
+            add_base32(idata, desc + 0);    // OriginalFirstThunk
+            add_base32(idata, desc + 12);   // Name
+            add_base32(idata, desc + 16);   // FirstThunk
+
+            const auto& list = by_module[m].second;
+            for (size_t k = 0; k < list.size(); ++k) {
+                add_base_thunk(idata, ilt_rva[m] + k * ptr);
+                add_base_thunk(idata, iat_rva[m] + k * ptr);
+            }
+        }
+
+        // In-place mode: every descriptor's FirstThunk is rewritten to point at
+        // a slice of the *original* IAT, so the addresses .text already calls
+        // through become the loader's fill targets.
+        if (patch_in_place) {
+            uint32_t cursor = old_first_thunk;
+            for (size_t m = 0; m < by_module.size(); ++m) {
+                const size_t desc = m * 20;
+                std::memcpy(idata.data() + desc + 16, &cursor, 4);   // FirstThunk (RVA)
+                cursor += static_cast<uint32_t>((by_module[m].second.size() + 1) * ptr);
+                if (cursor != old_first_thunk && (cursor - old_first_thunk) > 0x10000) {
+                    // The original table is smaller than what we need to write.
+                    // Fall back to the private array rather than corrupt memory
+                    // past the end of the old IAT.
+                    patch_in_place = false;
+                    break;
+                }
+            }
+        }
+
+        const uint32_t idata_vsize = static_cast<uint32_t>(idata.size());
+        const uint32_t idata_raw_size = (idata_vsize + file_align - 1) & ~(file_align - 1);
+        const uint32_t idata_raw_ptr = static_cast<uint32_t>(
+            (out.size() + file_align - 1) & ~(static_cast<size_t>(file_align) - 1));
+
+        const size_t new_sect_off = sect_table + static_cast<size_t>(nsec) * 40;
+        const size_t needed = new_sect_off + 40;
+        if (needed > size_of_headers) {
+            // Header growth must stay inside the first raw section's offset.
+            const uint32_t new_hdr = static_cast<uint32_t>(
+                (needed + file_align - 1) & ~(static_cast<size_t>(file_align) - 1));
+            if (new_hdr > file_align * 4) {
+                return s_http_response::internal_error(
+                    "No room for another section header next to the existing ones");
+            }
+            out.resize(std::max<size_t>(out.size(), new_hdr), 0);
+            std::memcpy(out.data() + opt + 60, &new_hdr, 4);
+            size_of_headers = new_hdr;
+        }
+        if (out.size() < needed) out.resize(needed, 0);
+
+        uint8_t* sh = out.data() + new_sect_off;
+        std::memset(sh, 0, 40);
+        std::memcpy(sh, ".idata", 6);
+        std::memcpy(sh + 8,  &idata_vsize,    4);   // VirtualSize
+        std::memcpy(sh + 12, &new_va,         4);   // VirtualAddress
+        std::memcpy(sh + 16, &idata_raw_size, 4);   // SizeOfRawData
+        std::memcpy(sh + 20, &idata_raw_ptr,  4);   // PointerToRawData
+        // IMAGE_SCN_CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE. Spelled out
+        // because the minimal SDK does not define these macros.
+        constexpr uint32_t SCN_CNT_INITIALIZED_DATA = 0x00000040;
+        constexpr uint32_t SCN_MEM_READ             = 0x40000000;
+        constexpr uint32_t SCN_MEM_WRITE            = 0x80000000;
+        const uint32_t chars =
+            SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ | SCN_MEM_WRITE;
+        std::memcpy(sh + 36, &chars, 4);
+
+        std::memcpy(out.data() + e_lfanew + 6, &++nsec, 2);
+
+        // Data directories: [1] import table, [12] IAT.
+        //
+        // The IAT directory still pointed into .rdata at the old table's size.
+        // That entry is not merely cosmetic: the loader validates it (it must
+        // describe a writable region), and leaving it stale made the image fail
+        // with STATUS_INVALID_IMAGE_FORMAT at start despite a valid import
+        // directory.
+        const size_t dd_base = opt + (file_pe32plus ? 112 : 96);
+
+        std::memcpy(out.data() + dd_base + 1 * 8,     &new_va,      4);
+        std::memcpy(out.data() + dd_base + 1 * 8 + 4, &idata_vsize, 4);
+
+        // The IAT directory must describe the array the descriptors actually
+        // point at. In in-place mode that is the original table inside .rdata,
+        // not the private copy in .idata - a mismatch here is rejected by the
+        // loader even when both arrays are individually valid.
+        uint32_t iat_va = 0, iat_size = 0;
+        if (patch_in_place) {
+            uint32_t end_exclusive = old_first_thunk;
+            for (size_t m = 0; m < by_module.size(); ++m) {
+                uint32_t ft = 0;
+                std::memcpy(&ft, idata.data() + m * 20 + 16, 4);
+                const uint32_t stop =
+                    ft + static_cast<uint32_t>((by_module[m].second.size() + 1) * ptr);
+                if (stop > end_exclusive) end_exclusive = stop;
+            }
+            iat_va = old_first_thunk;
+            iat_size = end_exclusive - old_first_thunk;
+        } else {
+            uint32_t iat_begin = 0, iat_end = 0;
+            for (size_t m = 0; m < by_module.size(); ++m) {
+                const uint32_t start = iat_rva[m];
+                const uint32_t stop  = start +
+                    static_cast<uint32_t>((by_module[m].second.size() + 1) * ptr);
+                if (iat_begin == 0 || start < iat_begin) iat_begin = start;
+                if (stop > iat_end) iat_end = stop;
+            }
+            iat_va = new_va + iat_begin;
+            iat_size = iat_end - iat_begin;
+        }
+        std::memcpy(out.data() + dd_base + 12 * 8,     &iat_va,   4);
+        std::memcpy(out.data() + dd_base + 12 * 8 + 4, &iat_size, 4);
+
+        const uint32_t new_image = (new_va + idata_vsize + sect_align - 1) & ~(sect_align - 1);
+        std::memcpy(out.data() + opt + 56, &new_image, 4);
+
+        out.resize(idata_raw_ptr);
+        out.insert(out.end(), idata.begin(), idata.end());
+        out.resize(idata_raw_ptr + idata_raw_size, 0);
+
+        std::ofstream f(file_path, std::ios::binary | std::ios::trunc);
+        if (!f) return s_http_response::internal_error("Cannot write " + file_path);
+        f.write(reinterpret_cast<const char*>(out.data()),
+                static_cast<std::streamsize>(out.size()));
+        const bool wrote = f.good();
+        f.close();
+        if (!wrote) return s_http_response::internal_error("Failed writing " + file_path);
+
+        nlohmann::json dlls = nlohmann::json::array();
+        for (const auto& [name, list] : by_module) {
+            dlls.push_back({{"dll", name}, {"functions", list.size()}});
+        }
+
+        return s_http_response::ok({
+            {"success",       true},
+            {"file",          file_path},
+            {"modules",       dlls},
+            {"module_count",  by_module.size()},
+            {"import_count",  imports.size()},
+            {"unresolved",    unresolved},
+            {"scanned_slots", scanned_slots},
+            {"used_descriptors", have_descriptors},
+            {"idata_rva",     format_utils::format_hex(new_va)},
+            {"idata_size",    idata_vsize},
+            {"size_of_image", new_image},
+            {"note", unresolved
+                ? "Some pointers did not resolve to a loaded module's export and were "
+                  "left out; the image may still need manual fixes."
+                : "Every resolved pointer mapped to a real export."}
         });
     });
 

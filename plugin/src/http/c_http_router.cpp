@@ -12,6 +12,15 @@ void c_http_router::post(const std::string& path, route_handler_t handler) {
     add_route("POST", path, std::move(handler));
 }
 
+std::vector<std::string> c_http_router::route_manifest() const {
+    std::vector<std::string> out;
+    out.reserve(m_routes.size());
+    for (const auto& r : m_routes) {
+        out.push_back(r.method + " " + r.path);
+    }
+    return out;
+}
+
 s_http_response c_http_router::dispatch(const s_http_request& request) const {
     // Handle CORS preflight
     if (request.method == "OPTIONS") {

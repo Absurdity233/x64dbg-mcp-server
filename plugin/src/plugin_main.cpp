@@ -214,7 +214,7 @@ static void cb_breakpoint(CBTYPE, void* cb_info) {
     // GetCurrentThreadId is a plain Win32 call (no Bridge), so it is safe on
     // the debugger thread and tells us which thread tripped the breakpoint -
     // essential when several threads share a hot code path.
-    event_log::push("breakpoint", {
+    nlohmann::json ev = {
         {"address",   addr},
         {"name",      bp.name},
         {"module",    bp.mod},
@@ -222,7 +222,19 @@ static void cb_breakpoint(CBTYPE, void* cb_info) {
         {"hit_count", bp.hitCount},
         {"log_text",  bp.logText},
         {"tid",       static_cast<unsigned>(GetCurrentThreadId())}
-    });
+    };
+
+    // Instrumented anti-VM probes carry a "vmprobe:<mnemonic>" name so the log
+    // entry says which check fired. The register values are NOT read here:
+    // GetThreadContext(GetCurrentThread()) on the debugger thread returns the
+    // debugger's own context, not the debuggee's. x64dbg's log_text formatting
+    // already evaluates expressions in the debuggee's context, so the probe
+    // log line (set by /api/antidebug/probe_breakpoints) carries them.
+    if (bp.name && strncmp(bp.name, "vmprobe:", 8) == 0) {
+        ev["probe"] = std::string(bp.name + 8);
+    }
+
+    event_log::push("breakpoint", ev);
 }
 
 static void cb_exception(CBTYPE, void* cb_info) {
@@ -361,6 +373,31 @@ void register_all_routes(c_http_router& router) {
             {"version", PLUGIN_VERSION_STR},
             {"plugin",  PLUGIN_NAME},
             {"status",  "ok"}
+        });
+    });
+
+    // GET /api/meta - Version, architecture and the full route manifest.
+    //
+    // The plugin and the MCP server ship as separate artifacts (a .dp64 the
+    // user installs vs. a dist/ tree), so they can be at different versions
+    // without anything failing loudly: the server calls a route the installed
+    // plugin does not have and gets a 404 that looks like a code bug. Serving
+    // the route table lets the server detect that at startup and say so.
+    //
+    // Registered last so `route_manifest()` includes every other route; the
+    // manifest is captured at request time, not at registration time, so
+    // ordering does not actually matter.
+    router.get("/api/meta", [&router](const s_http_request&) -> s_http_response {
+        auto routes = router.route_manifest();
+        nlohmann::json list = nlohmann::json::array();
+        for (const auto& r : routes) list.push_back(r);
+
+        return s_http_response::ok({
+            {"plugin",     PLUGIN_NAME},
+            {"version",    PLUGIN_VERSION_STR},
+            {"arch",       sizeof(void*) == 8 ? "x64" : "x86"},
+            {"route_count", routes.size()},
+            {"routes",     list}
         });
     });
 

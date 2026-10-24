@@ -22,6 +22,14 @@ public:
     // Dispatch a request to the appropriate handler
     [[nodiscard]] s_http_response dispatch(const s_http_request& request) const;
 
+    // Every registered route as "METHOD /path", in registration order.
+    //
+    // Routes are only ever stored here, so a manifest built from this list
+    // cannot drift from what the plugin actually serves. The server checks it
+    // against the routes its tools call, which turns a plugin/server version
+    // mismatch into a startup warning instead of a mysterious 404 mid-session.
+    [[nodiscard]] std::vector<std::string> route_manifest() const;
+
 private:
     struct s_route {
         std::string method;
