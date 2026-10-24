@@ -10,6 +10,7 @@ import { registerDisassemblyTools } from './disassembly.js';
 import { registerDumpingTools } from './dumping.js';
 import { registerExceptionTools } from './exceptions.js';
 import { registerFunctionTools } from './functions.js';
+import { registerUiTools } from './ui.js';
 import { registerHandleTools } from './handles.js';
 import { registerMemoryTools } from './memory.js';
 import { registerModuleTools } from './modules.js';
@@ -44,4 +45,5 @@ export function registerAllTools(server: McpServer) {
   registerControlFlowTools(server);
   registerPatchTools(server);
   registerFunctionTools(server);
+  registerUiTools(server);
 }
