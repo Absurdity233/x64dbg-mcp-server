@@ -130,13 +130,17 @@ static void cb_breakpoint(CBTYPE, void* cb_info) {
     char addr[32];
     snprintf(addr, sizeof(addr), "0x%llX", static_cast<unsigned long long>(bp.addr));
 
+    // GetCurrentThreadId is a plain Win32 call (no Bridge), so it is safe on
+    // the debugger thread and tells us which thread tripped the breakpoint -
+    // essential when several threads share a hot code path.
     event_log::push("breakpoint", {
         {"address",   addr},
         {"name",      bp.name},
         {"module",    bp.mod},
         {"type",      static_cast<int>(bp.type)},
         {"hit_count", bp.hitCount},
-        {"log_text",  bp.logText}
+        {"log_text",  bp.logText},
+        {"tid",       static_cast<unsigned>(GetCurrentThreadId())}
     });
 }
 

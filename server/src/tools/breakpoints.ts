@@ -25,12 +25,12 @@ const breakpointSchema = {
 export function registerBreakpointTools(server: McpServer) {
   server.tool(
     'x64dbg_breakpoints',
-    'Breakpoint management. Actions: set_software, set_hardware, set_memory, delete, enable, disable, toggle, set_condition, set_log, reset_hit_count, get, list, configure, configure_batch.',
+    'Breakpoint management. Actions: set_software, set_hardware, set_memory, delete, enable, disable, toggle, set_condition, set_log, reset_hit_count, get, list, configure, configure_batch, set_logging.',
     {
       action: z.enum([
         'set_software', 'set_hardware', 'set_memory', 'delete', 'enable', 'disable',
         'toggle', 'set_condition', 'set_log', 'reset_hit_count', 'get', 'list',
-        'configure', 'configure_batch',
+        'configure', 'configure_batch', 'set_logging',
       ]).describe('Operation to perform'),
 
       address: z.string().optional().describe('Breakpoint address'),
@@ -139,6 +139,48 @@ export function registerBreakpointTools(server: McpServer) {
           if (!Array.isArray(breakpoints)) throw new Error("'breakpoints' is required for this action");
           const data = await httpClient.post('/api/breakpoints/configure_batch', { breakpoints });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'set_logging': {
+          // Non-stopping logging breakpoint.
+          //
+          // Measured on x64dbg 2026.05.27: SetBreakpointFastResume alone does
+          // NOT keep the target running - the first hit still pauses. What does
+          // work is attaching a `run` command to the breakpoint, which resumes
+          // immediately after the log line is written. That combination is used
+          // here (verified: 681 hits in 3s, target still running).
+          const addr = requireAddress();
+          const logText = requireString(args.log_text ?? text, 'log_text');
+
+          const run = (command: string) =>
+            httpClient.post<any>('/api/command/exec', { command });
+
+          await run(`bp ${addr}`);
+          await run(`SetBreakpointSilent ${addr}, 1`);
+          await run(`SetBreakpointLog ${addr}, ${JSON.stringify(logText)}`);
+          if (args.log_condition) {
+            await run(`SetBreakpointLogCondition ${addr}, ${JSON.stringify(args.log_condition)}`);
+          }
+          if (args.condition) {
+            await run(`SetBreakpointCondition ${addr}, ${JSON.stringify(args.condition)}`);
+          }
+          if (args.name) {
+            await run(`SetBreakpointName ${addr}, ${JSON.stringify(args.name)}`);
+          }
+          // The auto-continue. `run` is an x64dbg command, executed on hit.
+          await run(`SetBreakpointCommand ${addr}, "run"`);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                configured: true,
+                address: addr,
+                log_text: logText,
+                auto_continue: 'SetBreakpointCommand ..., "run"',
+                note: 'the target will not stop here; read hits with x64dbg_command get_events',
+              }, null, 2),
+            }],
+          };
         }
       }
     }

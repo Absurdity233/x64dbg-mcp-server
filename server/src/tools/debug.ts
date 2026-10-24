@@ -14,13 +14,23 @@ interface DebugState {
 }
 
 /** Poll /api/debug/state until `want` is reached or the deadline passes. */
+/**
+ * Poll /api/debug/state until `want` is reached or the deadline passes.
+ *
+ * `stable_ms` guards against transient pauses: a breakpoint with an auto-run
+ * command (logging breakpoints) pauses for a few milliseconds on every hit, and
+ * treating that as "the target stopped" makes `run` return immediately. When
+ * set, the state must stay put for that long before it counts.
+ */
 async function waitForState(
   want: 'paused' | 'stopped' | 'active' | 'not_running',
   timeout_ms: number,
-  poll_ms: number
+  poll_ms: number,
+  stable_ms = 0
 ): Promise<{ reached: boolean; elapsed_ms: number; state: DebugState }> {
   const started = Date.now();
   let last: DebugState = { state: 'running' };
+  let stableSince: number | null = null;
 
   for (;;) {
     last = await httpClient.get<DebugState>('/api/debug/state');
@@ -28,9 +38,21 @@ async function waitForState(
       want === 'active' ? last.state !== 'stopped'
       : want === 'not_running' ? last.state !== 'running'
       : last.state === want;
+
     if (hit) {
-      return { reached: true, elapsed_ms: Date.now() - started, state: last };
+      if (stable_ms <= 0) {
+        return { reached: true, elapsed_ms: Date.now() - started, state: last };
+      }
+      const now = Date.now();
+      if (stableSince === null) {
+        stableSince = now;
+      } else if (now - stableSince >= stable_ms) {
+        return { reached: true, elapsed_ms: now - started, state: last };
+      }
+    } else {
+      stableSince = null;
     }
+
     if (Date.now() - started >= timeout_ms) {
       return { reached: false, elapsed_ms: Date.now() - started, state: last };
     }
@@ -73,16 +95,50 @@ export function registerDebugTools(server: McpServer) {
       poll_ms: z.number().optional().default(200).describe("wait_for_pause/wait_for_event: state poll interval (default 200)"),
       include_health: z.boolean().optional().describe("state: also query plugin health"),
       wait: z.boolean().optional().describe("run: block until the target stops again (default true). Set false for fire-and-forget."),
+      stable_ms: z.number().optional().describe(
+        "run: how long the stop must persist before it counts as stopped (default 400). " +
+        "Raise it if auto-continuing logging breakpoints make run return too early."),
       event_types: z.array(z.string()).optional()
         .describe("wait_for_event: event types to match, e.g. ['breakpoint','exception']. Omit for any event."),
       match_address: z.string().optional()
         .describe("wait_for_event: only match events whose address equals this expression"),
     },
-    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address, wait }) => {
+    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address, wait, stable_ms }) => {
       let endpoint = '';
       let payload: any = undefined;
 
       switch (action) {
+        case 'pause': {
+          // x64dbg's pause frequently loses the race against a running target
+          // and is silently dropped. Retry a few times before giving up.
+          let lastErr: unknown = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              const res = await httpClient.post<any>('/api/debug/pause');
+              const waited = await waitForState('paused', 2500, 100);
+              if (waited.reached) {
+                return {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                      message: `Paused after ${waited.elapsed_ms}ms`,
+                      attempts: attempt + 1,
+                      state: waited.state,
+                      response: res,
+                    }, null, 2),
+                  }],
+                };
+              }
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+          throw new Error(
+            `Could not pause the target after 3 attempts${lastErr ? `: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}` : ''}. ` +
+            'The target may be spinning in a fast-resume breakpoint loop - try force_pause.'
+          );
+        }
+
         case 'run': {
           // Block by default so the caller learns where and why the target
           // stopped, instead of having to issue a separate wait. Pass
@@ -92,7 +148,12 @@ export function registerDebugTools(server: McpServer) {
             return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
           }
 
-          const waited = await waitForState('not_running', timeout_ms ?? 120000, poll_ms ?? 200);
+          // Require the stop to hold for a moment: logging breakpoints with an
+          // auto-run command bounce through paused for ~1ms per hit, and a
+          // naive poll would report the first of those as the target stopping.
+          const waited = await waitForState(
+            'not_running', timeout_ms ?? 120000, poll_ms ?? 200, stable_ms ?? 400
+          );
           const events = waited.reached ? await consume() : { events: [], dropped: 0 };
 
           let instruction: string | null = null;
@@ -112,15 +173,24 @@ export function registerDebugTools(server: McpServer) {
                 message: waited.reached
                   ? `Target stopped after ${waited.elapsed_ms}ms`
                   : `Timed out after ${waited.elapsed_ms}ms - target still running`,
-                state: waited.state,
+                // When the stop was not stable, the last sample may have caught
+                // a transient pause inside an auto-continuing breakpoint. Report
+                // it as running rather than contradicting `reached`.
+                state: waited.reached ? waited.state : { state: 'running' },
+                ...(waited.reached ? {} : {
+                  note: 'the target is bouncing through auto-continue breakpoints; ' +
+                        'raise stable_ms or remove the logging breakpoint to get a real stop',
+                }),
                 instruction,
                 events: events.events.map(describe),
                 dropped: events.dropped,
               }, null, 2),
             }],
-          };
+            // This response already carries the state observed at the stop;
+            // a fresh sample could catch a transient pause and contradict it.
+            skipStateLine: true,
+          } as any;
         }
-        case 'pause': endpoint = '/api/debug/pause'; break;
         case 'force_pause': endpoint = '/api/debug/force_pause'; break;
         case 'step_into': endpoint = '/api/debug/step_into'; break;
         case 'step_over': endpoint = '/api/debug/step_over'; break;
@@ -224,7 +294,7 @@ export function registerDebugTools(server: McpServer) {
               if (ev_addr !== wanted_addr) return false;
             }
             return true;
-          }, timeout_ms ?? 120000, poll_ms ?? 200);
+          }, timeout_ms ?? 120000, poll_ms ?? 200, event_types);
 
           // Snapshot the debugger state at the moment we return, so the caller
           // does not need a second round-trip to see where it stopped.

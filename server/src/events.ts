@@ -13,11 +13,13 @@ interface EventsResponse {
   count: number;
   latest_seq: number;
   dropped: number;
+  timed_out?: boolean;
 }
 
-const SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-/** Highest sequence number known to this client, so polls only return new events. */
+/**
+ * Highest sequence number known to this client, so polls only return new
+ * events. Module-level state: one MCP server process talks to one plugin.
+ */
 let cursor = 0;
 
 export function currentCursor(): number {
@@ -28,6 +30,23 @@ export function resetCursor(): void {
   cursor = 0;
 }
 
+function advance(res: EventsResponse): void {
+  if (res.latest_seq > cursor) cursor = res.latest_seq;
+}
+
+/** Snapshot of everything buffered since the cursor. Does not block. */
+export async function drain(): Promise<{ events: DebugEvent[]; dropped: number }> {
+  try {
+    const res = await httpClient.get<EventsResponse>('/api/command/events', {
+      since: String(cursor),
+    });
+    advance(res);
+    return { events: res.events ?? [], dropped: res.dropped ?? 0 };
+  } catch {
+    return { events: [], dropped: 0 };
+  }
+}
+
 /**
  * Consume everything buffered and advance the cursor past it.
  *
@@ -36,41 +55,22 @@ export function resetCursor(): void {
  * visible, but it is not left in the buffer to satisfy a later wait_for_event.
  */
 export async function consume(): Promise<{ events: DebugEvent[]; dropped: number }> {
-  try {
-    const res = await httpClient.get<EventsResponse>('/api/command/events', {
-      since: String(cursor),
-    });
-    if (res.latest_seq > cursor) cursor = res.latest_seq;
-    return { events: res.events ?? [], dropped: res.dropped ?? 0 };
-  } catch {
-    // Plugin not ready / older plugin without the endpoint - nothing to do.
-    return { events: [], dropped: 0 };
-  }
-}
-
-async function fetchSince(since: number): Promise<EventsResponse> {
-  const res = await httpClient.get<EventsResponse>('/api/command/events', {
-    since: String(since),
-  });
-  if (res.latest_seq > cursor) cursor = res.latest_seq;
-  return res;
-}
-
-/** Drain whatever is buffered right now. */
-export async function drain(): Promise<{ events: DebugEvent[]; dropped: number }> {
-  const res = await fetchSince(cursor);
-  return { events: res.events ?? [], dropped: res.dropped ?? 0 };
+  return drain();
 }
 
 /**
- * Poll until an event matches `predicate`, or the deadline passes.
- * Events that do not match are still consumed (the cursor advances), so a
- * later call will not re-report them.
+ * Block until an event matches `predicate`, or the deadline passes.
+ *
+ * Uses the plugin's long-poll endpoint: one HTTP request parks on the plugin
+ * side instead of the client polling every N ms. The request is re-issued when
+ * the plugin returns a batch that contains no match (filtered wait), so a
+ * `types` filter does not turn into a busy loop.
  */
 export async function waitFor(
   predicate: (ev: DebugEvent) => boolean,
   timeout_ms: number,
-  poll_ms = 150
+  _poll_ms = 0,
+  filterTypes?: string[]
 ): Promise<{
   matched: DebugEvent | null;
   others: DebugEvent[];
@@ -81,9 +81,36 @@ export async function waitFor(
   const others: DebugEvent[] = [];
   let dropped = 0;
 
-  for (;;) {
-    const res = await fetchSince(cursor);
+  while (true) {
+    const remaining = timeout_ms - (Date.now() - started);
+    if (remaining <= 0) {
+      return { matched: null, others, elapsed_ms: Date.now() - started, dropped };
+    }
+
+    const params: Record<string, string> = {
+      since: String(cursor),
+      // Hold for at most eventHoldMs per request so a plugin restart is noticed
+      // promptly, but never longer than the caller's remaining budget.
+      timeout: String(Math.min(remaining, config.eventHoldMs)),
+    };
+    if (filterTypes && filterTypes.length) params.types = filterTypes.join(',');
+    // Server-side waits park on a condition variable, so a single request can
+    // return a whole burst; cap it so one huge module load cannot blow up the
+    // tool response.
+    params.max = String(config.eventBatchMax);
+
+    let res: EventsResponse;
+    try {
+      res = await httpClient.get<EventsResponse>('/api/command/events/wait', params);
+    } catch (err) {
+      // Plugin gone or endpoint missing - fall back to a short sleep so we do
+      // not spin, then let the next iteration fail or succeed.
+      await new Promise((r) => setTimeout(r, Math.min(remaining, 500)));
+      continue;
+    }
+
     dropped += res.dropped ?? 0;
+    advance(res);
 
     for (const ev of res.events ?? []) {
       if (predicate(ev)) {
@@ -92,11 +119,9 @@ export async function waitFor(
       others.push(ev);
     }
 
-    if (Date.now() - started >= timeout_ms) {
+    if (res.timed_out) {
       return { matched: null, others, elapsed_ms: Date.now() - started, dropped };
     }
-
-    await SLEEP(Math.max(config.eventPollMs, poll_ms));
   }
 }
 

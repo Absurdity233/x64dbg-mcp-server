@@ -3,6 +3,8 @@
 #include "util/event_log.h"
 #include "util/format_utils.h"
 
+#include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
 #include "_dbgfunctions.h"
 
@@ -100,6 +102,48 @@ void register_command_routes(c_http_router& router) {
             {"message", "Event log cleared"},
             {"latest_seq", event_log::latest_seq()}
         });
+    });
+
+    // GET /api/command/events/wait?since=<seq>&timeout=<ms>&types=a,b&max=<n>
+    //
+    // Long poll: blocks on the plugin side until an event arrives, so the
+    // client does not have to spin. `types` filters what counts as newsworthy;
+    // the payload still contains every event since the cursor.
+    router.get("/api/command/events/wait", [](const s_http_request& req) -> s_http_response {
+        uint64_t since_seq = 0;
+        int timeout_ms = 30000;
+        size_t max_events = 256;
+        std::vector<std::string> types;
+
+        try {
+            if (!req.get_query("since").empty()) since_seq = std::stoull(req.get_query("since"));
+            if (!req.get_query("timeout").empty()) timeout_ms = std::stoi(req.get_query("timeout"));
+            if (!req.get_query("max").empty()) {
+                max_events = static_cast<size_t>(std::stoull(req.get_query("max")));
+            }
+        } catch (...) {
+            return s_http_response::bad_request("'since'/'timeout'/'max' must be integers");
+        }
+
+        // Cap the hold time: a client that disappears must not pin a thread
+        // for minutes. 120s matches the MCP-side wait default.
+        if (timeout_ms < 0) timeout_ms = 0;
+        if (timeout_ms > 120000) timeout_ms = 120000;
+
+        const auto raw_types = req.get_query("types");
+        if (!raw_types.empty()) {
+            size_t start = 0;
+            while (start <= raw_types.size()) {
+                const size_t comma = raw_types.find(',', start);
+                const auto token = raw_types.substr(
+                    start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!token.empty()) types.push_back(token);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+
+        return s_http_response::ok(event_log::wait_since(since_seq, timeout_ms, types, max_events));
     });
 
     // POST /api/command/init_script - Set debuggee init script

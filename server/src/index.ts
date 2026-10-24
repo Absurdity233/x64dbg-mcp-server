@@ -51,6 +51,10 @@ function installStateLine(server: McpServer): { count: () => number } {
     if (typeof handler === 'function') {
       args[args.length - 1] = async (...callArgs: any[]) => {
         const result = await handler(...callArgs);
+        // Handlers that already reported a precise state (e.g. run, which knows
+        // whether the stop was stable) opt out to avoid contradicting themselves
+        // with a stale sample taken a few milliseconds later.
+        if (result && (result as any).skipStateLine) return result;
         try {
           const st = await httpClient.get<any>('/api/debug/state');
           let line = `[state] ${String(st.state).toUpperCase()}`;
@@ -60,6 +64,8 @@ function installStateLine(server: McpServer): { count: () => number } {
           if (Array.isArray(result?.content)) {
             result.content.push({ type: 'text', text: line });
           }
+          // Do not leak the internal opt-out flag to the client.
+          delete (result as any).skipStateLine;
         } catch {
           // Plugin down or no session - skip the annotation.
         }
