@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
-import { waitFor, describe, syncCursor } from '../events.js';
+import { waitFor, describe, consume } from '../events.js';
 import { requireString, quoteArg } from './util.js';
 
 const SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -131,9 +131,10 @@ export function registerDebugTools(server: McpServer) {
           const waited = await waitForState(want, timeout_ms ?? 30000, poll_ms ?? 200);
 
           // Consume the events this just produced (session_start, system
-          // breakpoint, dll_load, ...) so a later wait_for_event only sees new
-          // ones and the caller does not have to filter startup noise.
-          if (waited.reached) await syncCursor();
+          // breakpoint, dll_load, ...). They are returned below so they stay
+          // visible, but they no longer sit in the buffer to satisfy a later
+          // wait_for_event.
+          const startup = waited.reached ? await consume() : { events: [], dropped: 0 };
 
           return {
             content: [{
@@ -145,6 +146,7 @@ export function registerDebugTools(server: McpServer) {
                 started: waited.reached,
                 waited_ms: waited.elapsed_ms,
                 state: waited.state,
+                startup_events: startup.events.map(describe),
               }, null, 2),
             }],
           };

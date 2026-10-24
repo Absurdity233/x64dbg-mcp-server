@@ -29,18 +29,22 @@ export function resetCursor(): void {
 }
 
 /**
- * Jump the cursor to the newest buffered event without returning anything.
- * Called right after starting a session so events from a previous run do not
- * satisfy a subsequent wait_for_event.
+ * Consume everything buffered and advance the cursor past it.
+ *
+ * Used right after starting a session: the startup burst (session_start,
+ * dll_load x N, system_breakpoint) is returned to the caller so it is still
+ * visible, but it is not left in the buffer to satisfy a later wait_for_event.
  */
-export async function syncCursor(): Promise<void> {
+export async function consume(): Promise<{ events: DebugEvent[]; dropped: number }> {
   try {
     const res = await httpClient.get<EventsResponse>('/api/command/events', {
       since: String(cursor),
     });
     if (res.latest_seq > cursor) cursor = res.latest_seq;
+    return { events: res.events ?? [], dropped: res.dropped ?? 0 };
   } catch {
-    // Plugin not ready / old firmware without the endpoint - leave the cursor.
+    // Plugin not ready / older plugin without the endpoint - nothing to do.
+    return { events: [], dropped: 0 };
   }
 }
 
