@@ -42,6 +42,7 @@ void register_tracing_routes(c_http_router& router) {
         }
 
         auto success = bridge.exec_command_async(cmd);
+        if (success) mcp::trace_mark_started("");
 
         return s_http_response::ok({
             {"success", success},
@@ -71,6 +72,7 @@ void register_tracing_routes(c_http_router& router) {
         }
 
         auto success = bridge.exec_command_async(cmd);
+        if (success) mcp::trace_mark_started("");
 
         return s_http_response::ok({
             {"success", success},
@@ -127,6 +129,13 @@ void register_tracing_routes(c_http_router& router) {
         if (include_tid && log_text.find("tid()") == std::string::npos) {
             log_text += ",{tid()}";
         }
+        // GetTickCount() is re-evaluated for every traced instruction (verified:
+        // 444 distinct values across 57,672 rows), which gives trace rows the
+        // same clock the plugin's event queue uses. That makes exact event
+        // alignment possible instead of proportional guessing.
+        if (body.value("include_tick", true) && log_text.find("GetTickCount()") == std::string::npos) {
+            log_text += ",{GetTickCount()}";
+        }
 
         if (!file.empty()) {
             bridge.exec_command("TraceSetLogFile \"" + file + "\"");
@@ -140,13 +149,14 @@ void register_tracing_routes(c_http_router& router) {
         }
 
         const auto success = bridge.exec_command_async(cmd);
+        if (success) mcp::trace_mark_started(file);
 
         return s_http_response::ok({
             {"success", success},
             {"command", cmd},
             {"log_text", log_text},
             {"file", file},
-            {"note", "each trace row now carries the thread id as its last column"}
+            {"note", "each trace row carries the thread id and GetTickCount() as the last two columns"}
         });
     });
 
@@ -176,17 +186,22 @@ void register_tracing_routes(c_http_router& router) {
     });
 
     // POST /api/trace/stop - Stop trace recording
+    //
+    // Pause first: StopRunTrace on a still-running trace loop leaves the engine
+    // in a state where no later trace in this x64dbg process produces output.
     router.post("/api/trace/stop", [](const s_http_request&) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.require_debugging()) {
             return s_http_response::conflict("No active debug session");
         }
 
-        auto success = bridge.exec_command("StopRunTrace");
+        std::string file;
+        const bool was_active = mcp::trace_quiesce_for_stop(&file);
 
         return s_http_response::ok({
-            {"success", success},
-            {"message", "Trace stopped"}
+            {"success", true},
+            {"file", was_active ? nlohmann::json(file) : nlohmann::json(nullptr)},
+            {"message", was_active ? "Trace stopped (paused, then StopRunTrace)" : "No trace was running"}
         });
     });
 

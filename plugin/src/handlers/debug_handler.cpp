@@ -1,6 +1,7 @@
 #include "http/c_http_router.h"
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
+#include "util/trace_state.h"
 
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -114,25 +115,48 @@ void register_debug_routes(c_http_router& router) {
     });
 
     // POST /api/debug/stop - Stop debugging
+    //
+    // A run-trace has to be unwound before the session goes away. `stop` while
+    // TraceIntoConditional is executing corrupts the instance's trace engine
+    // permanently (see trace_quiesce_for_stop in util/trace_state.h), so it is
+    // paused and stopped first.
     router.post("/api/debug/stop", [](const s_http_request&) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.is_debugging()) {
             return s_http_response::ok({{"message", "Not debugging"}});
         }
 
+        std::string trace_file;
+        const bool stopped_trace = mcp::trace_quiesce_for_stop(&trace_file);
+
         bridge.exec_command("stop");
-        return s_http_response::ok({{"message", "Debug session stopped"}});
+
+        nlohmann::json out = {{"message", "Debug session stopped"}};
+        if (stopped_trace) {
+            out["stopped_trace"] = trace_file;
+        }
+        return s_http_response::ok(out);
     });
 
     // POST /api/debug/restart - Restart debuggee
+    //
+    // Same hazard as stop: restart tears the process down underneath a live
+    // trace loop.
     router.post("/api/debug/restart", [](const s_http_request&) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.is_debugging()) {
             return s_http_response::conflict("No active debug session");
         }
 
+        std::string trace_file;
+        const bool stopped_trace = mcp::trace_quiesce_for_stop(&trace_file);
+
         bridge.exec_command("restart");
-        return s_http_response::ok({{"message", "Restart initiated"}});
+        nlohmann::json out = {{"message", "Restart initiated"}};
+        if (stopped_trace) {
+            out["stopped_trace"] = trace_file;
+        }
+        return s_http_response::ok(out);
     });
 
     // POST /api/debug/force_pause - Force pause even against high-frequency fast-resume breakpoints

@@ -9,11 +9,15 @@ second (cip sequence). Neither carries the other's timeline.
 This script merges them: every trace row is assigned to the event that was
 current when it executed, using the plugin's tick_ms as the ordering key.
 
-Because TraceSetLog cannot emit a tick, the trace is placed using row order
-combined with the *count* of events: callers pass the event timestamps and the
-trace row count, and the script produces proportional buckets. If the trace
-also logs a monotonically increasing counter (see --column), that is used
-instead of proportion, which is exact.
+Two modes:
+
+  exact         the trace has a tick column ({GetTickCount()}, which the
+                /api/trace/thread route appends and which x64dbg re-evaluates
+                for every instruction). Each row is placed in the real event
+                window it executed in.
+  proportional  no tick column; rows are bucketed by row-position proportion.
+                Kept as a fallback for traces captured with the plain
+                TraceSetLog command, and clearly labelled as approximate.
 
 Usage
 -----
@@ -82,21 +86,57 @@ def main() -> int:
         print("error: no parsable trace rows", file=sys.stderr)
         return 2
 
-    # Proportional assignment: row i belongs to the event whose index is
-    # floor(i / total * len(events)). Exact when the trace is uniform, which it
-    # is not - but it localises the phase, which is what matters for identifying
-    # "the block that ran right after the N-th exception".
-    per_event = collections.defaultdict(collections.Counter)
-    n_events = len(events)
-    for i, vals in enumerate(rows):
-        idx = min(n_events - 1, int(i * n_events / total))
-        per_event[idx][vals[0]] += 1
+    # Exact alignment: the plugin appends {GetTickCount()} to every trace row, so
+    # when the trace carries a tick column we can place each row in the event
+    # window it actually executed in. Without it we fall back to proportional
+    # bucketing and say so.
+    tick_idx = None
+    for i, name in enumerate(columns):
+        if name.lower() in ("tick", "ticks", "gettickcount"):
+            tick_idx = i
+            break
 
-    print(f"events: {n_events}")
+    per_event = collections.defaultdict(collections.Counter)
+    exact = tick_idx is not None and len(rows[0]) > tick_idx
+
+    if exact:
+        # Events are sorted by tick_ms. For each row find the last event whose
+        # tick_ms <= row tick - that is the event that was "current".
+        ev_ticks = [e["tick_ms"] for e in events]
+        import bisect
+        for vals in rows:
+            t = vals[tick_idx]
+            idx = bisect.bisect_right(ev_ticks, t) - 1
+            if idx < 0:
+                idx = 0
+            per_event[idx][vals[0]] += 1
+    else:
+        n_events = len(events)
+        for i, vals in enumerate(rows):
+            idx = min(n_events - 1, int(i * n_events / total))
+            per_event[idx][vals[0]] += 1
+
+    print(f"events: {len(events)}")
     print(f"trace rows: {total}")
+    print(f"alignment: {'EXACT (tick column)' if exact else 'proportional (no tick column)'}")
+
+    outside = 0
+    if exact:
+        # A run-trace ends the moment the debugger pauses, so a trace started
+        # once and paused once covers only the first window. Say so explicitly:
+        # otherwise the empty buckets below look like a bug in the aligner.
+        lo = min(v[tick_idx] for v in rows)
+        hi = max(v[tick_idx] for v in rows)
+        outside = sum(1 for e in events if not (lo <= e["tick_ms"] <= hi))
+        print(f"trace tick range: {lo}..{hi} "
+              f"({hi - lo} ms)")
+        if outside:
+            print(f"events outside the trace window: {outside} "
+                  f"(trace ended at the first pause)")
+
     print()
     print(f"{'#':>4} {'tick_ms':>12} {'type':<18} {'rows':>9}  hottest addresses")
-    for idx in range(n_events):
+    for idx in range(len(events)):
         ev = events[idx]
         bucket = per_event.get(idx)
         if not bucket:
@@ -105,9 +145,19 @@ def main() -> int:
         hot = ", ".join(f"{a:#x}({c})" for a, c in bucket.most_common(3))
         print(f"{idx:>4} {ev['tick_ms']:>12} {str(ev.get('type','')):<18} {n:>9}  {hot}")
 
-    print()
-    print("note: rows are assigned proportionally; use a trace with a tick column")
-    print("      (--columns cip,tick) for exact alignment.")
+    if exact and outside:
+        print()
+        print(f"note: {outside} of {len(events)} events have no trace rows - the"
+              " trace window closed before they happened.")
+        print("      Re-start the trace after each resume, or trace with a"
+              " break condition that does not require pausing.")
+
+    if not exact:
+        print()
+        print("note: no tick column in the trace - rows were assigned proportionally.")
+        print("      Re-run the trace via /api/trace/thread (it appends")
+        print("      {GetTickCount()}) and pass --columns cip,<...,>tick.")
+
     return 0
 
 

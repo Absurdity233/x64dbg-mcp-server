@@ -60,37 +60,82 @@ static s_plugin_settings g_settings;
 static std::mutex g_trace_mutex;
 static bool g_trace_active = false;
 static std::string g_trace_file;
+static ULONGLONG g_trace_started_tick = 0;
+// Only trace_quiesce_for_stop touches these; they serialise the pause/stop
+// sequence so two concurrent stops cannot interleave.
+static std::mutex g_trace_stop_mutex;
 
 namespace mcp {
 
-void trace_set_active(bool active, const std::string& file) {
+void trace_mark_started(const std::string& file) {
     std::lock_guard<std::mutex> lock(g_trace_mutex);
-    g_trace_active = active;
-    g_trace_file = active ? file : "";
+    g_trace_active = true;
+    g_trace_file = file;
+    g_trace_started_tick = GetTickCount64();
+}
+
+std::string trace_mark_stopped() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    const auto file = g_trace_file;
+    g_trace_active = false;
+    g_trace_file.clear();
+    g_trace_started_tick = 0;
+    return file;
+}
+
+bool trace_is_active() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    return g_trace_active;
 }
 
 nlohmann::json trace_status() {
     std::lock_guard<std::mutex> lock(g_trace_mutex);
+    if (!g_trace_active) {
+        return nlohmann::json{{"tracing", false}, {"file", ""}};
+    }
+
+    // Size is read outside the lock-free window: the trace writer appends from
+    // the debugger thread while this runs on a connection thread. Reading the
+    // size is advisory only (used to spot a trace that produced no rows), so a
+    // stale value is harmless.
+    unsigned long long size = 0;
+    if (!g_trace_file.empty()) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExA(g_trace_file.c_str(), GetFileExInfoStandard, &fad)) {
+            size = (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        }
+    }
+
     return nlohmann::json{
-        {"tracing", g_trace_active},
-        {"file",    g_trace_file}
+        {"tracing",     true},
+        {"file",        g_trace_file},
+        {"size",        size},
+        {"elapsed_ms",  g_trace_started_tick ? (GetTickCount64() - g_trace_started_tick) : 0}
     };
 }
 
+bool trace_quiesce_for_stop(std::string* out_file) {
+    std::lock_guard<std::mutex> lock(g_trace_stop_mutex);
+    const auto file = trace_mark_stopped();
+    if (out_file) *out_file = file;
+
+    if (!DbgIsDebugging() || !DbgIsRunning()) {
+        // Not running means no trace loop is executing; nothing to unwind.
+        return !file.empty();
+    }
+
+    // StopRunTrace alone leaves the debugger running mid-trace, which is the
+    // state that corrupts the next session. Pause first: that lets the trace
+    // loop exit on its own, and StopRunTrace then only clears the bookkeeping.
+    DbgCmdExecDirect("pause");
+    for (int i = 0; i < 200 && DbgIsRunning(); ++i) {
+        Sleep(10);
+    }
+    DbgCmdExecDirect("StopRunTrace");
+    return !file.empty();
+}
+
 } // namespace mcp
-
-// x64dbg fires these on the debugger thread when a run-trace starts/stops
-// (CB_STARTTRACE / CB_STOPTRACE, added in the 2026.05.27 SDK). Registered
-// explicitly in plugsetup because the loader does not auto-register them by
-// export name.
-static void cb_start_trace(CBTYPE, void* cb_info) {
-    auto* info = static_cast<PLUG_CB_STARTTRACE*>(cb_info);
-    mcp::trace_set_active(true, (info && info->traceFilePath) ? info->traceFilePath : "");
-}
-
-static void cb_stop_trace(CBTYPE, void*) {
-    mcp::trace_set_active(false, "");
-}
 
 // ============================================================================
 // Debugger event capture
@@ -108,6 +153,7 @@ static void cb_init_debug(CBTYPE, void* cb_info) {
 }
 
 static void cb_stop_debug(CBTYPE, void*) {
+    mcp::trace_mark_stopped();
     event_log::push("session_stop");
 }
 
@@ -168,6 +214,8 @@ static void cb_exception(CBTYPE, void* cb_info) {
 }
 
 static void cb_paused(CBTYPE, void*) {
+    // A run-trace only advances while the target runs; pausing ends it.
+    mcp::trace_mark_stopped();
     event_log::push("paused");
 }
 
@@ -401,8 +449,9 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init_struct) {
 
     // Trace lifecycle callbacks (no-op on x64dbg versions that don't fire them).
     // These are not auto-registered by export name, so register explicitly.
-    _plugin_registercallback(g_plugin_handle, CB_STARTTRACE, cb_start_trace);
-    _plugin_registercallback(g_plugin_handle, CB_STOPTRACE, cb_stop_trace);
+    // CB_STARTTRACE / CB_STOPTRACE are trace-record events, not run-trace ones:
+    // registering them never produced a callback for TraceIntoConditional. The
+    // run-trace state is tracked explicitly through util/trace_state.h instead.
 
     // Debugger event capture. Registered by name here because only CBMENUENTRY
     // is exported from plugin.def.
@@ -426,8 +475,6 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init_struct) {
 PLUG_EXPORT bool plugstop() {
     // Unregister command + callbacks
     _plugin_unregistercommand(g_plugin_handle, "mcpserver");
-    _plugin_unregistercallback(g_plugin_handle, CB_STARTTRACE);
-    _plugin_unregistercallback(g_plugin_handle, CB_STOPTRACE);
     _plugin_unregistercallback(g_plugin_handle, CB_INITDEBUG);
     _plugin_unregistercallback(g_plugin_handle, CB_STOPDEBUG);
     _plugin_unregistercallback(g_plugin_handle, CB_ATTACH);

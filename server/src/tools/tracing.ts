@@ -6,7 +6,7 @@ import { requireString } from './util.js';
 export function registerTracingTools(server: McpServer) {
   server.tool(
     'x64dbg_tracing',
-    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id in every trace row so the caller can filter to the thread that did the work), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id).',
+    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id and GetTickCount() in every row; the tick is what makes event alignment exact), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id). A run-trace only advances while the target runs: pausing ends it, so restart the trace after each resume.',
     {
       action: z.enum([
         'into', 'over', 'run', 'stop', 'status', 'animate',
