@@ -88,7 +88,9 @@ def main() -> int:
     ap.add_argument("pattern", help="trace file, directory, or glob (trace_*.csv)")
     ap.add_argument("--columns", default="cip,rax,rcx")
     ap.add_argument("--top", type=int, default=20)
-    ap.add_argument("--module", help="only count addresses inside this module name")
+    ap.add_argument("--tid", help="only count rows whose last column matches this thread id (hex or decimal)")
+    ap.add_argument("--tid-column", default="tid",
+                    help="name of the thread-id column when passed via --columns (default tid)")
     ap.add_argument("--timeline", action="store_true",
                     help="print module residency over time (sampled)")
     ap.add_argument("--sample", type=int, default=1000,
@@ -112,27 +114,48 @@ def main() -> int:
     total = 0
     prev = None
     cur_seq = []
+    block_seen = set()
+    MAX_BLOCK = 64
     timeline = []
 
     for row in stream_rows(files, columns):
+        # Thread filtering: the plugin appends {tid()} as the last column, so a
+        # trace covering several threads can be narrowed to the one that did
+        # the work without re-running it.
+        if args.tid is not None:
+            tid_val = row.get(args.tid_column)
+            if tid_val is None and len(row) >= len(columns):
+                tid_val = row[columns[-1]] if len(columns) > 1 else None
+            if tid_val is None:
+                continue
+            try:
+                want = int(args.tid, 0)
+            except ValueError:
+                print(f"error: --tid {args.tid!r} is not a number", file=sys.stderr)
+                return 2
+            if tid_val != want:
+                continue
+
         cip = row[columns[0]]
         total += 1
 
-        if args.module:
-            # Cheap module test: compare against the set of ranges seen so far
-            # is not available here, so callers pass a name filter only when the
-            # trace itself was step-filtered.
-            pass
-
         addr_hits[cip] += 1
 
-        if prev is not None and cip != prev:
-            if len(cur_seq) >= 2:
-                h = hashlib.sha1(",".join(f"{a:X}" for a in cur_seq).encode()).hexdigest()[:12]
-                seq_hashes[h] += 1
+        # Block segmentation: a "block" ends when control returns to an address
+        # already seen in the current run (a loop) or after MAX_BLOCK rows.
+        # Comparing cip != prev alone never brackets anything, which is why the
+        # first version reported 0 blocks.
+        if prev is None:
             cur_seq = [cip]
         else:
+            if cip in block_seen or len(cur_seq) >= MAX_BLOCK:
+                if len(cur_seq) >= 2:
+                    h = hashlib.sha1(",".join(f"{a:X}" for a in cur_seq).encode()).hexdigest()[:12]
+                    seq_hashes[h] += 1
+                cur_seq = []
+                block_seen.clear()
             cur_seq.append(cip)
+            block_seen.add(cip)
         prev = cip
 
         if args.timeline and total % args.sample == 0:
@@ -141,6 +164,7 @@ def main() -> int:
     if len(cur_seq) >= 2:
         h = hashlib.sha1(",".join(f"{a:X}" for a in cur_seq).encode()).hexdigest()[:12]
         seq_hashes[h] += 1
+    block_seen.clear()
 
     print(f"\nrows: {total}")
     print(f"unique addresses: {len(addr_hits)}")

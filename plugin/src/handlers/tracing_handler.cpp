@@ -4,6 +4,7 @@
 #include "util/trace_state.h"
 
 #include <string>
+#include <windows.h>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -98,14 +99,15 @@ void register_tracing_routes(c_http_router& router) {
         });
     });
 
-    // POST /api/trace/thread - Switch to a thread, then start a trace on it
+    // POST /api/trace/thread - Trace everything with the thread id in each row
     //
-    // TraceIntoConditional always begins on the *current* thread. On a target
-    // that assembles its work on a worker thread (network, crypto, ...) tracing
-    // the UI thread records nothing useful. This switches first.
+    // switchthread is not reliably usable through the command interface (it
+    // returns false from DbgCmdExecDirect *and* DbgCmdExec on 2026.05.27), so
+    // "trace one thread" is solved differently: record `tid()` as a column and
+    // let the caller filter. Verified to work in TraceSetLog on this build.
     //
-    // Body: { "tid": 1234, "mode": "into"|"over", "condition": "...",
-    //         "max_steps": "1000000", "log_text": "..." }
+    // Body: { "mode": "into"|"over", "condition": "...", "max_steps": "...",
+    //         "log_text": "...", "file": "...", "include_tid": true }
     router.post("/api/trace/thread", [](const s_http_request& req) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.require_paused()) {
@@ -113,38 +115,38 @@ void register_tracing_routes(c_http_router& router) {
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded() || !body.contains("tid")) {
-            return s_http_response::bad_request("Missing 'tid' field");
-        }
+        if (body.is_discarded()) body = nlohmann::json::object();
 
-        const auto tid = body["tid"].get<DWORD>();
         const auto mode = body.value("mode", "into");
         const auto condition = body.value("condition", "");
         const auto max_steps = body.value("max_steps", "");
-        const auto log_text = body.value("log_text", "");
+        const auto file = body.value("file", "");
+        const bool include_tid = body.value("include_tid", true);
 
-        // Switching thread is synchronous: it only rewrites the debugger's
-        // notion of the active thread, it does not resume the target.
-        if (!bridge.exec_command("switchthread " + std::to_string(tid))) {
-            return s_http_response::internal_error("switchthread failed for tid " + std::to_string(tid));
+        auto log_text = body.value("log_text", std::string("{p:cip},{p:rax}"));
+        if (include_tid && log_text.find("tid()") == std::string::npos) {
+            log_text += ",{tid()}";
         }
+
+        if (!file.empty()) {
+            bridge.exec_command("TraceSetLogFile \"" + file + "\"");
+        }
+        bridge.exec_command("TraceSetLog \"" + log_text + "\"");
 
         std::string cmd = (mode == "over") ? "TraceOverConditional " : "TraceIntoConditional ";
         cmd += condition.empty() ? std::string("0") : condition;
         if (!max_steps.empty()) {
             cmd += ", " + max_steps;
         }
-        if (!log_text.empty()) {
-            cmd += ", \"" + log_text + "\"";
-        }
 
         const auto success = bridge.exec_command_async(cmd);
 
         return s_http_response::ok({
             {"success", success},
-            {"tid", tid},
             {"command", cmd},
-            {"message", "Trace started on thread"}
+            {"log_text", log_text},
+            {"file", file},
+            {"note", "each trace row now carries the thread id as its last column"}
         });
     });
 

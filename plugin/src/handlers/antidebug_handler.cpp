@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <windows.h>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -245,11 +246,20 @@ void register_antidebug_routes(c_http_router& router) {
         // Clear the hardware debug registers in the current thread context.
         // x64dbg restores them on continue, so this only helps until the next
         // resume; targets typically read DR at their own entry, before that.
+        // `r dr0=0` is rejected by DbgCmdExecDirect (the register command is
+        // queue-dispatched), so go through the queue and read back to confirm.
         auto clear_dr = [&](const char* name) {
-            if (bridge.exec_command(std::string("r ") + name + "=0")) {
+            const std::string cmd = std::string("r ") + name + "=0";
+            bridge.exec_command_async(cmd);
+            Sleep(15);
+            const auto after = bridge.eval_expression(name);
+            if (after == 0) {
                 applied.push_back({{"field", name}, {"note", "hardware breakpoint register zeroed"}});
             } else {
-                skipped.push_back({{"field", name}, {"reason", "register write failed"}});
+                skipped.push_back({
+                    {"field", name},
+                    {"reason", "register still non-zero after write (x64dbg may restore it on resume)"}
+                });
             }
         };
         clear_dr("dr0");

@@ -6,12 +6,12 @@ import { requireString } from './util.js';
 export function registerTracingTools(server: McpServer) {
   server.tool(
     'x64dbg_tracing',
-    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (switch to a thread first, then trace it - needed when work happens off the UI thread), step_filter (restrict tracing to a module).',
+    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id in every trace row so the caller can filter to the thread that did the work), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id).',
     {
       action: z.enum([
         'into', 'over', 'run', 'stop', 'status', 'animate',
         'conditional_run', 'log_setup', 'hitcount', 'type', 'set_type',
-        'trace_thread', 'step_filter',
+        'trace_thread', 'step_filter', 'trace_all_threads',
       ]).describe('Operation to perform'),
 
       condition: z.string().optional().describe('Break condition expression (into/over/conditional_run/log_setup)'),
@@ -88,16 +88,15 @@ export function registerTracingTools(server: McpServer) {
           const data = await httpClient.get('/api/trace/record/type', { address: requireString(args.address, 'address') });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
-        case 'trace_thread': {
-          if (args.tid === undefined) throw new Error("'tid' is required for this action");
-          const tid = Number(args.tid);
-          if (!Number.isFinite(tid)) throw new Error(`'tid' must be a decimal thread id, got '${args.tid}'`);
+        case 'trace_thread':
+        case 'trace_all_threads': {
           const data = await httpClient.post('/api/trace/thread', {
-            tid,
             mode: args.mode ?? 'into',
             condition: args.condition ?? '',
             max_steps: args.max_steps ?? '',
             log_text: args.log_text ?? '',
+            file: args.file ?? '',
+            include_tid: true,
           });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
