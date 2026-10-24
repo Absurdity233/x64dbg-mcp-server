@@ -42,6 +42,7 @@ namespace handlers {
     void register_process_routes(c_http_router& router);
     void register_handles_routes(c_http_router& router);
     void register_controlflow_routes(c_http_router& router);
+    void register_functions_routes(c_http_router& router);
 } // namespace handlers
 
 // Globals
@@ -315,6 +316,7 @@ void register_all_routes(c_http_router& router) {
     handlers::register_process_routes(router);
     handlers::register_handles_routes(router);
     handlers::register_controlflow_routes(router);
+    handlers::register_functions_routes(router);
 }
 
 // ============================================================================

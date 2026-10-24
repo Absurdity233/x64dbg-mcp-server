@@ -6,11 +6,11 @@ import { requireString } from './util.js';
 export function registerDumpingTools(server: McpServer) {
   server.tool(
     'x64dbg_dumping',
-    'PE analysis, module dumping and IAT repair. Actions: pe_header, sections, imports, exports, entry_point, relocations, dump_module, fix_iat, export_patch_file.',
+    'PE analysis, module dumping and IAT repair. Actions: pe_header, sections, imports, exports, entry_point, relocations, dump_module, fix_iat, export_patch_file, detect_oep.',
     {
       action: z.enum([
         'pe_header', 'sections', 'imports', 'exports', 'entry_point',
-        'relocations', 'dump_module', 'fix_iat', 'export_patch_file',
+        'relocations', 'dump_module', 'fix_iat', 'export_patch_file', 'detect_oep',
       ]).describe('Operation to perform'),
 
       address: z.string().optional().describe('pe_header/relocations: address inside the PE'),
@@ -46,6 +46,10 @@ export function registerDumpingTools(server: McpServer) {
         }
         case 'export_patch_file': {
           const data = await httpClient.post('/api/patches/export_file', { filename: requireString(args.filename, 'filename') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'detect_oep': {
+          const data = await httpClient.get('/api/dump/detect_oep');
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
       }

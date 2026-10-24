@@ -37,6 +37,42 @@ function applyCliArgs(argv: string[]): { launch: boolean } {
   return { launch };
 }
 
+/**
+ * Append a `[state] ...` line to every tool response, mirroring the duty1g
+ * server's habit of telling you where the debugger is after each call.
+ * Best-effort: a failure to read state never fails the tool call.
+ */
+function installStateLine(server: McpServer): { count: () => number } {
+  const original = server.tool.bind(server) as (...a: any[]) => any;
+  let registrations = 0;
+
+  (server as any).tool = (...args: any[]) => {
+    const handler = args[args.length - 1];
+    if (typeof handler === 'function') {
+      args[args.length - 1] = async (...callArgs: any[]) => {
+        const result = await handler(...callArgs);
+        try {
+          const st = await httpClient.get<any>('/api/debug/state');
+          let line = `[state] ${String(st.state).toUpperCase()}`;
+          if (st.cip) line += ` at ${st.cip}`;
+          if (st.module) line += ` (${st.module})`;
+          if (st.label) line += ` | ${st.label}`;
+          if (Array.isArray(result?.content)) {
+            result.content.push({ type: 'text', text: line });
+          }
+        } catch {
+          // Plugin down or no session - skip the annotation.
+        }
+        return result;
+      };
+    }
+    registrations++;
+    return original(...args);
+  };
+
+  return { count: () => registrations };
+}
+
 async function main() {
   const { launch } = applyCliArgs(process.argv.slice(2));
 
@@ -45,7 +81,8 @@ async function main() {
     version: getVersion(),
   });
 
-  // Register all tools
+  // Register all tools (wrapped so every response carries a [state] line)
+  const counter = installStateLine(server);
   registerAllTools(server);
 
   // Connect via stdio (rock-solid transport, no connection drops)
@@ -53,7 +90,7 @@ async function main() {
   await server.connect(transport);
 
   // Log to stderr (stdout is used by MCP protocol)
-  console.error(`[x64dbg-mcp] Server started (23 tools), plugin expected at ${config.host}:${config.port}`);
+  console.error(`[x64dbg-mcp] Server started (${counter.count()} tools), plugin expected at ${config.host}:${config.port}`);
   const timeout_desc = config.timeout > 0 ? `${config.timeout}ms` : 'none (waits indefinitely)';
   console.error(`[x64dbg-mcp] Timeout: ${timeout_desc}, Retries: ${config.retries}`);
 

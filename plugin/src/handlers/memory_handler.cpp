@@ -2,6 +2,8 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 
+#include <algorithm>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include "_dbgfunctions.h"
 
@@ -251,6 +253,68 @@ void register_memory_routes(c_http_router& router) {
 
         return s_http_response::ok({
             {"message", "Memory map updated"}
+        });
+    });
+
+    // POST /api/memory/dump - Write a memory region to disk
+    // Body: { "address": "0x...", "size": 4096, "file": "C:\\out.bin" }
+    router.post("/api/memory/dump", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("address") || !body.contains("file")) {
+            return s_http_response::bad_request("Missing 'address' or 'file' field");
+        }
+
+        auto address_str = body["address"].get<std::string>();
+        auto file = body["file"].get<std::string>();
+        size_t size = body.value("size", static_cast<size_t>(0x1000));
+
+        // read_memory caps a single call at 10 MB; dump in chunks so larger
+        // regions (whole sections, unpacked images) work too.
+        constexpr size_t CHUNK = 4 * 1024 * 1024;
+        if (size == 0 || size > 512ull * 1024 * 1024) {
+            return s_http_response::bad_request("'size' must be between 1 and 512MB");
+        }
+
+        auto address = bridge.eval_expression(address_str);
+        if (address == 0) {
+            return s_http_response::bad_request("Invalid address: " + address_str);
+        }
+
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return s_http_response::internal_error("Cannot open '" + file + "' for writing");
+        }
+
+        size_t written = 0;
+        while (written < size) {
+            const size_t want = std::min(CHUNK, size - written);
+            auto chunk = bridge.read_memory(address + written, want);
+            if (!chunk.has_value()) {
+                out.close();
+                return s_http_response::internal_error(
+                    "Memory read failed at " + format_utils::format_address(address + written) +
+                    " after " + std::to_string(written) + " bytes: " + chunk.error());
+            }
+            out.write(reinterpret_cast<const char*>(chunk->data()),
+                      static_cast<std::streamsize>(chunk->size()));
+            if (!out) {
+                out.close();
+                return s_http_response::internal_error("Write to '" + file + "' failed");
+            }
+            written += chunk->size();
+            if (chunk->size() < want) break;
+        }
+        out.close();
+
+        return s_http_response::ok({
+            {"address", format_utils::format_address(address)},
+            {"file",    file},
+            {"written", written}
         });
     });
 }

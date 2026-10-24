@@ -60,6 +60,7 @@ set(SOURCES
     src/handlers/process_handler.cpp
     src/handlers/handles_handler.cpp
     src/handlers/controlflow_handler.cpp
+    src/handlers/functions_handler.cpp
     src/ui/settings_dialog.cpp
     src/ui/about_dialog.cpp
 )

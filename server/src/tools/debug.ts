@@ -15,7 +15,7 @@ interface DebugState {
 
 /** Poll /api/debug/state until `want` is reached or the deadline passes. */
 async function waitForState(
-  want: 'paused' | 'stopped' | 'active',
+  want: 'paused' | 'stopped' | 'active' | 'not_running',
   timeout_ms: number,
   poll_ms: number
 ): Promise<{ reached: boolean; elapsed_ms: number; state: DebugState }> {
@@ -24,7 +24,10 @@ async function waitForState(
 
   for (;;) {
     last = await httpClient.get<DebugState>('/api/debug/state');
-    const hit = want === 'active' ? last.state !== 'stopped' : last.state === want;
+    const hit =
+      want === 'active' ? last.state !== 'stopped'
+      : want === 'not_running' ? last.state !== 'running'
+      : last.state === want;
     if (hit) {
       return { reached: true, elapsed_ms: Date.now() - started, state: last };
     }
@@ -69,17 +72,54 @@ export function registerDebugTools(server: McpServer) {
       timeout_ms: z.number().optional().default(120000).describe("wait_for_pause/wait_for_event: maximum time to block (default 120000)"),
       poll_ms: z.number().optional().default(200).describe("wait_for_pause/wait_for_event: state poll interval (default 200)"),
       include_health: z.boolean().optional().describe("state: also query plugin health"),
+      wait: z.boolean().optional().describe("run: block until the target stops again (default true). Set false for fire-and-forget."),
       event_types: z.array(z.string()).optional()
         .describe("wait_for_event: event types to match, e.g. ['breakpoint','exception']. Omit for any event."),
       match_address: z.string().optional()
         .describe("wait_for_event: only match events whose address equals this expression"),
     },
-    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address }) => {
+    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address, wait }) => {
       let endpoint = '';
       let payload: any = undefined;
 
       switch (action) {
-        case 'run': endpoint = '/api/debug/run'; break;
+        case 'run': {
+          // Block by default so the caller learns where and why the target
+          // stopped, instead of having to issue a separate wait. Pass
+          // wait=false for fire-and-forget.
+          const res = await httpClient.post<any>('/api/debug/run');
+          if (wait === false) {
+            return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+          }
+
+          const waited = await waitForState('not_running', timeout_ms ?? 120000, poll_ms ?? 200);
+          const events = waited.reached ? await consume() : { events: [], dropped: 0 };
+
+          let instruction: string | null = null;
+          if (waited.state.state === 'paused') {
+            try {
+              const dis = await httpClient.get<any>('/api/disasm/at', { address: 'cip', count: '1' });
+              instruction = dis?.instructions?.[0]?.instruction ?? null;
+            } catch { /* non-fatal */ }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                reached: waited.reached,
+                waited_ms: waited.elapsed_ms,
+                message: waited.reached
+                  ? `Target stopped after ${waited.elapsed_ms}ms`
+                  : `Timed out after ${waited.elapsed_ms}ms - target still running`,
+                state: waited.state,
+                instruction,
+                events: events.events.map(describe),
+                dropped: events.dropped,
+              }, null, 2),
+            }],
+          };
+        }
         case 'pause': endpoint = '/api/debug/pause'; break;
         case 'force_pause': endpoint = '/api/debug/force_pause'; break;
         case 'step_into': endpoint = '/api/debug/step_into'; break;

@@ -2,12 +2,15 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 
+#include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
 #include "bridgelist.h"
+#include "_scriptapi_module.h"
 
 namespace handlers {
 
@@ -595,6 +598,109 @@ void register_dumping_routes(c_http_router& router) {
             {"base", format_utils::format_address(base)},
             {"entry_point", format_utils::format_address(entry)},
             {"rva", format_utils::format_address(entry - base)}
+        });
+    });
+
+    // GET /api/dump/detect_oep - Heuristic original-entry-point search
+    //
+    // Packers leave the PE entry pointing at the unpacking stub. The real OEP
+    // usually starts with a standard compiler prologue and sits just after a
+    // run of padding (CC / 00 / 90). This scans the main module's executable
+    // sections for those patterns and ranks them. It is a heuristic, not proof:
+    // confirm the candidate by breakpointing it and letting the target run.
+    router.get("/api/dump/detect_oep", [](const s_http_request&) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        BridgeList<Script::Module::ModuleSectionInfo> sections;
+        if (!Script::Module::GetMainModuleSectionList(&sections)) {
+            return s_http_response::internal_error("Cannot enumerate main module sections");
+        }
+
+        const duint entry = Script::Module::GetMainModuleEntry();
+        char module_name[MAX_MODULE_SIZE] = {};
+        Script::Module::GetMainModuleName(module_name);
+
+        // Common prologues. 32-bit: push ebp; mov ebp,esp / mov edi,edi; push ebp...
+        // 64-bit: sub rsp,imm8 / mov [rsp+x],rbx / push rbx / mov rax,rsp.
+        struct prologue { const uint8_t* bytes; size_t len; };
+        static const uint8_t p32a[] = {0x55, 0x8B, 0xEC};
+        static const uint8_t p32b[] = {0x55, 0x89, 0xE5};
+        static const uint8_t p32c[] = {0x8B, 0xFF, 0x55, 0x8B, 0xEC};
+        static const uint8_t p64a[] = {0x48, 0x83, 0xEC};
+        static const uint8_t p64b[] = {0x48, 0x89, 0x5C, 0x24};
+        static const uint8_t p64c[] = {0x48, 0x81, 0xEC};
+        static const uint8_t p64d[] = {0x40, 0x53};
+        static const prologue prologues[] = {
+            {p32a, sizeof(p32a)}, {p32b, sizeof(p32b)}, {p32c, sizeof(p32c)},
+            {p64a, sizeof(p64a)}, {p64b, sizeof(p64b)}, {p64c, sizeof(p64c)},
+            {p64d, sizeof(p64d)}
+        };
+
+        struct candidate {
+            duint addr;
+            std::string section;
+            int score;
+            size_t offset;
+        };
+        std::vector<candidate> found;
+
+        for (int s = 0; s < sections.Count(); ++s) {
+            const auto& sec = sections[s];
+            // Only executable sections matter, and skip tiny ones.
+            if (sec.size < 64) continue;
+            if (!DbgFunctions()->MemIsCodePage(sec.addr, false)) continue;
+
+            // Cap the scan per section so a huge .text cannot stall the plugin.
+            const size_t scan = std::min<size_t>(sec.size, 8 * 1024 * 1024);
+            auto bytes = bridge.read_memory(sec.addr, scan);
+            if (!bytes.has_value()) continue;
+
+            for (size_t i = 0; i + 8 < bytes->size(); ++i) {
+                for (const auto& p : prologues) {
+                    if (i + p.len > bytes->size()) continue;
+                    if (std::memcmp(bytes->data() + i, p.bytes, p.len) != 0) continue;
+
+                    int score = 0;
+                    // Padding immediately before the prologue is a strong hint.
+                    const uint8_t prev = i > 0 ? (*bytes)[i - 1] : 0;
+                    if (prev == 0xCC || prev == 0x00 || prev == 0x90) score += 3;
+                    // Candidates far from the current entry are more interesting
+                    // for a packed binary (the stub is at the entry).
+                    const duint addr = sec.addr + i;
+                    if (addr > entry + 0x100) score += 1;
+                    // Section-start candidates are usually the packer stub.
+                    if (i < 0x200) score -= 2;
+
+                    found.push_back({addr, sec.name, score, i});
+                    i += p.len - 1;
+                    break;
+                }
+            }
+        }
+
+        std::sort(found.begin(), found.end(), [](const candidate& a, const candidate& b) {
+            return a.score != b.score ? a.score > b.score : a.addr < b.addr;
+        });
+
+        auto candidates = nlohmann::json::array();
+        for (size_t i = 0; i < found.size() && i < 16; ++i) {
+            candidates.push_back({
+                {"address", format_utils::format_address(found[i].addr)},
+                {"section", found[i].section},
+                {"score",   found[i].score},
+                {"offset",  found[i].offset}
+            });
+        }
+
+        return s_http_response::ok({
+            {"module",            module_name},
+            {"current_entry",     format_utils::format_address(entry)},
+            {"candidate_count",   found.size()},
+            {"candidates",        candidates},
+            {"note",              "heuristic only - breakpoint a candidate and let the target run to confirm"}
         });
     });
 }

@@ -93,6 +93,15 @@ void register_command_routes(c_http_router& router) {
         return s_http_response::ok(event_log::since(since_seq));
     });
 
+    // POST /api/command/clear_events - Drop the buffered event log
+    router.post("/api/command/clear_events", [](const s_http_request&) -> s_http_response {
+        event_log::clear();
+        return s_http_response::ok({
+            {"message", "Event log cleared"},
+            {"latest_seq", event_log::latest_seq()}
+        });
+    });
+
     // POST /api/command/init_script - Set debuggee init script
     router.post("/api/command/init_script", [](const s_http_request& req) -> s_http_response {
         auto body = nlohmann::json::parse(req.body, nullptr, false);
