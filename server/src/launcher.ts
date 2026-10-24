@@ -81,16 +81,33 @@ export async function ensureX64dbg(timeoutMs = 60_000): Promise<{ launched: bool
     return { launched: false, ok: true };
   }
 
-  let exe = await runningX64dbgPath();
-
-  if (!exe) {
-    const candidates = candidatePaths();
-    if (candidates.length === 0) {
-      log('x64dbg.exe not found. Set X64DBG_PATH or pass --x64dbg=<path to x64dbg.exe>.');
-      return { launched: false, ok: false };
+  // x64dbg is already up but its plugin is not answering (server stopped,
+  // plugin not loaded, wrong port, wrong token). Starting a second instance
+  // would just open another GUI window and still not answer on this port, so
+  // wait for the existing one instead.
+  const running = await runningX64dbgPath();
+  if (running) {
+    log(`x64dbg is running (${running}) but the plugin is not answering at ${getBaseUrl()}; ` +
+        'waiting instead of starting a second instance');
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await SLEEP(1000);
+      if (await pluginReady()) {
+        log('plugin is online');
+        return { launched: false, ok: true };
+      }
     }
-    exe = candidates[0];
+    log('plugin did not come online. Check Plugins > x64dbg MCP Server > Start Server, ' +
+        'the configured port, and X64DBG_MCP_TOKEN.');
+    return { launched: false, ok: false };
   }
+
+  const candidates = candidatePaths();
+  if (candidates.length === 0) {
+    log('x64dbg.exe not found. Set X64DBG_PATH or pass --x64dbg=<path to x64dbg.exe>.');
+    return { launched: false, ok: false };
+  }
+  const exe = candidates[0];
 
   log(`starting ${exe}`);
   try {
