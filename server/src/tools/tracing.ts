@@ -6,11 +6,12 @@ import { requireString } from './util.js';
 export function registerTracingTools(server: McpServer) {
   server.tool(
     'x64dbg_tracing',
-    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type.',
+    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (switch to a thread first, then trace it - needed when work happens off the UI thread), step_filter (restrict tracing to a module).',
     {
       action: z.enum([
         'into', 'over', 'run', 'stop', 'status', 'animate',
         'conditional_run', 'log_setup', 'hitcount', 'type', 'set_type',
+        'trace_thread', 'step_filter',
       ]).describe('Operation to perform'),
 
       condition: z.string().optional().describe('Break condition expression (into/over/conditional_run/log_setup)'),
@@ -25,6 +26,9 @@ export function registerTracingTools(server: McpServer) {
       file: z.string().optional().describe('log_setup: absolute path of the trace log file'),
       address: z.string().optional().describe('hitcount/type/set_type: address'),
       record_type: z.number().optional().describe('set_type: trace record type (default 0)'),
+      tid: z.union([z.string(), z.number()]).optional().describe('trace_thread: thread id to switch to before tracing'),
+      filter: z.string().optional().describe("step_filter: 'user', 'system', 'none', or a module name to restrict tracing to"),
+      mode: z.enum(['into', 'over']).optional().describe('trace_thread: trace mode (default into)'),
     },
     async (args) => {
       const { action } = args;
@@ -82,6 +86,25 @@ export function registerTracingTools(server: McpServer) {
         }
         case 'type': {
           const data = await httpClient.get('/api/trace/record/type', { address: requireString(args.address, 'address') });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'trace_thread': {
+          if (args.tid === undefined) throw new Error("'tid' is required for this action");
+          const tid = Number(args.tid);
+          if (!Number.isFinite(tid)) throw new Error(`'tid' must be a decimal thread id, got '${args.tid}'`);
+          const data = await httpClient.post('/api/trace/thread', {
+            tid,
+            mode: args.mode ?? 'into',
+            condition: args.condition ?? '',
+            max_steps: args.max_steps ?? '',
+            log_text: args.log_text ?? '',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'step_filter': {
+          const data = await httpClient.post('/api/trace/step_filter', {
+            filter: requireString(args.filter, 'filter'),
+          });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'set_type': {

@@ -5,9 +5,9 @@ import { httpClient } from '../http_client.js';
 export function registerAntiDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_antidebug',
-    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger.',
+    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger, harden (clears BeingDebugged, NtGlobalFlag, heap flags and the DR registers, and reports what needs a kernel component).',
     {
-      action: z.enum(['peb', 'teb', 'dep', 'hide_debugger']).describe('Operation to perform'),
+      action: z.enum(['peb', 'teb', 'dep', 'hide_debugger', 'harden']).describe('Operation to perform'),
       pid: z.string().optional().describe('peb: process id (default current)'),
       tid: z.string().optional().describe('teb: thread id (default current)'),
     },
@@ -27,6 +27,10 @@ export function registerAntiDebugTools(server: McpServer) {
         }
         case 'hide_debugger': {
           const data = await httpClient.post('/api/antidebug/hide_debugger');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'harden': {
+          const data = await httpClient.post('/api/antidebug/harden');
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
       }

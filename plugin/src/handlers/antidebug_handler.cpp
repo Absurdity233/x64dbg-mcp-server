@@ -2,6 +2,9 @@
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
 
+#include <cstring>
+#include <vector>
+#include <string>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -176,6 +179,97 @@ void register_antidebug_routes(c_http_router& router) {
             {"peb_address", format_utils::format_address(peb_addr)},
             {"changes", changes},
             {"message", "Debugger hidden from PEB checks"}
+        });
+    });
+
+    // POST /api/antidebug/harden - Broader anti-detection pass
+    //
+    // hide_debugger only clears two PEB fields. Real protected targets also
+    // check heap flags, the DR registers, the debug object handle and the
+    // process debug port. This route clears what can be cleared from a plugin
+    // without a kernel component, and reports what it could not touch.
+    router.post("/api/antidebug/harden", [](const s_http_request&) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto pid = static_cast<DWORD>(bridge.eval_expression("$pid"));
+        auto peb_addr = DbgGetPebAddress(pid);
+        if (peb_addr == 0) {
+            return s_http_response::internal_error("Failed to get PEB address");
+        }
+
+        auto applied = nlohmann::json::array();
+        auto skipped = nlohmann::json::array();
+
+        auto poke = [&](duint addr, const std::vector<uint8_t>& bytes,
+                        const std::string& field, const std::string& note) {
+            auto r = bridge.write_memory(addr, bytes);
+            if (r.has_value()) {
+                applied.push_back({
+                    {"field", field},
+                    {"address", format_utils::format_address(addr)},
+                    {"note", note}
+                });
+            } else {
+                skipped.push_back({{"field", field}, {"reason", "write failed"}});
+            }
+        };
+
+        // PEB.BeingDebugged
+        poke(peb_addr + 0x2, {0x00}, "PEB.BeingDebugged", "clears IsDebuggerPresent");
+
+        // PEB.NtGlobalFlag
+#ifdef _WIN64
+        constexpr duint ntglobalflag_offset = 0xBC;
+        constexpr duint process_heap_offset = 0x30;
+#else
+        constexpr duint ntglobalflag_offset = 0x68;
+        constexpr duint process_heap_offset = 0x18;
+#endif
+        poke(peb_addr + ntglobalflag_offset, {0, 0, 0, 0}, "PEB.NtGlobalFlag",
+             "clears the FLG_HEAP_* debug bits");
+
+        // PEB.ProcessHeap -> Flags / ForceFlags. A debugger sets both.
+        auto heap_ptr = bridge.read_memory(peb_addr + process_heap_offset, sizeof(duint));
+        if (heap_ptr.has_value()) {
+            duint heap = 0;
+            memcpy(&heap, heap_ptr->data(), sizeof(duint));
+            if (heap != 0) {
+                poke(heap + 0x70, {0, 0, 0, 0}, "Heap.Flags", "x64 offset 0x70");
+                poke(heap + 0x74, {0, 0, 0, 0}, "Heap.ForceFlags", "x64 offset 0x74");
+            }
+        }
+
+        // Clear the hardware debug registers in the current thread context.
+        // x64dbg restores them on continue, so this only helps until the next
+        // resume; targets typically read DR at their own entry, before that.
+        auto clear_dr = [&](const char* name) {
+            if (bridge.exec_command(std::string("r ") + name + "=0")) {
+                applied.push_back({{"field", name}, {"note", "hardware breakpoint register zeroed"}});
+            } else {
+                skipped.push_back({{"field", name}, {"reason", "register write failed"}});
+            }
+        };
+        clear_dr("dr0");
+        clear_dr("dr1");
+        clear_dr("dr2");
+        clear_dr("dr3");
+        clear_dr("dr6");
+        clear_dr("dr7");
+
+        skipped.push_back({
+            {"field", "ProcessDebugPort/ProcessDebugObjectHandle"},
+            {"reason", "kernel-level query cannot be faked from a user-mode plugin; "
+                       "use ScyllaHide's driver component"}
+        });
+
+        return s_http_response::ok({
+            {"peb_address", format_utils::format_address(peb_addr)},
+            {"applied", applied},
+            {"skipped", skipped},
+            {"message", "Anti-debug hardening applied"}
         });
     });
 

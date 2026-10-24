@@ -3,6 +3,7 @@
 #include "util/format_utils.h"
 #include "util/trace_state.h"
 
+#include <string>
 #include <nlohmann/json.hpp>
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -94,6 +95,81 @@ void register_tracing_routes(c_http_router& router) {
             {"success", success},
             {"command", cmd},
             {"message", "Run to party started (async)"}
+        });
+    });
+
+    // POST /api/trace/thread - Switch to a thread, then start a trace on it
+    //
+    // TraceIntoConditional always begins on the *current* thread. On a target
+    // that assembles its work on a worker thread (network, crypto, ...) tracing
+    // the UI thread records nothing useful. This switches first.
+    //
+    // Body: { "tid": 1234, "mode": "into"|"over", "condition": "...",
+    //         "max_steps": "1000000", "log_text": "..." }
+    router.post("/api/trace/thread", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_paused()) {
+            return s_http_response::conflict("Debugger must be paused");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("tid")) {
+            return s_http_response::bad_request("Missing 'tid' field");
+        }
+
+        const auto tid = body["tid"].get<DWORD>();
+        const auto mode = body.value("mode", "into");
+        const auto condition = body.value("condition", "");
+        const auto max_steps = body.value("max_steps", "");
+        const auto log_text = body.value("log_text", "");
+
+        // Switching thread is synchronous: it only rewrites the debugger's
+        // notion of the active thread, it does not resume the target.
+        if (!bridge.exec_command("switchthread " + std::to_string(tid))) {
+            return s_http_response::internal_error("switchthread failed for tid " + std::to_string(tid));
+        }
+
+        std::string cmd = (mode == "over") ? "TraceOverConditional " : "TraceIntoConditional ";
+        cmd += condition.empty() ? std::string("0") : condition;
+        if (!max_steps.empty()) {
+            cmd += ", " + max_steps;
+        }
+        if (!log_text.empty()) {
+            cmd += ", \"" + log_text + "\"";
+        }
+
+        const auto success = bridge.exec_command_async(cmd);
+
+        return s_http_response::ok({
+            {"success", success},
+            {"tid", tid},
+            {"command", cmd},
+            {"message", "Trace started on thread"}
+        });
+    });
+
+    // POST /api/trace/step_filter - Restrict tracing to a module or address range
+    //
+    // TraceSetStepFilter takes a module name ("user", "system"), "none", or a
+    // module name to trace only inside it. Without a filter a multi-megabyte
+    // trace is mostly loader/system noise.
+    router.post("/api/trace/step_filter", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("filter")) {
+            return s_http_response::bad_request("Missing 'filter' field");
+        }
+
+        const auto filter = body["filter"].get<std::string>();
+        const auto success = bridge.exec_command("TraceSetStepFilter " + filter);
+
+        return s_http_response::ok({
+            {"success", success},
+            {"filter", filter}
         });
     });
 
