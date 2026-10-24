@@ -652,6 +652,11 @@ while ($true) {
   }
 
   $json = $resp | ConvertTo-Json -Compress -Depth 4
-  [Console]::Out.WriteLine($json)
-  [Console]::Out.Flush()
+  # Write UTF-8 bytes straight to the pipe. [Console]::OutputEncoding is not
+  # honoured when stdout is redirected in Windows PowerShell 5.1, which turned
+  # every Chinese OCR result into mojibake on the Node side.
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
+  $stdout = [Console]::OpenStandardOutput()
+  $stdout.Write($bytes, 0, $bytes.Length)
+  $stdout.Flush()
 }

@@ -308,6 +308,93 @@ void register_search_routes(c_http_router& router) {
         });
     });
 
+    // POST /api/search/memory - Scan committed readable memory for a byte pattern
+    //
+    // The existing /api/search/string only covers a named module, and its
+    // full-memory fallback used `findall` whose results are not readable
+    // through $result. This route walks the memory map directly so a value that
+    // only exists on the heap (an activation code, a decrypted buffer) can be
+    // located.
+    router.post("/api/search/memory", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("pattern")) {
+            return s_http_response::bad_request("Missing 'pattern' field");
+        }
+
+        const auto pattern = parse_byte_pattern(body["pattern"].get<std::string>());
+        if (pattern.empty()) {
+            return s_http_response::bad_request("Invalid byte pattern");
+        }
+
+        const size_t max_results = body.value("max_results", static_cast<size_t>(100));
+        const size_t max_bytes   = body.value("max_bytes", static_cast<size_t>(512ull * 1024 * 1024));
+
+        auto memmap = bridge.get_memory_map();
+        if (!memmap.has_value()) {
+            return s_http_response::internal_error(memmap.error());
+        }
+
+        auto matches = nlohmann::json::array();
+        size_t scanned = 0;
+        size_t regions_scanned = 0;
+
+        constexpr size_t CHUNK = 1 << 20;      // 1 MB
+        const size_t overlap = pattern.size() > 1 ? pattern.size() - 1 : 0;
+
+        for (const auto& page : memmap.value()) {
+            if (matches.size() >= max_results || scanned >= max_bytes) break;
+
+            const auto state   = page.value("state", "");
+            const auto protect = page.value("protect", "");
+            if (state != "MEM_COMMIT") continue;
+            // Skip guard/no-access pages: reading them fails or faults.
+            if (protect.find("NOACCESS") != std::string::npos) continue;
+            if (protect.find("GUARD") != std::string::npos) continue;
+
+            const auto base = format_utils::parse_address(page.value("base", "0"));
+            const size_t size = page.value("size", static_cast<size_t>(0));
+            if (base == 0 || size == 0) continue;
+
+            ++regions_scanned;
+
+            std::vector<uint8_t> carry;
+            for (size_t offset = 0; offset < size && scanned < max_bytes; offset += CHUNK) {
+                const size_t want = std::min(CHUNK, size - offset);
+                auto chunk = bridge.read_memory(base + offset, want);
+                if (!chunk.has_value()) { carry.clear(); continue; }
+
+                std::vector<uint8_t> buf;
+                buf.reserve(carry.size() + chunk->size());
+                buf.insert(buf.end(), carry.begin(), carry.end());
+                buf.insert(buf.end(), chunk->begin(), chunk->end());
+
+                const size_t buf_base = offset - carry.size();
+                for (size_t hit : scan_buffer(buf.data(), buf.size(), pattern)) {
+                    if (matches.size() >= max_results) break;
+                    matches.push_back(format_utils::format_address(base + buf_base + hit));
+                }
+
+                scanned += chunk->size();
+                carry.assign(buf.end() - std::min(overlap, buf.size()), buf.end());
+            }
+        }
+
+        return s_http_response::ok({
+            {"pattern",          body["pattern"]},
+            {"found",            !matches.empty()},
+            {"count",            matches.size()},
+            {"matches",          matches},
+            {"regions_scanned",  regions_scanned},
+            {"bytes_scanned",    scanned},
+            {"truncated",        matches.size() >= max_results || scanned >= max_bytes}
+        });
+    });
+
     // GET /api/search/string_at?address=&encoding=auto&max_length=256 - Get string at address
     // encoding: auto (default), ascii, unicode
     router.get("/api/search/string_at", [](const s_http_request& req) -> s_http_response {

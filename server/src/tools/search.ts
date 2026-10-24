@@ -6,9 +6,9 @@ import { requireString } from './util.js';
 export function registerSearchTools(server: McpServer) {
   server.tool(
     'x64dbg_search',
-    'Search. Actions: pattern (AOB), string, string_at, symbol_auto_complete, encode_type.',
+    'Search. Actions: pattern (AOB), string, string_at, symbol_auto_complete, encode_type, memory (scan all committed readable memory - use for heap values the module-scoped search cannot see).',
     {
-      action: z.enum(['pattern', 'string', 'string_at', 'symbol_auto_complete', 'encode_type'])
+      action: z.enum(['pattern', 'string', 'string_at', 'symbol_auto_complete', 'encode_type', 'memory'])
         .describe('Operation to perform'),
       query: z.string().optional().describe("pattern: byte pattern (e.g. '48 89 5C ??'); string/symbol_auto_complete: text; string_at/encode_type: address"),
       address: z.string().optional().describe('pattern: start address'),
@@ -50,6 +50,13 @@ export function registerSearchTools(server: McpServer) {
           const data = await httpClient.post('/api/search/auto_complete', {
             search: requireString(args.query, 'query'),
             max_results: args.max_results ?? 256,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'memory': {
+          const data = await httpClient.post('/api/search/memory', {
+            pattern: requireString(args.query, 'query'),
+            max_results: args.max_results ?? 100,
           });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
