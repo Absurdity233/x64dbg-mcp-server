@@ -1,87 +1,29 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 import { httpClient } from '../http_client.js';
+import { uiDaemon } from '../ui_daemon.js';
 import { requireString } from './util.js';
 
-const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'ui.ps1');
+/** Cache of pid -> window handle, so a UI flow does not re-enumerate windows. */
+const windowCache = new Map<number, { hwnd: number; at: number }>();
+// A window handle is stable for the life of a debug session. Resolve it through
+// the daemon (a few ms) rather than a fresh powershell.exe (~3s).
+const WINDOW_CACHE_MS = 10 * 60 * 1000;
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-  timedOut: boolean;
-}
-
-function runPowerShell(args: string[], timeoutMs: number): Promise<RunResult> {
-  return new Promise((resolve) => {
-    const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', ...args], {
-      windowsHide: true,
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-
-    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8'); });
-    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString('utf8'); });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout: stdout.trim(), stderr: stderr.trim(), timedOut });
-    });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({ code: -1, stdout, stderr: String(err), timedOut });
-    });
-  });
-}
-
-/**
- * Find the process's main window.
- *
- * Process.MainWindowHandle covers the normal case; the EnumWindows fallback
- * catches processes whose main window is not the one .NET picked (frameworks
- * that create several top-level windows). The delegate accumulates into
- * $global: because script-block scoping inside a delegate is unreliable.
- */
 async function findMainWindow(pid: number): Promise<number | null> {
-  const script = `
-$h = (Get-Process -Id ${pid} -ErrorAction SilentlyContinue).MainWindowHandle
-if ($h -and $h -ne 0) { Write-Output $h; exit 0 }
-Add-Type -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
-[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
-public struct RECT { public int Left, Top, Right, Bottom; }
-'@ -Name F -Namespace FindW
-$global:bestHwnd = 0; $global:bestArea = 0
-$cb = [FindW.F+EnumWindowsProc]{
-  param($w, $l)
-  $p = 0
-  $null = [FindW.F]::GetWindowThreadProcessId($w, [ref]$p)
-  if ($p -eq ${pid} -and [FindW.F]::IsWindowVisible($w)) {
-    $r = New-Object FindW.F+RECT
-    $null = [FindW.F]::GetWindowRect($w, [ref]$r)
-    $area = ($r.Right - $r.Left) * ($r.Bottom - $r.Top)
-    if ($area -gt $global:bestArea) { $global:bestArea = $area; $global:bestHwnd = $w.ToInt64() }
-  }
-  return $true
-}
-[FindW.F]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-Write-Output $global:bestHwnd
-`;
-  const res = await runPowerShell(['-Command', script], 15000);
-  const hwnd = parseInt(res.stdout.trim().split(/\r?\n/).pop() ?? '0', 10);
-  return Number.isFinite(hwnd) && hwnd > 0 ? hwnd : null;
+  const cached = windowCache.get(pid);
+  if (cached && Date.now() - cached.at < WINDOW_CACHE_MS) return cached.hwnd;
+
+  const res = await uiDaemon.run({ action: 'findwindow', pid } as any);
+  if (!res.ok) return null;
+
+  const text = (res.output || '').trim();
+  const lastLine = text.substring(text.lastIndexOf(String.fromCharCode(10)) + 1).trim();
+  const hwnd = parseInt(lastLine, 10);
+  if (!Number.isFinite(hwnd) || hwnd <= 0) return null;
+
+  windowCache.set(pid, { hwnd, at: Date.now() });
+  return hwnd;
 }
 
 export function registerUiTools(server: McpServer) {
@@ -94,8 +36,8 @@ export function registerUiTools(server: McpServer) {
         'click', 'realclick', 'type', 'key',
       ]).describe('Operation to perform'),
       hwnd: z.number().optional().describe('Window handle; omit to use the debuggee\'s largest visible window'),
-      x: z.number().optional().describe('click/realclick: client X; key: virtual key code'),
-      y: z.number().optional().describe('click/realclick: client Y'),
+      x: z.number().optional().describe('click/realclick: client X; key: virtual key code; typeinto: override click X'),
+      y: z.number().optional().describe('click/realclick: client Y; typeinto: override click Y'),
       text: z.string().optional().describe('type/typeinto: text to send as WM_CHAR'),
       match: z.string().optional().describe('findtext/clicktext/typeinto: text to locate on screen (OCR)'),
       regex: z.boolean().optional().describe('match: treat the string as a regular expression'),
@@ -108,7 +50,6 @@ export function registerUiTools(server: McpServer) {
       timeout_ms: z.number().optional().describe('screenshot/ocr: give up after this long (default 15000) - a paused Direct2D window can block PrintWindow'),
     },
     async (args) => {
-      // Resolve the window handle up front so every action works the same way.
       let hwnd = args.hwnd;
       if (!hwnd) {
         let pid: number | null = null;
@@ -123,86 +64,52 @@ export function registerUiTools(server: McpServer) {
         if (!hwnd) throw new Error(`No visible window found for pid ${pid}`);
       }
 
-      const captureActions = new Set(['screenshot', 'ocr', 'findtext', 'clicktext', 'typeinto']);
+      // The script calls the screenshot action "shot"; keep the MCP-facing
+      // name descriptive and translate here.
+      const scriptAction = args.action === 'screenshot' ? 'shot' : args.action;
+      const req: any = { action: scriptAction, hwnd };
+      if (args.x !== undefined) req.x = args.x;
+      if (args.y !== undefined) req.y = args.y;
+      if (args.text !== undefined) req.text = args.text;
+      if (args.match !== undefined) req.match = args.match;
+      if (args.file !== undefined) req.file = args.file;
+      if (args.lang) req.lang = args.lang;
+      if (args.scale !== undefined) req.scale = args.scale;
+      if (args.region) req.region = args.region;
+      if (args.wait_stable_ms) req.wait_stable_ms = args.wait_stable_ms;
+      if (args.stable_timeout_ms) req.stable_timeout_ms = args.stable_timeout_ms;
+      if (args.regex) req.regex = true;
 
-      if (args.action === 'screenshot') {
-        const file = requireString(args.file, 'file');
-        const res = await runPowerShell(
-          ['-File', SCRIPT, '-Hwnd', String(hwnd), '-Action', 'shot', '-Out', file],
-          args.timeout_ms ?? 15000
-        );
-        if (res.timedOut) {
-          throw new Error(
-            `Screenshot timed out after ${args.timeout_ms ?? 15000}ms. A paused Direct2D window ` +
-            'cannot repaint - resume the target first, take the shot, then pause again.'
-          );
-        }
-        return { content: [{ type: 'text', text: JSON.stringify({ hwnd, file, output: res.stdout || res.stderr }, null, 2) }] };
-      }
-
-
-      const cliArgs = ['-File', SCRIPT, '-Hwnd', String(hwnd), '-Action', args.action];
-      if (args.action === 'click' || args.action === 'realclick' || args.action === 'key') {
-        if (args.x === undefined) throw new Error("'x' is required for this action");
-        cliArgs.push('-X', String(args.x));
-      }
+      // Required-argument checks up front so the daemon is not woken for a
+      // request that can only fail.
+      if (args.action === 'screenshot') requireString(args.file, 'file');
       if (args.action === 'click' || args.action === 'realclick') {
+        if (args.x === undefined) throw new Error("'x' is required for this action");
         if (args.y === undefined) throw new Error("'y' is required for this action");
-        cliArgs.push('-Y', String(args.y));
       }
-      if (args.action === 'typeinto') {
-        // -X/-Y are optional here: they override the OCR-derived click point,
-        // which is needed when the label opens a dialog but the edit box sits
-        // somewhere else.
-        if (args.x !== undefined) cliArgs.push('-X', String(args.x));
-        if (args.y !== undefined) cliArgs.push('-Y', String(args.y));
-      }
-      if (args.action === 'type' || args.action === 'typeinto') {
-        cliArgs.push('-Text', requireString(args.text, 'text'));
-      }
+      if (args.action === 'key' && args.x === undefined) throw new Error("'x' is required for this action");
+      if (args.action === 'type' || args.action === 'typeinto') requireString(args.text, 'text');
       if (args.action === 'findtext' || args.action === 'clicktext' || args.action === 'typeinto') {
-        cliArgs.push('-Match', requireString(args.match, 'match'));
+        requireString(args.match, 'match');
       }
-      if (args.regex) cliArgs.push('-Regex');
-      if (args.lang) cliArgs.push('-Lang', args.lang);
-      if (args.scale !== undefined) cliArgs.push('-Scale', String(args.scale));
-      if (args.region) cliArgs.push('-Region', args.region);
-      if (args.wait_stable_ms) cliArgs.push('-WaitStable', String(args.wait_stable_ms));
-      if (args.stable_timeout_ms) cliArgs.push('-StableTimeout', String(args.stable_timeout_ms));
-      if (args.file && args.action === 'ocr') cliArgs.push('-Out', args.file);
 
-      // OCR actions capture + recognise, which is slower than a plain click.
-      const timeout = captureActions.has(args.action)
-        ? (args.timeout_ms ?? 30000)
-        : 30000;
+      let res;
+      try {
+        res = await uiDaemon.run(req);
+      } catch (err) {
+        // A dead handle is the usual cause of a hard failure here - drop the
+        // cache entry so the next call re-resolves it.
+        windowCache.clear();
+        throw err;
+      }
+      const payload = { hwnd, action: args.action, ok: res.ok, output: res.output || res.error };
 
-      const res = await runPowerShell(cliArgs, timeout);
-      if (res.timedOut) {
-        throw new Error(
-          `${args.action} timed out after ${timeout}ms. A paused Direct2D window cannot repaint - ` +
-          'resume the target first, then retry.'
-        );
+      // findtext/clicktext/typeinto report a miss as a plain "NOTFOUND" line;
+      // surface it as an error so the caller does not treat it as success.
+      if (!res.ok || /^NOTFOUND\b/m.test(res.output)) {
+        return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
       }
-      // exit 2 is ui.ps1's "text not found"; surface the available text rather
-      // than throwing away the diagnostic.
-      if (res.code === 2) {
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({ hwnd, action: args.action, found: false, output: res.stdout }, null, 2),
-          }],
-          isError: true,
-        };
-      }
-      if (res.code !== 0) {
-        throw new Error(`ui.ps1 failed (${res.code}): ${res.stderr || res.stdout}`);
-      }
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ hwnd, action: args.action, found: true, output: res.stdout }, null, 2),
-        }],
-      };
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
     }
   );
 }

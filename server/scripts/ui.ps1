@@ -14,7 +14,7 @@
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
   [ValidateSet('info', 'shot', 'ocr', 'findtext', 'clicktext', 'typeinto',
-               'click', 'realclick', 'type', 'key', 'windows')]
+               'click', 'realclick', 'type', 'key', 'windows', 'findwindow', 'serve')]
   [string]$Action = 'info',
   [int]$X = 0,
   [int]$Y = 0,
@@ -28,7 +28,8 @@ param(
   [switch]$All,
   [int]$WaitStable = 0,
   [string]$Region = '',
-  [int]$StableTimeout = 8000
+  [int]$StableTimeout = 8000,
+  [int]$TargetPid = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -431,7 +432,31 @@ function Invoke-Type([string]$s) {
 # Actions
 # ---------------------------------------------------------------------------
 
-switch ($Action) {
+function Invoke-UiAction {
+  param([string]$Action)
+  switch ($Action) {
+
+  'findwindow' {
+    # Resolve a process's largest visible top-level window. Lives here so the
+    # caller does not pay another PowerShell launch just to find a handle.
+    if ($TargetPid -le 0) { throw "-Pid is required for findwindow" }
+    $global:bestHwnd = 0; $global:bestArea = 0
+    $cb = [MCPUI.U+EnumWindowsProc] {
+      param($w, $l)
+      [uint32]$p = 0
+      $null = [MCPUI.U]::GetWindowThreadProcessIdOut($w, [ref]$p)
+      if ($p -eq $TargetPid -and [MCPUI.U]::IsWindowVisible($w)) {
+        $r = New-Object MCPUI.U+RECT
+        $null = [MCPUI.U]::GetWindowRect($w, [ref]$r)
+        $area = ($r.Right - $r.Left) * ($r.Bottom - $r.Top)
+        if ($area -gt $global:bestArea) { $global:bestArea = $area; $global:bestHwnd = $w.ToInt64() }
+      }
+      return $true
+    }
+    [MCPUI.U]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    Write-Output $global:bestHwnd
+  }
+
   'info' {
     $wr = New-Object MCPUI.U+RECT; [MCPUI.U]::GetWindowRect($script:h, [ref]$wr) | Out-Null
     $cr = New-Object MCPUI.U+RECT; [MCPUI.U]::GetClientRect($script:h, [ref]$cr) | Out-Null
@@ -569,4 +594,64 @@ switch ($Action) {
     $null = [MCPUI.U]::PostMessage($script:h, 0x0101, [IntPtr]$vk, [IntPtr]0xC0000001)
     Write-Output "key vk=$vk"
   }
+}
+
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+#
+# One-shot mode (default) runs a single action and exits. `-Action serve` keeps
+# the process alive and reads one JSON command per line from stdin, which is
+# what the MCP tool uses: loading .NET, WinRT and the P/Invoke types costs ~3s,
+# and paying that per click makes an otherwise instant UI interaction useless.
+# ---------------------------------------------------------------------------
+
+if ($Action -ne 'serve') {
+  Invoke-UiAction -Action $Action
+  exit 0
+}
+
+$stdin = [Console]::In
+while ($true) {
+  $line = $stdin.ReadLine()
+  if ($null -eq $line) { break }
+  $line = $line.Trim()
+  if (-not $line) { continue }
+
+  $resp = @{ id = $null; ok = $false; output = ''; error = '' }
+  try {
+    $cmd = $line | ConvertFrom-Json
+    $resp.id = $cmd.id
+
+    # Apply per-command state. Everything is script-scoped because the helper
+    # functions resolve these names up the scope chain.
+    if ($cmd.hwnd) { $script:h = [IntPtr][long]$cmd.hwnd }
+    $script:TargetPid = if ($cmd.pid) { [int]$cmd.pid } else { 0 }
+    $script:X = if ($null -ne $cmd.x) { [int]$cmd.x } else { 0 }
+    $script:Y = if ($null -ne $cmd.y) { [int]$cmd.y } else { 0 }
+    $script:Text = if ($cmd.text) { [string]$cmd.text } else { '' }
+    $script:Match = if ($cmd.match) { [string]$cmd.match } else { '' }
+    $script:Out = if ($cmd.file) { [string]$cmd.file } else { '' }
+    $script:Scale = if ($cmd.scale) { [int]$cmd.scale } else { 300 }
+    $script:Lang = if ($cmd.lang) { [string]$cmd.lang } else { '' }
+    $script:Region = if ($cmd.region) { [string]$cmd.region } else { '' }
+    $script:WaitStable = if ($cmd.wait_stable_ms) { [int]$cmd.wait_stable_ms } else { 0 }
+    $script:StableTimeout = if ($cmd.stable_timeout_ms) { [int]$cmd.stable_timeout_ms } else { 8000 }
+    $script:Enhance = [bool]$cmd.enhance
+    $script:Regex = [bool]$cmd.regex
+    $script:All = $false
+
+    $out = & { Invoke-UiAction -Action $cmd.action } *>&1 | Out-String
+    $resp.ok = $true
+    $resp.output = $out.Trim()
+  } catch {
+    $resp.ok = $false
+    $resp.error = $_.Exception.Message
+    $resp.output = ($_ | Out-String)
+  }
+
+  $json = $resp | ConvertTo-Json -Compress -Depth 4
+  [Console]::Out.WriteLine($json)
+  [Console]::Out.Flush()
 }

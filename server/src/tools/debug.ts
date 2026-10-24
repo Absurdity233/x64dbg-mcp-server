@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
 import { waitFor, describe, consume, resetCursor } from '../events.js';
+import { recordLaunch, launchInfo, breakpoints as sessionBreakpoints, noteRecovery } from '../session.js';
 import { requireString, quoteArg } from './util.js';
 
 const SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -85,7 +86,7 @@ export function registerDebugTools(server: McpServer) {
       action: z.enum([
         'run', 'pause', 'force_pause', 'step_into', 'step_over', 'step_out',
         'stop_debug', 'restart_debug', 'run_to_address', 'state',
-        'load', 'attach', 'detach', 'wait_for_pause', 'wait_for_event',
+        'load', 'attach', 'detach', 'wait_for_pause', 'wait_for_event', 'recover',
       ]).describe('Operation to perform'),
       address: z.string().optional().describe("run_to_address: target address or expression"),
       path: z.string().optional().describe("load: absolute path of the executable to open"),
@@ -148,6 +149,74 @@ export function registerDebugTools(server: McpServer) {
             `Could not pause the target after 3 attempts${lastErr ? `: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}` : ''}. ` +
             'The target may be spinning in a fast-resume breakpoint loop - try force_pause.'
           );
+        }
+
+        case 'recover': {
+          // Rebuild a dead session: reload the remembered target and re-arm the
+          // breakpoints that were set through this server. Nothing else (labels,
+          // patches) is restored - dump those with the module dumper if needed.
+          const info = launchInfo();
+          if (!info.path) {
+            throw new Error('Nothing to recover: no target has been loaded through this server yet.');
+          }
+
+          const current = await httpClient.get<DebugState>('/api/debug/state');
+          if (current.state !== 'stopped') {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  recovered: false,
+                  reason: `target is still alive (state=${current.state}) - nothing to rebuild`,
+                  state: current,
+                }, null, 2),
+              }],
+            };
+          }
+
+          const file = info.path;
+          const command = info.cmdline
+            ? `init ${quoteArg(file)}, ${quoteArg(info.cmdline)}`
+            : `init ${quoteArg(file)}`;
+          await httpClient.post('/api/command/exec', { command });
+          const started = await waitForState('paused', timeout_ms ?? 60000, poll_ms ?? 200);
+          if (started.reached) await consume();
+
+          const specs = sessionBreakpoints();
+          const rearmed: Array<{ address: string; ok: boolean; error?: string }> = [];
+          for (const spec of specs) {
+            try {
+              const body: Record<string, unknown> = {
+                address: spec.address,
+                bp_type: spec.kind,
+                singleshot: spec.singleshot ?? false,
+              };
+              for (const k of ['hw_type', 'hw_size', 'mem_type', 'break_condition', 'command_condition',
+                               'command_text', 'log_text', 'log_condition', 'silent', 'fast_resume', 'name'] as const) {
+                if ((spec as any)[k] !== undefined) body[k] = (spec as any)[k];
+              }
+              await httpClient.post('/api/breakpoints/configure', body);
+              rearmed.push({ address: spec.address, ok: true });
+            } catch (err) {
+              rearmed.push({ address: spec.address, ok: false, error: err instanceof Error ? err.message : String(err) });
+            }
+          }
+
+          const n = noteRecovery();
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                recovered: started.reached,
+                target: file,
+                cmdline: info.cmdline,
+                breakpoints_restored: rearmed.filter((r) => r.ok).length,
+                breakpoints_failed: rearmed.filter((r) => !r.ok),
+                recovery_count: n,
+                state: started.state,
+              }, null, 2),
+            }],
+          };
         }
 
         case 'run': {
@@ -269,6 +338,8 @@ export function registerDebugTools(server: McpServer) {
             const file = requireString(path, 'path');
             command = cmdline ? `init ${quoteArg(file)}, ${quoteArg(cmdline)}` : `init ${quoteArg(file)}`;
             exec = await httpClient.post('/api/command/exec', { command });
+            // Remember how we started it so recover() can rebuild the session.
+            recordLaunch(file, cmdline);
           } else {
             if (pid === undefined) throw new Error("'pid' is required for this action");
             ({ command, exec } = await attachCommand(String(pid)));

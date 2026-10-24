@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
 import { requireString } from './util.js';
+import { rememberBreakpoint, forgetBreakpoint, forgetAllBreakpoints } from '../session.js';
 
 const BP_TYPES = ['software', 'hardware', 'memory'] as const;
 
@@ -66,32 +67,40 @@ export function registerBreakpointTools(server: McpServer) {
 
       switch (action) {
         case 'set_software': {
+          const addr = requireAddress();
           const data = await httpClient.post('/api/breakpoints/set', {
-            address: requireAddress(),
+            address: addr,
             singleshot: args.singleshot ?? false,
           });
+          rememberBreakpoint({ address: addr, kind: 'software', singleshot: args.singleshot ?? false });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'set_hardware': {
+          const addr = requireAddress();
           const data = await httpClient.post('/api/breakpoints/set_hardware', {
-            address: requireAddress(),
+            address: addr,
             type: (args.type as string) ?? 'x',
             size: args.size ?? '1',
           });
+          rememberBreakpoint({ address: addr, kind: 'hardware', hw_type: (args.type as string) ?? 'x', hw_size: args.size ?? '1' });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'set_memory': {
+          const addr = requireAddress();
           const data = await httpClient.post('/api/breakpoints/set_memory', {
-            address: requireAddress(),
+            address: addr,
             type: (args.type as string) ?? 'a',
           });
+          rememberBreakpoint({ address: addr, kind: 'memory', mem_type: (args.type as string) ?? 'a' });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'delete': {
+          const addr = requireAddress();
           const data = await httpClient.post('/api/breakpoints/delete', {
-            address: requireAddress(),
+            address: addr,
             type: args.type,
           });
+          forgetBreakpoint(addr);
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'enable':
@@ -133,6 +142,22 @@ export function registerBreakpointTools(server: McpServer) {
             if ((args as any)[key] !== undefined) body[key] = (args as any)[key];
           }
           const data = await httpClient.post('/api/breakpoints/configure', body);
+          rememberBreakpoint({
+            address: body.address as string,
+            kind: ((body.bp_type as string) ?? 'software') as 'software' | 'hardware' | 'memory',
+            singleshot: body.singleshot as boolean | undefined,
+            hw_type: body.hw_type as string | undefined,
+            hw_size: body.hw_size as string | undefined,
+            mem_type: body.mem_type as string | undefined,
+            break_condition: body.break_condition as string | undefined,
+            command_condition: body.command_condition as string | undefined,
+            command_text: body.command_text as string | undefined,
+            log_text: body.log_text as string | undefined,
+            log_condition: body.log_condition as string | undefined,
+            silent: body.silent as boolean | undefined,
+            fast_resume: body.fast_resume as boolean | undefined,
+            name: body.name as string | undefined,
+          });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'configure_batch': {
@@ -168,6 +193,18 @@ export function registerBreakpointTools(server: McpServer) {
           }
           // The auto-continue. `run` is an x64dbg command, executed on hit.
           await run(`SetBreakpointCommand ${addr}, "run"`);
+
+          rememberBreakpoint({
+            address: addr,
+            kind: 'software',
+            log_text: logText,
+            log_condition: args.log_condition,
+            break_condition: args.condition,
+            name: args.name,
+            silent: true,
+            command_text: 'run',
+            logging: true,
+          });
 
           return {
             content: [{
