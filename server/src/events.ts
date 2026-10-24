@@ -119,9 +119,9 @@ export async function waitFor(
       others.push(ev);
     }
 
-    if (res.timed_out) {
-      return { matched: null, others, elapsed_ms: Date.now() - started, dropped };
-    }
+    // A single hold expiring is not the caller's deadline: keep re-issuing
+    // until the overall timeout budget is spent. (The loop head checks it.)
+    if (res.timed_out) continue;
   }
 }
 

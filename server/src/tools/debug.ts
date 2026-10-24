@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
-import { waitFor, describe, consume } from '../events.js';
+import { waitFor, describe, consume, resetCursor } from '../events.js';
 import { requireString, quoteArg } from './util.js';
 
 const SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -115,7 +115,18 @@ export function registerDebugTools(server: McpServer) {
           for (let attempt = 0; attempt < 3; attempt++) {
             try {
               const res = await httpClient.post<any>('/api/debug/pause');
-              const waited = await waitForState('paused', 2500, 100);
+              if (res?.message === 'Already paused') {
+                const st = await httpClient.get<DebugState>('/api/debug/state');
+                return {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({ message: 'Already paused', attempts: attempt + 1, state: st }, null, 2),
+                  }],
+                };
+              }
+              // Large virtualized targets can take several seconds to reach a
+              // safe point, so allow a generous window per attempt.
+              const waited = await waitForState('paused', 5000, 100);
               if (waited.reached) {
                 return {
                   content: [{
@@ -154,7 +165,10 @@ export function registerDebugTools(server: McpServer) {
           const waited = await waitForState(
             'not_running', timeout_ms ?? 120000, poll_ms ?? 200, stable_ms ?? 400
           );
-          const events = waited.reached ? await consume() : { events: [], dropped: 0 };
+          // Drain in both cases: on timeout the events still explain what the
+          // target did while we waited (dll loads, breakpoint hits, exceptions).
+          const events = await consume();
+          const breakpointHits = events.events.filter((e) => e.type === 'breakpoint').length;
 
           let instruction: string | null = null;
           if (waited.state.state === 'paused') {
@@ -177,10 +191,11 @@ export function registerDebugTools(server: McpServer) {
                 // a transient pause inside an auto-continuing breakpoint. Report
                 // it as running rather than contradicting `reached`.
                 state: waited.reached ? waited.state : { state: 'running' },
-                ...(waited.reached ? {} : {
-                  note: 'the target is bouncing through auto-continue breakpoints; ' +
-                        'raise stable_ms or remove the logging breakpoint to get a real stop',
-                }),
+                ...(!waited.reached && breakpointHits > 0 ? {
+                  note: `${breakpointHits} breakpoint hit(s) during the wait - the target is ` +
+                        'bouncing through auto-continue breakpoints. Raise stable_ms or remove ' +
+                        'the logging breakpoint to get a real stop.',
+                } : {}),
                 instruction,
                 events: events.events.map(describe),
                 dropped: events.dropped,
@@ -195,8 +210,33 @@ export function registerDebugTools(server: McpServer) {
         case 'step_into': endpoint = '/api/debug/step_into'; break;
         case 'step_over': endpoint = '/api/debug/step_over'; break;
         case 'step_out': endpoint = '/api/debug/step_out'; break;
-        case 'stop_debug': endpoint = '/api/debug/stop'; break;
-        case 'restart_debug': endpoint = '/api/debug/restart'; break;
+        case 'stop_debug': {
+          const res = await httpClient.post<any>('/api/debug/stop');
+          // The next session clears the plugin buffer, but our cursor must not
+          // lag behind or the first wait_for_event would replay old events.
+          resetCursor();
+          return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+        }
+
+        case 'restart_debug': {
+          const res = await httpClient.post<any>('/api/debug/restart');
+          // Restart is asynchronous: the new process takes a while to come up.
+          // Wait until a session exists again, then consume the new session's
+          // startup burst so later waits only see fresh events.
+          const started = await waitForState('active', timeout_ms ?? 30000, poll_ms ?? 200);
+          if (started.reached) await consume();
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ...res,
+                restarted: started.reached,
+                waited_ms: started.elapsed_ms,
+                state: started.state,
+              }, null, 2),
+            }],
+          };
+        }
 
         case 'run_to_address':
           endpoint = '/api/debug/run_to';

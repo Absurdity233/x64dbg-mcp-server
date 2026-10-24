@@ -39,7 +39,12 @@ export function registerThreadTools(server: McpServer) {
         case 'switch':
         case 'suspend':
         case 'resume': {
-          const data = await httpClient.post(`/api/threads/${args.action}`, { id: requireString(args.id, 'id') });
+          // The plugin parses `id` as a number, so coerce here - sending a
+          // string throws a json type_error inside the handler.
+          const raw = requireString(args.id, 'id');
+          const id = Number(raw);
+          if (!Number.isFinite(id)) throw new Error(`'id' must be a decimal thread id, got '${raw}'`);
+          const data = await httpClient.post(`/api/threads/${args.action}`, { id });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
       }
