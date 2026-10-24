@@ -28,15 +28,15 @@ void register_tracing_routes(c_http_router& router) {
         auto max_steps = body.value("max_steps", "");
         auto log_text = body.value("log_text", "");
 
-        std::string cmd = "TraceIntoConditional";
-        if (!condition.empty()) {
-            cmd += " " + condition;
-        }
+        // The break condition is positional and mandatory. It is a BREAK
+        // condition: "1" breaks immediately, "0" never breaks. Default to "0"
+        // so the trace runs for exactly max_steps.
+        std::string cmd = "TraceIntoConditional " + (condition.empty() ? std::string("0") : condition);
         if (!max_steps.empty()) {
             cmd += ", " + max_steps;
         }
         if (!log_text.empty()) {
-            cmd += ", " + log_text;
+            cmd += ", \"" + log_text + "\"";
         }
 
         auto success = bridge.exec_command_async(cmd);
@@ -60,15 +60,12 @@ void register_tracing_routes(c_http_router& router) {
         auto max_steps = body.value("max_steps", "");
         auto log_text = body.value("log_text", "");
 
-        std::string cmd = "TraceOverConditional";
-        if (!condition.empty()) {
-            cmd += " " + condition;
-        }
+        std::string cmd = "TraceOverConditional " + (condition.empty() ? std::string("0") : condition);
         if (!max_steps.empty()) {
             cmd += ", " + max_steps;
         }
         if (!log_text.empty()) {
-            cmd += ", " + log_text;
+            cmd += ", \"" + log_text + "\"";
         }
 
         auto success = bridge.exec_command_async(cmd);
