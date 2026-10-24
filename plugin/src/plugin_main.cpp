@@ -61,6 +61,10 @@ static std::mutex g_trace_mutex;
 static bool g_trace_active = false;
 static std::string g_trace_file;
 static ULONGLONG g_trace_started_tick = 0;
+// Last file a trace wrote to, kept after the trace ends so the caller can still
+// find its output. A run-trace finishes on its own (max_steps) or on pause, and
+// without this the path disappears exactly when the analysis needs it.
+static std::string g_trace_last_file;
 // Only trace_quiesce_for_stop touches these; they serialise the pause/stop
 // sequence so two concurrent stops cannot interleave.
 static std::mutex g_trace_stop_mutex;
@@ -72,16 +76,35 @@ void trace_mark_started(const std::string& file) {
     g_trace_active = true;
     g_trace_file = file;
     g_trace_started_tick = GetTickCount64();
+    // Do not carry the previous run's path into a trace that has none of its
+    // own yet (the /into and /over routes write wherever TraceSetLogFile last
+    // pointed, which is not knowable from here).
+    if (!file.empty()) g_trace_last_file.clear();
 }
 
 std::string trace_mark_stopped() {
     std::lock_guard<std::mutex> lock(g_trace_mutex);
     const auto file = g_trace_file;
+    // Only remember the path here. This runs on the debugger thread (pause and
+    // stop-debug callbacks), so no file I/O: trace_status stat()s it lazily from
+    // a connection thread instead.
+    if (!file.empty()) g_trace_last_file = file;
     g_trace_active = false;
     g_trace_file.clear();
     g_trace_started_tick = 0;
     return file;
 }
+
+namespace {
+
+unsigned long long file_size_of(const std::string& path) {
+    if (path.empty()) return 0;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) return 0;
+    return (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+}
+
+} // namespace
 
 bool trace_is_active() {
     std::lock_guard<std::mutex> lock(g_trace_mutex);
@@ -89,28 +112,39 @@ bool trace_is_active() {
 }
 
 nlohmann::json trace_status() {
-    std::lock_guard<std::mutex> lock(g_trace_mutex);
-    if (!g_trace_active) {
-        return nlohmann::json{{"tracing", false}, {"file", ""}};
+    bool active;
+    std::string file;
+    std::string last_file;
+    ULONGLONG started;
+    {
+        std::lock_guard<std::mutex> lock(g_trace_mutex);
+        active = g_trace_active;
+        file = g_trace_file;
+        last_file = g_trace_last_file;
+        started = g_trace_started_tick;
     }
 
-    // Size is read outside the lock-free window: the trace writer appends from
-    // the debugger thread while this runs on a connection thread. Reading the
-    // size is advisory only (used to spot a trace that produced no rows), so a
-    // stale value is harmless.
-    unsigned long long size = 0;
-    if (!g_trace_file.empty()) {
-        WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (GetFileAttributesExA(g_trace_file.c_str(), GetFileExInfoStandard, &fad)) {
-            size = (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    // Stat outside the lock: this runs on a connection thread while the trace
+    // writer keeps appending, and a torn read only makes the advertised size
+    // stale, which is harmless.
+    if (!active) {
+        if (last_file.empty()) {
+            return nlohmann::json{{"tracing", false}, {"file", ""}};
         }
+        return nlohmann::json{
+            {"tracing",   false},
+            {"file",      ""},
+            {"last_file", last_file},
+            {"last_size", file_size_of(last_file)},
+            {"message",   "trace finished; read last_file for the output"}
+        };
     }
 
     return nlohmann::json{
         {"tracing",     true},
-        {"file",        g_trace_file},
-        {"size",        size},
-        {"elapsed_ms",  g_trace_started_tick ? (GetTickCount64() - g_trace_started_tick) : 0}
+        {"file",        file},
+        {"size",        file_size_of(file)},
+        {"elapsed_ms",  started ? (GetTickCount64() - started) : 0}
     };
 }
 

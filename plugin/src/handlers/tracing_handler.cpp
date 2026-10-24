@@ -11,9 +11,35 @@
 
 namespace handlers {
 
+namespace {
+
+// TraceIntoConditional/TraceOverConditional parse their step count as a hex
+// expression, so "5000" means 0x5000 = 20480 steps. Callers think in decimal
+// ("trace 5000 instructions"), so normalise to an explicit 0x form. Sent as
+// "0x1388" the value is unambiguous.
+std::string normalise_step_count(const std::string& raw) {
+    if (raw.empty()) return raw;
+    // Already explicit: leave the caller's expression alone.
+    if (raw.size() > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) return raw;
+
+    bool all_digits = true;
+    for (char c : raw) {
+        if (c < '0' || c > '9') { all_digits = false; break; }
+    }
+    if (!all_digits) return raw;   // e.g. an expression like "rax*4"
+
+    // Decimal digits -> the same number written in hex.
+    char buf[32];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "0x%llX", _strtoui64(raw.c_str(), nullptr, 10));
+    return buf;
+}
+
+} // namespace
+
 void register_tracing_routes(c_http_router& router) {
-    // GET /api/trace/status - Whether a run-trace is active (driven by the
-    // CB_STARTTRACE / CB_STOPTRACE callbacks) and the file it writes to.
+    // GET /api/trace/status - Whether a trace is writing, and where. After a
+    // trace ends (max_steps reached, or the target paused) this reports
+    // last_file/last_size so the caller can still find the output.
     router.get("/api/trace/status", [](const s_http_request&) -> s_http_response {
         return s_http_response::ok(mcp::trace_status());
     });
@@ -35,7 +61,7 @@ void register_tracing_routes(c_http_router& router) {
         // so the trace runs for exactly max_steps.
         std::string cmd = "TraceIntoConditional " + (condition.empty() ? std::string("0") : condition);
         if (!max_steps.empty()) {
-            cmd += ", " + max_steps;
+            cmd += ", " + normalise_step_count(max_steps);
         }
         if (!log_text.empty()) {
             cmd += ", \"" + log_text + "\"";
@@ -65,7 +91,7 @@ void register_tracing_routes(c_http_router& router) {
 
         std::string cmd = "TraceOverConditional " + (condition.empty() ? std::string("0") : condition);
         if (!max_steps.empty()) {
-            cmd += ", " + max_steps;
+            cmd += ", " + normalise_step_count(max_steps);
         }
         if (!log_text.empty()) {
             cmd += ", \"" + log_text + "\"";
@@ -145,7 +171,7 @@ void register_tracing_routes(c_http_router& router) {
         std::string cmd = (mode == "over") ? "TraceOverConditional " : "TraceIntoConditional ";
         cmd += condition.empty() ? std::string("0") : condition;
         if (!max_steps.empty()) {
-            cmd += ", " + max_steps;
+            cmd += ", " + normalise_step_count(max_steps);
         }
 
         const auto success = bridge.exec_command_async(cmd);

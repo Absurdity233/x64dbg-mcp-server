@@ -12,6 +12,8 @@ interface EventsResponse {
   events: DebugEvent[];
   count: number;
   latest_seq: number;
+  /** The plugin buffered more events than this batch carried. */
+  has_more?: boolean;
   dropped: number;
   timed_out?: boolean;
 }
@@ -80,6 +82,9 @@ export async function waitFor(
   const started = Date.now();
   const others: DebugEvent[] = [];
   let dropped = 0;
+  // Set when the plugin returned a batch it had truncated: more events are
+  // buffered already, so the next request must not hold for new ones.
+  let hasMore = false;
 
   while (true) {
     const remaining = timeout_ms - (Date.now() - started);
@@ -90,8 +95,10 @@ export async function waitFor(
     const params: Record<string, string> = {
       since: String(cursor),
       // Hold for at most eventHoldMs per request so a plugin restart is noticed
-      // promptly, but never longer than the caller's remaining budget.
-      timeout: String(Math.min(remaining, config.eventHoldMs)),
+      // promptly, but never longer than the caller's remaining budget. When the
+      // previous batch was truncated there is already data to read, so do not
+      // park at all - the hold is only for waiting on future events.
+      timeout: String(hasMore ? 0 : Math.min(remaining, config.eventHoldMs)),
     };
     if (filterTypes && filterTypes.length) params.types = filterTypes.join(',');
     // Server-side waits park on a condition variable, so a single request can
@@ -110,6 +117,7 @@ export async function waitFor(
     }
 
     dropped += res.dropped ?? 0;
+    hasMore = res.has_more === true;
     advance(res);
 
     for (const ev of res.events ?? []) {

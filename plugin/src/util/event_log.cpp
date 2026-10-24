@@ -105,6 +105,12 @@ nlohmann::json wait_since(
 
     const bool timed_out = !has_match();
 
+    // latest_seq has to be the seq of the last event actually returned, not the
+    // newest one buffered: the client advances its cursor to it, so reporting a
+    // higher value silently skips everything past max_events. A truncated batch
+    // then looks up-to-date while having handed over only its head.
+    uint64_t last_returned = since_seq;
+
     auto events = nlohmann::json::array();
     for (const auto& e : g_events) {
         if (e.seq <= since_seq) continue;
@@ -114,6 +120,7 @@ nlohmann::json wait_since(
         item["tick_ms"] = e.tick_ms;
         item["type"] = e.type;
         events.push_back(std::move(item));
+        last_returned = e.seq;
     }
 
     uint64_t dropped = 0;
@@ -125,10 +132,15 @@ nlohmann::json wait_since(
         }
     }
 
+    // True when the ring still holds events the caller has not seen. The client
+    // uses this to keep draining rather than parking on a fresh wait.
+    const bool has_more = !g_events.empty() && g_events.back().seq > last_returned;
+
     return {
         {"events",     events},
         {"count",      events.size()},
-        {"latest_seq", g_next_seq > 1 ? g_next_seq - 1 : 0},
+        {"latest_seq", last_returned},
+        {"has_more",   has_more},
         {"dropped",    dropped},
         {"timed_out",  timed_out}
     };

@@ -96,6 +96,8 @@ def main() -> int:
     ap.add_argument("--sample", type=int, default=1000,
                     help="timeline sampling interval in rows")
     ap.add_argument("--json", help="write aggregate result as JSON")
+    ap.add_argument("--tick-column", default="tick",
+                    help="name of the GetTickCount() column when passed via --columns (default tick)")
     args = ap.parse_args()
 
     columns = [c.strip() for c in args.columns.split(",") if c.strip()]
@@ -117,6 +119,22 @@ def main() -> int:
     block_seen = set()
     MAX_BLOCK = 64
     timeline = []
+
+    # When the trace carries GetTickCount(), group by real time instead of row
+    # count: a virtualised dispatcher spends wildly different wall-clock time in
+    # different handlers, so "rows per millisecond" is the number that separates
+    # a hot dispatch path from a long memcpy. Rows between two tick values share
+    # the same tick, so the granularity is the tick period (~15.6 ms).
+    tick_buckets = collections.Counter()   # tick -> row count
+    # Addresses seen in the tick currently being read. Flushed into
+    # time_weight when the tick changes, so memory is bounded by one tick's
+    # working set rather than by the whole trace.
+    current_addrs = set()
+    time_weight = collections.Counter()    # address -> ticks present in
+    first_tick = None
+    last_tick = None
+    cur_tick = None
+    have_tick = args.tick_column in columns
 
     for row in stream_rows(files, columns):
         # Thread filtering: the plugin appends {tid()} as the last column, so a
@@ -140,6 +158,20 @@ def main() -> int:
         total += 1
 
         addr_hits[cip] += 1
+
+        if have_tick:
+            tick = row[args.tick_column]
+            if first_tick is None:
+                first_tick = tick
+                cur_tick = tick
+            elif tick != cur_tick:
+                for a in current_addrs:
+                    time_weight[a] += 1
+                current_addrs.clear()
+                cur_tick = tick
+            last_tick = tick
+            tick_buckets[tick] += 1
+            current_addrs.add(cip)
 
         # Block segmentation: a "block" ends when control returns to an address
         # already seen in the current run (a loop) or after MAX_BLOCK rows.
@@ -165,10 +197,29 @@ def main() -> int:
         h = hashlib.sha1(",".join(f"{a:X}" for a in cur_seq).encode()).hexdigest()[:12]
         seq_hashes[h] += 1
     block_seen.clear()
+    for a in current_addrs:
+        time_weight[a] += 1
+    current_addrs.clear()
 
     print(f"\nrows: {total}")
     print(f"unique addresses: {len(addr_hits)}")
     print(f"distinct blocks: {len(seq_hashes)}")
+
+    if have_tick and tick_buckets:
+        span = (last_tick - first_tick) if last_tick is not None else 0
+        ticks = len(tick_buckets)
+        print(f"tick range: {first_tick}..{last_tick} ({span} ms, {ticks} distinct ticks)")
+        if span > 0 and ticks > 1:
+            print(f"throughput: {total/max(span,1):.1f} rows/ms over the trace window")
+
+        # Time-weighted hot addresses: rank by how many ticks an address was
+        # executing in, not by how many rows it produced. A tight loop can
+        # dominate row count while occupying microseconds.
+        print(f"\ntop {args.top} addresses by time residency (ticks present):")
+        for addr, n in time_weight.most_common(args.top):
+            pct = n / max(ticks, 1) * 100
+            print(f"  {addr:#018x}  {n:>8} ticks  {pct:5.1f}% of window  "
+                  f"{addr_hits[addr]:>9} rows")
 
     print(f"\ntop {args.top} hot addresses:")
     for addr, n in addr_hits.most_common(args.top):
