@@ -1,4 +1,5 @@
 import { httpClient } from './http_client.js';
+import { currentInstance } from './context.js';
 
 /**
  * Plugin/server compatibility check.
@@ -37,10 +38,11 @@ export interface CompatResult {
   message: string;
 }
 
-let lastResult: CompatResult | null = null;
+/** Keyed by instance: each x64dbg may run a different plugin build. */
+const lastResults = new Map<string, CompatResult>();
 
 export function getCompatResult(): CompatResult | null {
-  return lastResult;
+  return lastResults.get(currentInstance().id) ?? null;
 }
 
 /**
@@ -84,7 +86,7 @@ export async function checkPluginCompat(serverVersion: string): Promise<CompatRe
         : `Could not reach the plugin at startup (${msg}). It may not be loaded yet; ` +
           `compatibility will be re-checked on use.`,
     };
-    lastResult = result;
+    lastResults.set(currentInstance().id, result);
     return result;
   }
 
@@ -118,6 +120,6 @@ export async function checkPluginCompat(serverVersion: string): Promise<CompatRe
     missing_routes: missing,
     message,
   };
-  lastResult = result;
+  lastResults.set(currentInstance().id, result);
   return result;
 }

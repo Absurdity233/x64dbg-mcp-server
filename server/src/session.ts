@@ -12,6 +12,8 @@
  * and which breakpoints were armed.
  */
 
+import { currentInstance } from './context.js';
+
 export interface BreakpointSpec {
   address: string;
   kind: 'software' | 'hardware' | 'memory';
@@ -39,53 +41,66 @@ interface SessionState {
   recoveries: number;
 }
 
-const state: SessionState = {
-  path: null,
-  cmdline: null,
-  breakpoints: new Map(),
-  recoveries: 0,
-};
+/**
+ * One record per x64dbg instance. Sharing a single record would make one
+ * target's recover() reload the other target's binary and re-arm breakpoints
+ * that belong to a different process.
+ */
+const states = new Map<string, SessionState>();
+
+function state(): SessionState {
+  const key = currentInstance().id;
+  let s = states.get(key);
+  if (!s) {
+    s = { path: null, cmdline: null, breakpoints: new Map(), recoveries: 0 };
+    states.set(key, s);
+  }
+  return s;
+}
 
 const keyOf = (address: string) => address.trim().toLowerCase();
 
 export function recordLaunch(path: string, cmdline?: string): void {
-  state.path = path;
-  state.cmdline = cmdline ?? null;
+  const s = state();
+  s.path = path;
+  s.cmdline = cmdline ?? null;
   // A new process starts with no breakpoints.
-  state.breakpoints.clear();
+  s.breakpoints.clear();
 }
 
 export function rememberBreakpoint(spec: BreakpointSpec): void {
-  state.breakpoints.set(keyOf(spec.address), spec);
+  state().breakpoints.set(keyOf(spec.address), spec);
 }
 
 export function forgetBreakpoint(address: string): void {
-  state.breakpoints.delete(keyOf(address));
+  state().breakpoints.delete(keyOf(address));
 }
 
 export function forgetAllBreakpoints(): void {
-  state.breakpoints.clear();
+  state().breakpoints.clear();
 }
 
 export function launchInfo(): { path: string | null; cmdline: string | null } {
-  return { path: state.path, cmdline: state.cmdline };
+  const s = state();
+  return { path: s.path, cmdline: s.cmdline };
 }
 
 export function breakpoints(): BreakpointSpec[] {
-  return [...state.breakpoints.values()];
+  return [...state().breakpoints.values()];
 }
 
 export function noteRecovery(): number {
-  return ++state.recoveries;
+  return ++state().recoveries;
 }
 
 export function recoveryCount(): number {
-  return state.recoveries;
+  return state().recoveries;
 }
 
 export function resetSession(): void {
-  state.path = null;
-  state.cmdline = null;
-  state.breakpoints.clear();
-  state.recoveries = 0;
+  const s = state();
+  s.path = null;
+  s.cmdline = null;
+  s.breakpoints.clear();
+  s.recoveries = 0;
 }

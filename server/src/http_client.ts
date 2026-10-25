@@ -1,4 +1,6 @@
-import { config, getBaseUrl } from './config.js';
+import { config } from './config.js';
+import { currentInstance } from './context.js';
+import { isMultiInstance, type InstanceEndpoint } from './instances.js';
 
 interface PluginResponse<T = unknown> {
   success: boolean;
@@ -11,12 +13,17 @@ interface PluginResponse<T = unknown> {
 
 type ConnectionState = 'connected' | 'disconnected' | 'reconnecting';
 
-// How long to wait for the plugin to come online before failing a request
-const WAIT_FOR_PLUGIN_TIMEOUT_MS = 120_000; // 2 minutes
+// Default wait for a plugin that is not answering. Single instance: 2 minutes,
+// because the editor may still be starting x64dbg. Multi-instance: 15 seconds,
+// because a stopped instance is a routing mistake, not a startup race - stalling
+// every call for two minutes would make the whole session look hung.
+const WAIT_FOR_PLUGIN_TIMEOUT_MS = 120_000;
+const WAIT_FOR_PLUGIN_TIMEOUT_MULTI_MS = 15_000;
 const WAIT_POLL_INTERVAL_MS = 2_000;        // poll every 2s
 
 export class HttpClient {
   private base_url: string;
+  private token: string;
   private state: ConnectionState = 'disconnected';
   private last_successful_request = 0;
   private consecutive_failures = 0;
@@ -26,9 +33,19 @@ export class HttpClient {
   // polling for two minutes with a misleading message.
   private auth_rejected = false;
 
-  constructor() {
-    this.base_url = getBaseUrl();
+  constructor(instance: InstanceEndpoint) {
+    this.base_url = `http://${instance.host}:${instance.port}`;
+    this.token = instance.token;
     this.start_health_monitor();
+  }
+
+  get baseUrl(): string {
+    return this.base_url;
+  }
+
+  private waitMs(): number {
+    if (config.waitMs > 0) return config.waitMs;
+    return isMultiInstance() ? WAIT_FOR_PLUGIN_TIMEOUT_MULTI_MS : WAIT_FOR_PLUGIN_TIMEOUT_MS;
   }
 
   get connection_state(): ConnectionState {
@@ -36,7 +53,7 @@ export class HttpClient {
   }
 
   private auth_headers(): Record<string, string> {
-    return config.token ? { Authorization: `Bearer ${config.token}` } : {};
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
   }
 
   async get<T = unknown>(path: string, params?: Record<string, string>): Promise<T> {
@@ -78,6 +95,8 @@ export class HttpClient {
     this.health_check_interval = setInterval(async () => {
       await this.check_health();
     }, 15_000);
+    // One timer per instance must not keep the process alive on its own.
+    this.health_check_interval.unref?.();
 
     // Initial health check (non-blocking)
     this.check_health().catch(() => {});
@@ -146,12 +165,13 @@ export class HttpClient {
     }
 
     // Plugin not available - enter wait loop
+    const budget = this.waitMs();
     this.state = 'reconnecting';
     console.error(
-      `[x64dbg-mcp] Plugin not reachable at ${this.base_url}, waiting up to ${WAIT_FOR_PLUGIN_TIMEOUT_MS / 1000}s for it to come online...`
+      `[x64dbg-mcp] Plugin not reachable at ${this.base_url}, waiting up to ${budget / 1000}s for it to come online...`
     );
 
-    const deadline = Date.now() + WAIT_FOR_PLUGIN_TIMEOUT_MS;
+    const deadline = Date.now() + budget;
     let poll_count = 0;
 
     while (Date.now() < deadline) {
@@ -173,7 +193,7 @@ export class HttpClient {
 
       // Log progress every 10s
       if (poll_count % 5 === 0) {
-        const elapsed = Math.round((Date.now() - (deadline - WAIT_FOR_PLUGIN_TIMEOUT_MS)) / 1000);
+        const elapsed = Math.round((Date.now() - (deadline - budget)) / 1000);
         const remaining = Math.round((deadline - Date.now()) / 1000);
         console.error(`[x64dbg-mcp] Still waiting for plugin... (${elapsed}s elapsed, ${remaining}s remaining)`);
       }
@@ -181,9 +201,10 @@ export class HttpClient {
 
     this.state = 'disconnected';
     throw new Error(
-      `x64dbg plugin did not come online at ${this.base_url} within ${WAIT_FOR_PLUGIN_TIMEOUT_MS / 1000}s. ` +
+      `x64dbg plugin did not come online at ${this.base_url} within ${budget / 1000}s. ` +
       `Make sure x64dbg is running with the MCP plugin loaded. ` +
-      `Check with 'mcpserver status' in x64dbg command bar.`
+      `Check with 'mcpserver status' in x64dbg command bar. ` +
+      `Raise the budget with X64DBG_MCP_WAIT_MS=<ms>.`
     );
   }
 
@@ -328,4 +349,37 @@ export class HttpClient {
   }
 }
 
-export const httpClient = new HttpClient();
+/**
+ * One client per configured instance, created on first use.
+ *
+ * Every tool handler calls `httpClient.get/post` directly. Instead of threading
+ * an instance through ~160 call sites, the facade below resolves the instance
+ * from the async context the tool wrapper established (context.ts).
+ */
+const clients = new Map<string, HttpClient>();
+
+export function getClient(instance: InstanceEndpoint): HttpClient {
+  let client = clients.get(instance.id);
+  if (!client) {
+    client = new HttpClient(instance);
+    clients.set(instance.id, client);
+  }
+  return client;
+}
+
+export const httpClient = {
+  get<T = unknown>(path: string, params?: Record<string, string>): Promise<T> {
+    return getClient(currentInstance()).get<T>(path, params);
+  },
+  post<T = unknown>(path: string, body?: unknown): Promise<T> {
+    return getClient(currentInstance()).post<T>(path, body);
+  },
+  get connection_state(): ConnectionState {
+    return getClient(currentInstance()).connection_state;
+  },
+  /** Stop the health monitors of every instance client. */
+  destroy(): void {
+    for (const client of clients.values()) client.destroy();
+    clients.clear();
+  },
+};

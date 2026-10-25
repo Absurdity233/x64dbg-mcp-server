@@ -1,5 +1,6 @@
 import { httpClient } from './http_client.js';
 import { config } from './config.js';
+import { currentInstance } from './context.js';
 
 export interface DebugEvent {
   seq: number;
@@ -19,28 +20,34 @@ interface EventsResponse {
 }
 
 /**
- * Highest sequence number known to this client, so polls only return new
- * events. Module-level state: one MCP server process talks to one plugin.
+ * Highest sequence number seen per x64dbg instance, so polls only return new
+ * events. Keyed by instance: a single shared counter would let one target's
+ * event stream advance past another's, and both would silently lose events.
  */
-let cursor = 0;
+const cursors = new Map<string, number>();
+
+function cursorKey(): string {
+  return currentInstance().id;
+}
 
 export function currentCursor(): number {
-  return cursor;
+  return cursors.get(cursorKey()) ?? 0;
 }
 
 export function resetCursor(): void {
-  cursor = 0;
+  cursors.set(cursorKey(), 0);
 }
 
 function advance(res: EventsResponse): void {
-  if (res.latest_seq > cursor) cursor = res.latest_seq;
+  const key = cursorKey();
+  if (res.latest_seq > (cursors.get(key) ?? 0)) cursors.set(key, res.latest_seq);
 }
 
 /** Snapshot of everything buffered since the cursor. Does not block. */
 export async function drain(): Promise<{ events: DebugEvent[]; dropped: number }> {
   try {
     const res = await httpClient.get<EventsResponse>('/api/command/events', {
-      since: String(cursor),
+      since: String(currentCursor()),
     });
     advance(res);
     return { events: res.events ?? [], dropped: res.dropped ?? 0 };
@@ -93,7 +100,7 @@ export async function waitFor(
     }
 
     const params: Record<string, string> = {
-      since: String(cursor),
+      since: String(currentCursor()),
       // Hold for at most eventHoldMs per request so a plugin restart is noticed
       // promptly, but never longer than the caller's remaining budget. When the
       // previous batch was truncated there is already data to read, so do not
