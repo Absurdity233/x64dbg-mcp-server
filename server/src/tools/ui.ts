@@ -1,8 +1,22 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { currentInstance } from '../context.js';
 import { uiDaemon } from '../ui_daemon.js';
+import { withUiLock } from '../ui_lock.js';
 import { requireString } from './util.js';
+
+/**
+ * Actions that can synthesise real mouse/keyboard input. They need the
+ * foreground window and a global cursor, so in the default `input: "real"` mode
+ * they are serialised machine-wide.
+ *
+ * `input: "message"` switches clicktext/typeinto/type/key to PostMessage, which
+ * targets the window's own thread: no focus change, no cursor movement, and
+ * therefore no machine-wide lock - several targets can be driven at once.
+ * `click` is always PostMessage and never takes the lock.
+ */
+const REAL_INPUT_ACTIONS = new Set(['realclick', 'clicktext', 'typeinto', 'type', 'key']);
 
 /** Cache of pid -> window handle, so a UI flow does not re-enumerate windows. */
 const windowCache = new Map<number, { hwnd: number; at: number }>();
@@ -32,7 +46,7 @@ export function registerUiTools(server: McpServer) {
     'Interact with the debuggee\'s window - the half x64dbg cannot do. Actions: windows (list top-level windows), info (geometry), screenshot (PNG to file, then read it), ocr (recognise on-screen text with positions), findtext (locate a string, return its client coordinates), clicktext (OCR + realclick on the match - no hardcoded coordinates), typeinto (OCR + click + type), click (posted message, does not move the mouse), realclick (SendInput, needed by custom-drawn UIs), type (WM_CHAR into the focused control), key (single virtual key).',
     {
       action: z.enum([
-        'windows', 'info', 'screenshot', 'ocr', 'findtext', 'clicktext', 'typeinto',
+        'windows', 'info', 'activity', 'screenshot', 'ocr', 'findtext', 'clicktext', 'typeinto',
         'click', 'realclick', 'type', 'key',
       ]).describe('Operation to perform'),
       hwnd: z.number().optional().describe('Window handle; omit to use the debuggee\'s largest visible window'),
@@ -48,10 +62,25 @@ export function registerUiTools(server: McpServer) {
       stable_timeout_ms: z.number().optional().describe('OCR: give up waiting for a stable frame after this long (default 8000)'),
       file: z.string().optional().describe('screenshot: output PNG path; ocr: save what OCR saw'),
       timeout_ms: z.number().optional().describe('screenshot/ocr: give up after this long (default 15000) - a paused Direct2D window can block PrintWindow'),
+      lock_timeout_ms: z.number().optional().describe('input actions: how long to queue behind another model driving a different target (default 30000). Real input is machine-global and serialised.'),
+      guard: z.enum(['abort', 'wait', 'off']).optional().describe(
+        'input actions: what to do when a human is using the machine (last input < guard_ms, or cursor moving). ' +
+        '"abort" (default) refuses and reports the idle time; "wait" queues until quiet (up to guard_wait_ms); ' +
+        '"off" forces the action. Use activity to inspect the current state.'
+      ),
+      guard_ms: z.number().optional().describe('input actions: idle time (ms) below which the machine counts as in use (default 600)'),
+      guard_wait_ms: z.number().optional().describe('guard:"wait": how long to queue before giving up (default 3000)'),
+      input: z.enum(['real', 'message']).optional().describe(
+        'clicktext/typeinto/type/key: "real" (default) uses SetCursorPos+SendInput and steals the foreground window, ' +
+        'so it is serialised across all instances. "message" posts WM_* straight to the target window: no focus, ' +
+        'no global cursor, and several targets can be driven in parallel. Use "message" first; fall back to ' +
+        '"real" only if the app ignores posted messages (raw input / GetAsyncKeyState).'
+      ),
     },
     async (args) => {
       let hwnd = args.hwnd;
-      if (!hwnd) {
+      // activity is a machine-level diagnostic; it must work without a session.
+      if (!hwnd && args.action !== 'activity') {
         let pid: number | null = null;
         try {
           const info = await httpClient.get<any>('/api/process/info');
@@ -79,6 +108,10 @@ export function registerUiTools(server: McpServer) {
       if (args.wait_stable_ms) req.wait_stable_ms = args.wait_stable_ms;
       if (args.stable_timeout_ms) req.stable_timeout_ms = args.stable_timeout_ms;
       if (args.regex) req.regex = true;
+      if (args.input) req.input = args.input;
+      if (args.guard) req.guard = args.guard;
+      if (args.guard_ms !== undefined) req.guard_ms = args.guard_ms;
+      if (args.guard_wait_ms !== undefined) req.guard_wait_ms = args.guard_wait_ms;
 
       // Required-argument checks up front so the daemon is not woken for a
       // request that can only fail.
@@ -93,16 +126,32 @@ export function registerUiTools(server: McpServer) {
         requireString(args.match, 'match');
       }
 
+      const runOnce = () => uiDaemon.run(req);
+      // Message-mode input never touches the global cursor or the foreground
+      // window, so it does not need the machine-wide lock.
+      const needsGlobalLock = REAL_INPUT_ACTIONS.has(args.action) && args.input !== 'message';
       let res;
       try {
-        res = await uiDaemon.run(req);
+        res = needsGlobalLock
+          ? await withUiLock(
+              { instance: currentInstance().id, action: args.action, hwnd },
+              args.lock_timeout_ms ?? 30_000,
+              runOnce
+            )
+          : await runOnce();
       } catch (err) {
         // A dead handle is the usual cause of a hard failure here - drop the
         // cache entry so the next call re-resolves it.
         windowCache.clear();
         throw err;
       }
-      const payload = { hwnd, action: args.action, ok: res.ok, output: res.output || res.error };
+      const payload = {
+        hwnd,
+        action: args.action,
+        instance: currentInstance().id,
+        ok: res.ok,
+        output: res.output || res.error,
+      };
 
       // findtext/clicktext/typeinto report a miss as a plain "NOTFOUND" line;
       // surface it as an error so the caller does not treat it as success.

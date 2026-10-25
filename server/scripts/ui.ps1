@@ -14,7 +14,7 @@
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
   [ValidateSet('info', 'shot', 'ocr', 'findtext', 'clicktext', 'typeinto',
-               'click', 'realclick', 'type', 'key', 'windows', 'findwindow', 'serve')]
+               'click', 'realclick', 'type', 'key', 'activity', 'windows', 'findwindow', 'serve')]
   [string]$Action = 'info',
   [int]$X = 0,
   [int]$Y = 0,
@@ -29,7 +29,10 @@ param(
   [int]$WaitStable = 0,
   [string]$Region = '',
   [int]$StableTimeout = 8000,
-  [int]$TargetPid = 0
+  [int]$TargetPid = 0,
+  [ValidateSet('abort', 'wait', 'off')][string]$Guard = 'abort',
+  [int]$GuardMs = 600,
+  [int]$GuardWaitMs = 3000
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,6 +47,19 @@ Add-Type -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
 [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
 [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+[DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
+[DllImport("user32.dll")] public static extern IntPtr ChildWindowFromPointEx(IntPtr h, POINT p, uint flags);
+[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+[DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW")] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+[StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+[DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+[DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+[DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(IntPtr c);
 [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -67,6 +83,50 @@ public struct POINT { public int X, Y; }
 '@ -Name U -Namespace MCPUI
 
 $script:h = [IntPtr]$Hwnd
+# 'real' = SetCursorPos + SendInput, needs the foreground window and serialises
+# the whole machine. 'message' = PostMessage straight to the target window: no
+# focus, no global cursor, so several targets can be driven at once.
+$script:InputMode = 'real'
+# Window that received the last synthetic click. Buttons ignore a top-level
+# WM_LBUTTONDOWN, and an edit control ignores a WM_CHAR sent to its parent, so
+# both the click and the following type must address the resolved child.
+$script:LastTarget = [IntPtr]::Zero
+
+# Human-activity guard. Synthetic input and a human share one cursor and one
+# keyboard; if somebody is using the machine while the model clicks, the model
+# steals their window or types into the wrong place. Every input action checks
+# how long the machine has been idle first.
+#   abort (default) = refuse and explain
+#   wait            = queue until quiet, up to GuardWaitMs
+#   off             = do not check
+$script:Guard = $Guard
+$script:GuardMs = if ($GuardMs -gt 0) { $GuardMs } else { 600 }
+$script:GuardWaitMs = if ($GuardWaitMs -gt 0) { $GuardWaitMs } else { 3000 }
+# Tick of the last input event *we* generated, so our own SendInput is not
+# mistaken for a human.
+$script:LastInputTick = 0
+
+# DPI awareness must be set before the first window/coordinate call.
+#
+# powershell.exe ships DPI-unaware: GetWindowRect / ClientToScreen return
+# 96-DPI virtualised coordinates while PrintWindow and SetCursorPos work in
+# physical pixels. On any display scaling other than 100% that splits the
+# coordinate system in two - the screenshot is clipped to the virtualised size
+# and every click lands short by the scale factor. Per-monitor-v2 makes all of
+# them physical, which is what the OCR image already is.
+$script:DpiAwareness = 'unknown'
+try {
+  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+  if ([MCPUI.U]::SetProcessDpiAwarenessContext([IntPtr](-4))) {
+    $script:DpiAwareness = 'per-monitor-v2'
+  } elseif ([MCPUI.U]::SetProcessDPIAware()) {
+    $script:DpiAwareness = 'system'
+  } else {
+    $script:DpiAwareness = 'unchanged'
+  }
+} catch {
+  try { if ([MCPUI.U]::SetProcessDPIAware()) { $script:DpiAwareness = 'system' } } catch { }
+}
 
 # ---------------------------------------------------------------------------
 # WinRT await helper (PowerShell has no native await for IAsyncOperation)
@@ -111,6 +171,67 @@ function Get-ClientOrigin {
   $p = New-Object MCPUI.U+POINT
   [MCPUI.U]::ClientToScreen($script:h, [ref]$p) | Out-Null
   return $p
+}
+
+function Get-CursorPosNow {
+  $p = New-Object MCPUI.U+POINT
+  [MCPUI.U]::GetCursorPos([ref]$p) | Out-Null
+  return $p
+}
+
+function Get-LastInputTick {
+  $lii = New-Object MCPUI.U+LASTINPUTINFO
+  $lii.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([type][MCPUI.U+LASTINPUTINFO])
+  if (-not [MCPUI.U]::GetLastInputInfo([ref]$lii)) { return 0 }
+  return [uint32]$lii.dwTime
+}
+
+function Get-IdleMs {
+  # System-wide idle time. GetLastInputInfo reports a 32-bit tick, so the
+  # subtraction is done mod 2^32 and masked - it survives the ~49 day wrap.
+  $tick = Get-LastInputTick
+  if ($tick -eq 0) { return -1 }
+  $now = [uint32][Environment]::TickCount
+  return [int](($now - $tick) -band 0x7FFFFFFF)
+}
+
+function Get-HumanActivity {
+  $idle = Get-IdleMs
+  $tick = Get-LastInputTick
+  # Our own SetCursorPos/SendInput also bumps the last-input tick. Remembering
+  # it is what keeps back-to-back model clicks from tripping the guard.
+  $ours = ($script:LastInputTick -ne 0 -and $tick -eq $script:LastInputTick)
+  $recent = (-not $ours) -and ($idle -ge 0) -and ($idle -lt $script:GuardMs)
+  $moving = $false
+  if ($recent) {
+    $a = Get-CursorPosNow
+    Start-Sleep -Milliseconds 80
+    $b = Get-CursorPosNow
+    $moving = ($a.X -ne $b.X -or $a.Y -ne $b.Y)
+  }
+  return [pscustomobject]@{ IdleMs = $idle; Recent = $recent; Moving = $moving; Ours = $ours }
+}
+
+function Assert-NoHumanActivity([string]$what) {
+  if ($script:Guard -eq 'off') { return }
+  $deadline = (Get-Date).AddMilliseconds($script:GuardWaitMs)
+  while ($true) {
+    $act = Get-HumanActivity
+    if (-not $act.Recent) { return }
+
+    $desc = "last input $($act.IdleMs)ms ago"
+    if ($act.Moving) { $desc += ', cursor moving' }
+    if ([MCPUI.U]::GetForegroundWindow() -ne $script:h) { $desc += ', foreground is another window' }
+
+    if ($script:Guard -ne 'wait') {
+      throw "human input detected ($desc); refusing to $what. " +
+            "Retry when the machine is idle, or pass guard:'wait' to queue, guard:'off' to force."
+    }
+    if ((Get-Date) -ge $deadline) {
+      throw "machine still busy after $($script:GuardWaitMs)ms ($desc); refusing to $what."
+    }
+    Start-Sleep -Milliseconds 100
+  }
 }
 
 function Get-ImageOffset {
@@ -203,6 +324,12 @@ function Enhance-ForOcr($bmp) {
 }
 
 function Capture-Bitmap {
+  # A minimized window has no client area to render; PrintWindow would hand back
+  # an empty bitmap and OCR would then report "NOTFOUND" as if the UI had
+  # changed. Fail loudly instead.
+  if ([MCPUI.U]::IsIconic($script:h)) {
+    throw "window is minimized - restore it before capturing or clicking"
+  }
   $r = New-Object MCPUI.U+RECT
   [MCPUI.U]::GetWindowRect($script:h, [ref]$r) | Out-Null
   $w = $r.Right - $r.Left
@@ -282,6 +409,11 @@ function Invoke-Ocr {
   # Returns @{ Text; Words } where each word carries its center in CLIENT coords.
   if ($WaitStable -gt 0) { $null = Wait-StableFrame }
   $cap = Capture-Bitmap
+  if (-not $cap.Ok) {
+    $cap.Bitmap.Dispose()
+    throw "PrintWindow failed for hwnd $([int64]$script:h) - the window may be cloaked, " +
+          "minimized, or on a desktop the compositor is not rendering"
+  }
   $base = $cap.Bitmap
   $regionOffset = @{ X = 0; Y = 0 }
   if ($Region) {
@@ -293,7 +425,24 @@ function Invoke-Ocr {
     $base = $cropped
   }
   $enhanced = if ($Enhance) { Enhance-ForOcr $base } else { $base }
+
+  # Clamp the upscale, but favour accuracy: a 3x image is what makes small
+  # labels legible, and a click is a one-off action where 300ms does not
+  # matter. The clamp exists for two hard limits, not for speed:
+  #   - the engine rejects images above MaxImageDimension (10000 px), and
+  #   - a huge bitmap is a memory/latency cliff (12M px ~ 48 MB).
+  # For speed, crop with `region`; that helps accuracy too.
   $factor = [Math]::Max(1.0, $Scale / 100.0)
+  $maxDim = 10000
+  try { $maxDim = [int][Windows.Media.Ocr.OcrEngine]::MaxImageDimension } catch { }
+  if ($base.Width -gt 0 -and $base.Height -gt 0) {
+    $budgetFactor = [Math]::Sqrt(12000000.0 / ([double]$base.Width * [double]$base.Height))
+    $dimFactor = [double]$maxDim / [Math]::Max($base.Width, $base.Height)
+    $capFactor = [Math]::Min($budgetFactor, $dimFactor)
+    if ($capFactor -lt $factor) {
+      $factor = [Math]::Max(1.0, [Math]::Floor($capFactor * 10.0) / 10.0)
+    }
+  }
   $scaled = Scale-Bitmap $enhanced $factor
   try {
     $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), "mcp-ocr-$PID-$([guid]::NewGuid().ToString('N')).png")
@@ -335,11 +484,12 @@ function Invoke-Ocr {
     }
 
     return @{
-      Text  = ($lines -join "`n")
-      Lines = $lines
-      Words = $words
-      Width = $cap.Width
+      Text   = ($lines -join "`n")
+      Lines  = $lines
+      Words  = $words
+      Width  = $cap.Width
       Height = $cap.Height
+      Factor = $factor
     }
   } finally {
     if ($scaled -ne $enhanced) { $scaled.Dispose() }
@@ -347,6 +497,30 @@ function Invoke-Ocr {
     if ($base -ne $cap.Bitmap) { $base.Dispose() }
     $cap.Bitmap.Dispose()
   }
+}
+
+function Get-EditDistance([string]$a, [string]$b) {
+  # Levenshtein, two rows. Used only as an OCR fallback on short labels, so the
+  # O(n*m) cost is irrelevant.
+  $n = $a.Length
+  $m = $b.Length
+  if ($n -eq 0) { return $m }
+  if ($m -eq 0) { return $n }
+  $prev = New-Object 'int[]' ($m + 1)
+  $cur = New-Object 'int[]' ($m + 1)
+  for ($j = 0; $j -le $m; $j++) { $prev[$j] = $j }
+  for ($i = 1; $i -le $n; $i++) {
+    $cur[0] = $i
+    for ($j = 1; $j -le $m; $j++) {
+      $cost = if ($a[$i - 1] -eq $b[$j - 1]) { 0 } else { 1 }
+      $del = $cur[$j - 1] + 1
+      $ins = $prev[$j] + 1
+      $sub = $prev[$j - 1] + $cost
+      $cur[$j] = [Math]::Min([Math]::Min($del, $ins), $sub)
+    }
+    $swap = $prev; $prev = $cur; $cur = $swap
+  }
+  return $prev[$m]
 }
 
 function Find-Text($ocr, [string]$needle, [switch]$UseRegex) {
@@ -359,10 +533,21 @@ function Find-Text($ocr, [string]$needle, [switch]$UseRegex) {
   $normalize = { param($t) ($t -replace '\s+', '') }
   $target = & $normalize $needle
 
+  # OCR is a noisy recogniser: "PASSWORD" comes back as "PASSW0RD" or
+  # "PÅSSWORD" often enough that an exact match is a coin flip, and a miss used
+  # to cost a whole tool call. Matching is case-insensitive and falls back to
+  # an edit-distance match, which is reported so the caller can see what was
+  # actually clicked.
+  $loose = { param($t) (($t -replace '\s+', '') -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant() }
+  $looseNeedle = & $loose $needle
+  $maxDist = if ($looseNeedle.Length -le 4) { 1 } else { 2 }
+
   $hits = New-Object System.Collections.ArrayList
   foreach ($line in $ocr.Lines) {
     $flat = & $normalize $line
-    $isHit = if ($UseRegex) { $flat -match $target } else { $flat.Contains($target) }
+    $isHit = if ($UseRegex) { $flat -match $target } else {
+      $flat.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    }
     if ($isHit) { [void]$hits.Add(@{ Line = $line; Flat = $flat }) }
   }
 
@@ -371,7 +556,9 @@ function Find-Text($ocr, [string]$needle, [switch]$UseRegex) {
     # Collect the words whose flattened text participates in the matched line,
     # restricted to the slice that covers the needle when possible.
     foreach ($hit in $hits) {
-      $pos = if ($UseRegex) { -1 } else { $hit.Flat.IndexOf($target) }
+      $pos = if ($UseRegex) { -1 } else {
+        $hit.Flat.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase)
+      }
       $cursor = 0
       foreach ($word in $ocr.Words) {
         if (-not $hit.Flat.Contains(($word.Text -replace '\s+', ''))) { continue }
@@ -391,41 +578,127 @@ function Find-Text($ocr, [string]$needle, [switch]$UseRegex) {
   if ($targets.Count -eq 0) {
     foreach ($word in $ocr.Words) {
       $flat = & $normalize $word.Text
-      $isHit = if ($UseRegex) { $flat -match $target } else { $flat.Contains($target) }
+      $isHit = if ($UseRegex) { $flat -match $target } else {
+        $flat.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+      }
       if ($isHit) { [void]$targets.Add($word) }
+    }
+  }
+
+  # Last resort: the closest label within a small edit distance.
+  if ($targets.Count -eq 0 -and -not $UseRegex) {
+    $best = $null
+    $bestD = [int]::MaxValue
+    foreach ($word in $ocr.Words) {
+      $flat = & $loose $word.Text
+      if ($flat.Length -eq 0) { continue }
+      $d = Get-EditDistance $looseNeedle $flat
+      if ($d -lt $bestD) { $bestD = $d; $best = $word }
+    }
+    if ($best -and $bestD -le $maxDist) {
+      [void]$targets.Add([pscustomobject]@{
+        Text = $best.Text; X = $best.X; Y = $best.Y
+        Width = $best.Width; Height = $best.Height
+        CX = $best.CX; CY = $best.CY
+        Fuzzy = $true; Distance = $bestD
+      })
     }
   }
 
   return @{ Lines = @($hits | ForEach-Object { $_.Line }); Words = $targets }
 }
 
+function Resolve-InputTarget([int]$cx, [int]$cy) {
+  # Real mouse input is delivered to whatever window is under the cursor, which
+  # is usually a child control, not the top-level window. Posting to the top
+  # level therefore does nothing for a standard button/edit (the message lands
+  # on the form background). Descend with ChildWindowFromPointEx - it is
+  # geometry-only, so it works while the window is in the background - and
+  # translate the point into each child's client space.
+  $h = $script:h
+  $x = $cx
+  $y = $cy
+  for ($i = 0; $i -lt 16; $i++) {
+    $pt = New-Object MCPUI.U+POINT
+    $pt.X = $x; $pt.Y = $y
+    $child = [MCPUI.U]::ChildWindowFromPointEx($h, $pt, 0x0001)  # CWP_SKIPINVISIBLE
+    if ($child -eq [IntPtr]::Zero -or $child -eq $h) { break }
+
+    $sp = New-Object MCPUI.U+POINT
+    $sp.X = $x; $sp.Y = $y
+    [MCPUI.U]::ClientToScreen($h, [ref]$sp) | Out-Null
+    [MCPUI.U]::ScreenToClient($child, [ref]$sp) | Out-Null
+    $x = $sp.X; $y = $sp.Y
+    $h = $child
+  }
+  return [pscustomobject]@{ H = $h; X = $x; Y = $y }
+}
+
+function Invoke-PostClick([int]$cx, [int]$cy) {
+  # Window-targeted click. The message goes to this window's thread only, so it
+  # works with the window in the background and never touches the global cursor.
+  # Use it whenever the target handles WM_LBUTTONDOWN normally; fall back to
+  # Invoke-RealClick for apps that read raw input / GetAsyncKeyState.
+  Assert-NoHumanActivity 'click'
+  $t = Resolve-InputTarget $cx $cy
+  $script:LastTarget = $t.H
+  $lp = [IntPtr](($t.Y -shl 16) -bor ($t.X -band 0xFFFF))
+  $null = [MCPUI.U]::PostMessage($t.H, 0x0200, [IntPtr]1, $lp)   # WM_MOUSEMOVE
+  $null = [MCPUI.U]::PostMessage($t.H, 0x0201, [IntPtr]1, $lp)   # WM_LBUTTONDOWN
+  Start-Sleep -Milliseconds 60
+  $null = [MCPUI.U]::PostMessage($t.H, 0x0202, [IntPtr]0, $lp)   # WM_LBUTTONUP
+  return "posted click at client($cx,$cy) -> hwnd $([int64]$t.H) local($($t.X),$($t.Y))"
+}
+
+function Invoke-UiClick([int]$cx, [int]$cy) {
+  if ($script:InputMode -eq 'message') { return (Invoke-PostClick $cx $cy) }
+  return (Invoke-RealClick $cx $cy)
+}
+
 function Invoke-RealClick([int]$cx, [int]$cy) {
+  Assert-NoHumanActivity 'move the cursor and click'
   $focused = Focus-Target
   if (-not $focused -and [MCPUI.U]::GetForegroundWindow() -ne $script:h) {
     throw "cannot click: the target window is not in the foreground and cannot be activated"
   }
+  $script:LastTarget = (Resolve-InputTarget $cx $cy).H
   $o = Get-ClientOrigin
   $sx = $o.X + $cx
   $sy = $o.Y + $cy
   [MCPUI.U]::SetCursorPos($sx, $sy) | Out-Null
-  Start-Sleep -Milliseconds 120
-  [MCPUI.U]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+  # 60ms is enough for the cursor move to be processed before the button goes
+  # down; 120ms was pure padding and every click paid it.
   Start-Sleep -Milliseconds 60
+  [MCPUI.U]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 40
   [MCPUI.U]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+  # Record the input event this click produced, so the next call's guard does
+  # not mistake it for a human.
+  Start-Sleep -Milliseconds 20
+  $script:LastInputTick = Get-LastInputTick
   return "real click at screen($sx,$sy) from client($cx,$cy)"
 }
 
 function Invoke-Type([string]$s) {
-  $focused = Focus-Target
-  if (-not $focused -and [MCPUI.U]::GetForegroundWindow() -ne $script:h) {
-    throw "cannot type: the target window is not in the foreground"
+  Assert-NoHumanActivity 'type'
+  # WM_CHAR is posted to the window, so it does not need focus. Only the real
+  # mode insists on the foreground, because that is the mode that pretends to
+  # be a user typing.
+  if ($script:InputMode -ne 'message') {
+    $focused = Focus-Target
+    if (-not $focused -and [MCPUI.U]::GetForegroundWindow() -ne $script:h) {
+      throw "cannot type: the target window is not in the foreground"
+    }
   }
+  # An edit control only sees WM_CHAR sent to itself, not to its parent window.
+  # After a click we know the child; fall back to the top-level window otherwise.
+  $target = if ($script:LastTarget -ne [IntPtr]::Zero) { $script:LastTarget } else { $script:h }
   foreach ($ch in $s.ToCharArray()) {
     $code = [int][char]$ch
-    $null = [MCPUI.U]::PostMessage($script:h, 0x0102, [IntPtr]$code, [IntPtr]1)
-    Start-Sleep -Milliseconds 20
+    $null = [MCPUI.U]::PostMessage($target, 0x0102, [IntPtr]$code, [IntPtr]1)
+    Start-Sleep -Milliseconds 8
   }
-  return "typed $($s.Length) chars"
+  return "typed $($s.Length) chars -> hwnd $([int64]$target)"
 }
 
 # ---------------------------------------------------------------------------
@@ -465,6 +738,39 @@ function Invoke-UiAction {
     Write-Output ("window={0},{1} {2}x{3} client={4}x{5} client_origin={6},{7} image_offset={8},{9}" -f `
       $wr.Left, $wr.Top, ($wr.Right - $wr.Left), ($wr.Bottom - $wr.Top), `
       ($cr.Right - $cr.Left), ($cr.Bottom - $cr.Top), $o.X, $o.Y, $off.X, $off.Y)
+
+    # Calibration diagnostics: the client origin and image offset above are the
+    # two numbers every click and every OCR coordinate is derived from. If the
+    # process were DPI-unaware on a scaled display they would be logical while
+    # the bitmap is physical, so say so explicitly.
+    $dpi = [MCPUI.U]::GetDpiForWindow($script:h)
+    if ($dpi -eq 0) { $dpi = [MCPUI.U]::GetDpiForSystem() }
+    $aware = [MCPUI.U]::GetAwarenessFromDpiAwarenessContext([MCPUI.U]::GetThreadDpiAwarenessContext())
+    $scale = [Math]::Round(100.0 * $dpi / 96.0)
+    Write-Output ("dpi={0} scale={1}% awareness={2} (0=unaware 1=system 2=per-monitor, process={3})" -f `
+      $dpi, $scale, $aware, $script:DpiAwareness)
+    if ($aware -eq 0 -and $dpi -ne 96) {
+      Write-Output "WARNING: DPI-unaware process on a ${scale}% window - screenshots and clicks will disagree by the scale factor"
+    }
+  }
+
+  'activity' {
+    # Diagnostics for "is it safe to touch the UI right now?".
+    $a = Get-HumanActivity
+    $p1 = Get-CursorPosNow
+    Start-Sleep -Milliseconds 80
+    $p2 = Get-CursorPosNow
+    $fg = [MCPUI.U]::GetForegroundWindow()
+    $title = ''
+    try {
+      $sb = New-Object System.Text.StringBuilder 512
+      [void][MCPUI.U]::GetWindowTextW($fg, $sb, 512)
+      $title = $sb.ToString()
+    } catch { }
+    $fmt = "idle_ms={0} last_input_ours={1} cursor={2},{3} cursor_moving={4} " +
+           "foreground=0x{5:X} foreground_is_target={6} foreground_title='{7}' guard={8}/{9}ms"
+    Write-Output ($fmt -f $a.IdleMs, $a.Ours, $p2.X, $p2.Y, ($p1.X -ne $p2.X -or $p1.Y -ne $p2.Y),
+      [int64]$fg, ($fg -eq $script:h), $title, $script:Guard, $script:GuardMs)
   }
 
   'windows' {
@@ -526,7 +832,9 @@ function Invoke-UiAction {
       Write-Output "NOTFOUND '$Match'"
       Write-Output "available text:"
       foreach ($l in $ocr.Lines) { Write-Output "  $l" }
-      exit 2
+      # Never `exit` here: this runs inside the long-lived daemon, and exiting
+      # would kill the process, making the next call pay a ~3s cold start.
+      return
     }
     foreach ($w in $found.Words) {
       Write-Output ("MATCH '{0}' client=({1},{2}) center=({3},{4})" -f $w.Text, $w.X, $w.Y, $w.CX, $w.CY)
@@ -540,11 +848,12 @@ function Invoke-UiAction {
       Write-Output "NOTFOUND '$Match'"
       Write-Output "available text:"
       foreach ($l in $ocr.Lines) { Write-Output "  $l" }
-      exit 2
+      return
     }
     $w = $found.Words[0]
     Write-Output ("matched '{0}' center=({1},{2})" -f $w.Text, $w.CX, $w.CY)
-    Write-Output (Invoke-RealClick $w.CX $w.CY)
+    if ($w.Fuzzy) { Write-Output ("fuzzy match, edit distance {0} from '{1}'" -f $w.Distance, $Match) }
+    Write-Output (Invoke-UiClick $w.CX $w.CY)
   }
 
   'typeinto' {
@@ -560,34 +869,35 @@ function Invoke-UiAction {
       Write-Output "NOTFOUND '$Match'"
       Write-Output "available text:"
       foreach ($l in $ocr.Lines) { Write-Output "  $l" }
-      exit 2
+      return
     }
 
     $w = $found.Words[0]
-    $clickX = if ($PSBoundParameters.ContainsKey('X') -and ($X -ne 0 -or $Y -ne 0)) { $X } else { $w.CX }
-    $clickY = if ($PSBoundParameters.ContainsKey('X') -and ($X -ne 0 -or $Y -ne 0)) { $Y } else { $w.CY }
+    # In serve mode the coordinates arrive as script variables, not bound
+    # parameters, so the old $PSBoundParameters check silently never applied the
+    # override and every typeinto clicked its own label.
+    $ox = if ($PSBoundParameters.ContainsKey('X')) { $X } else { $script:X }
+    $oy = if ($PSBoundParameters.ContainsKey('Y')) { $Y } else { $script:Y }
+    $hasOverride = ($null -ne $ox -and $null -ne $oy -and ($ox -ne 0 -or $oy -ne 0))
+    $clickX = if ($hasOverride) { $ox } else { $w.CX }
+    $clickY = if ($hasOverride) { $oy } else { $w.CY }
 
     Write-Output ("matched '{0}' label_center=({1},{2}) click=({3},{4})" -f $w.Text, $w.CX, $w.CY, $clickX, $clickY)
-    Write-Output (Invoke-RealClick $clickX $clickY)
+    if ($w.Fuzzy) { Write-Output ("fuzzy match, edit distance {0} from '{1}'" -f $w.Distance, $Match) }
+    Write-Output (Invoke-UiClick $clickX $clickY)
     Start-Sleep -Milliseconds 250
     Write-Output (Invoke-Type $Text)
   }
 
-  'click' {
-    $lp = [IntPtr](($Y -shl 16) -bor ($X -band 0xFFFF))
-    $null = [MCPUI.U]::PostMessage($script:h, 0x0200, [IntPtr]1, $lp)
-    $null = [MCPUI.U]::PostMessage($script:h, 0x0201, [IntPtr]1, $lp)
-    Start-Sleep -Milliseconds 60
-    $null = [MCPUI.U]::PostMessage($script:h, 0x0202, [IntPtr]0, $lp)
-    Write-Output "posted click at client($X,$Y)"
-  }
+  'click' { Write-Output (Invoke-PostClick $X $Y) }
 
   'realclick' { Write-Output (Invoke-RealClick $X $Y) }
 
   'type' { Write-Output (Invoke-Type $Text) }
 
   'key' {
-    Focus-Target | Out-Null
+    Assert-NoHumanActivity 'send a key'
+    if ($script:InputMode -ne 'message') { Focus-Target | Out-Null }
     $vk = [int]$X
     $null = [MCPUI.U]::PostMessage($script:h, 0x0100, [IntPtr]$vk, [IntPtr]1)
     Start-Sleep -Milliseconds 40
@@ -640,6 +950,12 @@ while ($true) {
     $script:StableTimeout = if ($cmd.stable_timeout_ms) { [int]$cmd.stable_timeout_ms } else { 8000 }
     $script:Enhance = [bool]$cmd.enhance
     $script:Regex = [bool]$cmd.regex
+    $script:InputMode = if ($cmd.input -eq 'message') { 'message' } else { 'real' }
+    # Cleared per command; typeinto sets it via its click.
+    $script:LastTarget = [IntPtr]::Zero
+    $script:Guard = if ($cmd.guard) { [string]$cmd.guard } else { 'abort' }
+    $script:GuardMs = if ($cmd.guard_ms) { [int]$cmd.guard_ms } else { 600 }
+    $script:GuardWaitMs = if ($cmd.guard_wait_ms) { [int]$cmd.guard_wait_ms } else { 3000 }
     $script:All = $false
 
     $out = & { Invoke-UiAction -Action $cmd.action } *>&1 | Out-String
