@@ -1,18 +1,22 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
+  duplicateEndpoints,
   getDefaultInstance,
   listInstances,
+  markDefaultChosen,
   setDefaultInstance,
   type InstanceEndpoint,
 } from '../instances.js';
-import { ownsLease, peekLease, releaseLease } from '../lease.js';
+import { config } from '../config.js';
+import { acquireLease, ownsLease, peekLease, releaseLease } from '../lease.js';
+
 import { requireString } from './util.js';
 
 /** 'ours' | 'free' | the live holder. */
 function leaseView(instance: InstanceEndpoint): unknown {
-  if (ownsLease(instance.id)) return 'ours';
-  const holder = peekLease(instance.id);
+  if (ownsLease(instance.host, instance.port)) return 'ours';
+  const holder = peekLease(instance.host, instance.port);
   if (!holder) return 'free';
   return {
     pid: holder.pid,
@@ -89,16 +93,23 @@ export function registerInstanceTools(server: McpServer) {
       switch (args.action) {
         case 'list': {
           const defaultId = getDefaultInstance().id;
+          const dups = duplicateEndpoints();
           const rows = await Promise.all(
-            listInstances().map(async (inst) => ({
-              id: inst.id,
-              label: inst.label,
-              endpoint: `${inst.host}:${inst.port}`,
-              x64dbgPath: inst.x64dbgPath,
-              default: inst.id === defaultId,
-              lease: leaseView(inst),
-              ...(await probe(inst)),
-            }))
+            listInstances().map(async (inst) => {
+              const ep = `${inst.host}:${inst.port}`;
+              return {
+                id: inst.id,
+                label: inst.label,
+                endpoint: ep,
+                x64dbgPath: inst.x64dbgPath,
+                default: inst.id === defaultId,
+                // Same endpoint as another id = same debugger. The lease is
+                // keyed by endpoint, so only one of them can ever be used.
+                ...(dups.has(ep) ? { shared_with: dups.get(ep)!.filter((x) => x !== inst.id) } : {}),
+                lease: leaseView(inst),
+                ...(await probe(inst)),
+              };
+            })
           );
           return {
             content: [{
@@ -112,7 +123,10 @@ export function registerInstanceTools(server: McpServer) {
           const id = requireString(args.id, 'id');
           // Switching to an instance another session owns would make every
           // following call fail; say so here rather than one call later.
-          const holder = !ownsLease(id) ? peekLease(id) : null;
+          const target = listInstances().find((i) => i.id === id);
+          const holder = target && !ownsLease(target.host, target.port)
+            ? peekLease(target.host, target.port)
+            : null;
           if (holder) {
             return {
               content: [{
@@ -129,7 +143,32 @@ export function registerInstanceTools(server: McpServer) {
               isError: true,
             };
           }
+          // Take the lease now rather than on the next call: "switch to X"
+          // should fail here if X is taken, not one call later.
+          if (!target) throw new Error(`Unknown x64dbg instance "${id}".`);
+          if (config.lease && !ownsLease(target.host, target.port)) {
+            const got = acquireLease(target.id, target.host, target.port);
+            if (!got.ok) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    default: getDefaultInstance().id,
+                    switched: false,
+                    message: `"${id}" could not be leased; another session took it in the meantime.`,
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+          }
           const inst = setDefaultInstance(id);
+          // Also stops auto-assignment from overriding this choice later.
+          markDefaultChosen();
+
+          // Warn immediately instead of letting the next call burn the whole
+          // wait budget on a debugger whose plugin is not running.
+          const up = (await probe(inst)).reachable;
           return {
             content: [{
               type: 'text',
@@ -137,6 +176,11 @@ export function registerInstanceTools(server: McpServer) {
                 default: inst.id,
                 endpoint: `${inst.host}:${inst.port}`,
                 switched: true,
+                plugin_answering: up,
+                ...(up ? {} : {
+                  warning: 'The MCP plugin is not answering on this instance yet. ' +
+                    'Start that x64dbg (or its plugin) before calling, or calls will wait and fail.',
+                }),
                 note: 'Applies to tool calls in this MCP server process that omit "instance".',
               }, null, 2),
             }],
@@ -167,8 +211,9 @@ export function registerInstanceTools(server: McpServer) {
 
         case 'release': {
           const id = requireString(args.id, 'id');
-          const owned = ownsLease(id);
-          if (owned) releaseLease(id);
+          const inst = listInstances().find((i) => i.id === id);
+          const owned = !!inst && ownsLease(inst.host, inst.port);
+          if (inst && owned) releaseLease(inst.host, inst.port);
           return {
             content: [{
               type: 'text',

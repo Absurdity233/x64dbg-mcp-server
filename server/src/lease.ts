@@ -10,17 +10,21 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 /**
- * Exclusive ownership of an x64dbg instance.
+ * Exclusive ownership of an x64dbg *endpoint*.
  *
  * The `instance` argument only says where a call should go; it does not stop
  * two models from pointing at the same debugger. Two agents on one x64dbg
  * silently corrupt each other: breakpoints collide, one agent's run clears the
- * other's paused state, both see each other's events. There is no way to
- * isolate that inside the debugger, so ownership is enforced here instead.
+ * other's paused state, both see each other's events.
+ *
+ * The lease is keyed by host:port, not by instance id. Two ids can name the
+ * same endpoint (a duplicate entry, or a provisioned copy that ended up on the
+ * default's port); keying by id would then hand out two "different" leases over
+ * one debugger, which is exactly the failure this exists to prevent.
  *
  * The lease is a file, not an in-process lock: independent Claude Code sessions
  * are independent MCP server processes. A lease names the owner pid and is
- * refreshed every HEARTBEAT_MS; a lease whose owner is gone (same machine) or
+ * refreshed every HEARTBEAT_MS; a lease whose owner is gone (same host) or
  * whose heartbeat is older than STALE_MS is reclaimed.
  *
  * X64DBG_MCP_LEASE=off disables enforcement (the old advisory behaviour).
@@ -31,7 +35,10 @@ const HEARTBEAT_MS = 10_000;
 const STALE_MS = 35_000;
 
 export interface LeaseInfo {
+  /** Instance id the owner used; only for messages. */
   instance: string;
+  /** host:port this lease actually protects. */
+  endpoint: string;
   pid: number;
   host: string;
   started_at: number;
@@ -43,14 +50,20 @@ export type AcquireResult =
   | { ok: true; reclaimed: boolean }
   | { ok: false; holder: LeaseInfo | null };
 
-const held = new Map<string, { info: LeaseInfo; timer: NodeJS.Timeout }>();
+interface Held { info: LeaseInfo; timer: NodeJS.Timeout; host: string; port: number }
+const held = new Map<string, Held>();
 
-function safeName(instance: string): string {
-  return instance.replace(/[^A-Za-z0-9._-]/g, '_');
+function safeName(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
-function leasePath(instance: string): string {
-  return join(DIR, `${safeName(instance)}.lease`);
+/** The identity of a debugger: what the lease and every lookup key on. */
+export function leaseKey(host: string, port: number): string {
+  return `ep_${safeName(host)}_${port}`;
+}
+
+function leasePath(key: string): string {
+  return join(DIR, `${safeName(key)}.lease`);
 }
 
 function pidAlive(pid: number): boolean {
@@ -62,9 +75,9 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function readLease(instance: string): LeaseInfo | null {
+function readLease(key: string): LeaseInfo | null {
   try {
-    return JSON.parse(readFileSync(leasePath(instance), 'utf8')) as LeaseInfo;
+    return JSON.parse(readFileSync(leasePath(key), 'utf8')) as LeaseInfo;
   } catch {
     return null;
   }
@@ -77,10 +90,10 @@ function isStale(info: LeaseInfo): boolean {
   return Date.now() - info.heartbeat > STALE_MS;
 }
 
-function writeLease(info: LeaseInfo): boolean {
+function writeLease(key: string, info: LeaseInfo): boolean {
   try {
     mkdirSync(DIR, { recursive: true });
-    const fd = openSync(leasePath(info.instance), 'wx');
+    const fd = openSync(leasePath(key), 'wx');
     try {
       writeSync(fd, JSON.stringify(info));
     } finally {
@@ -88,23 +101,32 @@ function writeLease(info: LeaseInfo): boolean {
     }
     return true;
   } catch (err) {
+    // EEXIST is the normal "somebody else has it" path. Anything else (a
+    // transient sharing violation while another process rewrites its lease)
+    // must not crash a tool call either: report "not acquired" and let the
+    // caller surface the conflict.
     if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') return false;
-    throw err;
+    return false;
   }
 }
 
-function startHeartbeat(info: LeaseInfo): NodeJS.Timeout {
+function startHeartbeat(key: string, info: LeaseInfo): NodeJS.Timeout {
   const timer = setInterval(() => {
-    const current = readLease(info.instance);
-    // Someone stole it (we were considered stale): stop pretending we own it.
+    if (held.get(key)?.info.token !== info.token) {
+      clearInterval(timer);
+      return;
+    }
+    const current = readLease(key);
+    // Someone else took it (our heartbeat was considered stale): stop
+    // pretending we own it.
     if (!current || current.token !== info.token) {
       clearInterval(timer);
-      held.delete(info.instance);
+      held.delete(key);
       return;
     }
     info.heartbeat = Date.now();
     try {
-      const fd = openSync(leasePath(info.instance), 'w');
+      const fd = openSync(leasePath(key), 'w');
       try {
         writeSync(fd, JSON.stringify(info));
       } finally {
@@ -118,18 +140,24 @@ function startHeartbeat(info: LeaseInfo): NodeJS.Timeout {
   return timer;
 }
 
+function take(key: string, info: LeaseInfo, host: string, port: number, reclaimed: boolean): AcquireResult {
+  held.set(key, { info, timer: startHeartbeat(key, info), host, port });
+  return { ok: true, reclaimed };
+}
+
 /**
- * Take the lease for `instance`, or report who holds it.
+ * Take the lease for an endpoint, or report who holds it.
  *
- * Re-entrant for this process: the second call for the same instance is a
- * no-op. Reclaiming a stale lease is not reported as a conflict.
+ * Re-entrant for this process: a second call for the same endpoint is a no-op.
+ * Reclaiming a stale lease is not reported as a conflict.
  */
-export function acquireLease(instance: string): AcquireResult {
-  const existing = held.get(instance);
-  if (existing) return { ok: true, reclaimed: false };
+export function acquireLease(instanceId: string, host: string, port: number): AcquireResult {
+  const key = leaseKey(host, port);
+  if (held.has(key)) return { ok: true, reclaimed: false };
 
   const info: LeaseInfo = {
-    instance,
+    instance: instanceId,
+    endpoint: `${host}:${port}`,
     pid: process.pid,
     host: hostname(),
     started_at: Date.now(),
@@ -137,58 +165,48 @@ export function acquireLease(instance: string): AcquireResult {
     token: `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   };
 
-  if (writeLease(info)) {
-    held.set(instance, { info, timer: startHeartbeat(info) });
-    return { ok: true, reclaimed: false };
-  }
+  if (writeLease(key, info)) return take(key, info, host, port, false);
 
-  const current = readLease(instance);
+  const current = readLease(key);
   if (!current) {
-    // Unreadable/corrupt or removed between EEXIST and read: retry once.
-    if (writeLease(info)) {
-      held.set(instance, { info, timer: startHeartbeat(info) });
-      return { ok: true, reclaimed: false };
-    }
+    // Corrupt or removed between EEXIST and read: retry once.
+    if (writeLease(key, info)) return take(key, info, host, port, false);
     return { ok: false, holder: null };
   }
 
-  if (!isStale(current)) {
-    return { ok: false, holder: current };
-  }
+  if (!isStale(current)) return { ok: false, holder: current };
 
   try {
-    unlinkSync(leasePath(instance));
+    unlinkSync(leasePath(key));
   } catch {
     // Someone else removed it first.
   }
-  if (writeLease(info)) {
-    held.set(instance, { info, timer: startHeartbeat(info) });
-    return { ok: true, reclaimed: true };
-  }
-  return { ok: false, holder: readLease(instance) };
+  if (writeLease(key, info)) return take(key, info, host, port, true);
+  return { ok: false, holder: readLease(key) };
 }
 
-/** True when this process currently owns the instance. */
-export function ownsLease(instance: string): boolean {
-  return held.has(instance);
+/** True when this process owns the endpoint. */
+export function ownsLease(host: string, port: number): boolean {
+  return held.has(leaseKey(host, port));
 }
 
-/** Read-only view: the live holder of `instance`, or null if it is free. */
-export function peekLease(instance: string): LeaseInfo | null {
-  const info = readLease(instance);
+/** Read-only view: the live holder of an endpoint, or null if it is free. */
+export function peekLease(host: string, port: number): LeaseInfo | null {
+  const info = readLease(leaseKey(host, port));
   if (!info) return null;
   return isStale(info) ? null : info;
 }
 
-export function releaseLease(instance: string): void {
-  const entry = held.get(instance);
+export function releaseLease(host: string, port: number): void {
+  const key = leaseKey(host, port);
+  const entry = held.get(key);
   if (!entry) return;
   clearInterval(entry.timer);
-  held.delete(instance);
-  const current = readLease(instance);
+  held.delete(key);
+  const current = readLease(key);
   if (current?.token === entry.info.token) {
     try {
-      unlinkSync(leasePath(instance));
+      unlinkSync(leasePath(key));
     } catch {
       // Already gone.
     }
@@ -196,14 +214,16 @@ export function releaseLease(instance: string): void {
 }
 
 export function releaseAllLeases(): void {
-  for (const instance of [...held.keys()]) releaseLease(instance);
+  for (const entry of [...held.values()]) {
+    releaseLease(entry.host, entry.port);
+  }
 }
 
 /** Describe a holder for an error message. */
 export function describeHolder(info: LeaseInfo): string {
   const age = Math.round((Date.now() - info.started_at) / 1000);
-  return `pid ${info.pid} on ${info.host}, holding it for ${age}s`;
+  return `pid ${info.pid} on ${info.host}, holding ${info.endpoint} for ${age}s`;
 }
 
-// A killed process cannot run handlers; these cover the normal exits.
+// A killed process cannot run handlers; this covers the normal exit.
 process.on('exit', releaseAllLeases);

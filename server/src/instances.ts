@@ -165,6 +165,23 @@ function build(): void {
     }
   }
 
+  // Two ids pointing at one endpoint would be two names for one debugger. The
+  // lease is keyed by endpoint so they cannot corrupt each other, but the second
+  // id is also useless and confusing - say so at startup.
+  const byEndpoint = new Map<string, string>();
+  for (const inst of registry.values()) {
+    const ep = `${inst.host}:${inst.port}`;
+    const other = byEndpoint.get(ep);
+    if (other) {
+      console.error(
+        `[x64dbg-mcp] instances "${other}" and "${inst.id}" both point at ${ep}; ` +
+        'they are the same debugger and will share one lease.'
+      );
+    } else {
+      byEndpoint.set(ep, inst.id);
+    }
+  }
+
   // The default is the one X64DBG_MCP_INSTANCE names, else the first declared.
   const wanted = process.env.X64DBG_MCP_INSTANCE?.trim();
   if (wanted && registry.has(wanted)) {
@@ -181,6 +198,24 @@ function build(): void {
 }
 
 let defaultId = DEFAULT_INSTANCE_ID;
+
+/**
+ * Whether the default instance is settled for this process.
+ *
+ * Set by auto-assignment (success, or "there is nothing to choose"), and by an
+ * explicit x64dbg_instances action=use - an explicit choice must not be
+ * overridden by a later auto-assignment. Lives here rather than in index.ts so
+ * the tool modules can set it without importing the server entry point.
+ */
+let defaultChosenFlag = false;
+
+export function markDefaultChosen(): void {
+  defaultChosenFlag = true;
+}
+
+export function defaultChosen(): boolean {
+  return defaultChosenFlag;
+}
 
 export function listInstances(): InstanceEndpoint[] {
   return [...registry.values()];
@@ -227,6 +262,17 @@ export function setDefaultInstance(id: string): InstanceEndpoint {
 
 export function isMultiInstance(): boolean {
   return registry.size > 1;
+}
+
+/** ids that share an endpoint with another id, keyed by "host:port". */
+export function duplicateEndpoints(): Map<string, string[]> {
+  const byEp = new Map<string, string[]>();
+  for (const inst of registry.values()) {
+    const ep = `${inst.host}:${inst.port}`;
+    byEp.set(ep, [...(byEp.get(ep) ?? []), inst.id]);
+  }
+  for (const [ep, ids] of byEp) if (ids.length < 2) byEp.delete(ep);
+  return byEp;
 }
 
 /**

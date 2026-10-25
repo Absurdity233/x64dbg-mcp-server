@@ -7,10 +7,12 @@ import { httpClient } from './http_client.js';
 import { runWithInstance } from './context.js';
 import {
   applyX64dbgPathOverride,
+  defaultChosen,
   getDefaultInstance,
   getInstance,
   isMultiInstance,
   listInstances,
+  markDefaultChosen,
   setDefaultInstance,
   type InstanceEndpoint,
 } from './instances.js';
@@ -71,7 +73,8 @@ function compactJsonBlocks(result: any): void {
  * else owns. Independent Claude Code sessions then land on different debuggers
  * without any per-session configuration. Done once, on the first call.
  */
-let autoAssigned = false;
+// These two live in instances.ts so the "use" tool does not have to import
+// this module, which would create a cycle (index -> tools -> index).
 
 async function pluginAnswers(instance: InstanceEndpoint): Promise<boolean> {
   try {
@@ -89,14 +92,19 @@ async function pluginAnswers(instance: InstanceEndpoint): Promise<boolean> {
 }
 
 async function autoAssignDefaultInstance(): Promise<void> {
-  if (autoAssigned) return;
-  autoAssigned = true;
-  if (!config.lease || !isMultiInstance() || process.env.X64DBG_MCP_INSTANCE) return;
+  if (defaultChosen()) return;
+  if (!config.lease || !isMultiInstance() || process.env.X64DBG_MCP_INSTANCE) {
+    // Nothing to choose between: latch so this check is not repeated.
+    markDefaultChosen();
+    return;
+  }
 
-  const free = listInstances().filter((i) => ownsLease(i.id) || !peekLease(i.id));
+  const free = listInstances().filter((i) => ownsLease(i.host, i.port) || !peekLease(i.host, i.port));
   if (!free.length) {
+    // Not latched: another session may release an instance a minute from now,
+    // and this one should be able to pick it up instead of failing forever.
     console.error(
-      '[x64dbg-mcp] every instance is leased by another session; tool calls will name the holder. ' +
+      '[x64dbg-mcp] every instance is leased by another session; will retry on the next call. ' +
       'Provision more instances, or set X64DBG_MCP_LEASE=off.'
     );
     return;
@@ -105,21 +113,26 @@ async function autoAssignDefaultInstance(): Promise<void> {
   // Prefer one that is actually running: a leased-but-stopped instance would
   // just stall the first call for the whole wait budget.
   const probed = await Promise.all(free.map(async (i) => ({ i, up: await pluginAnswers(i) })));
-  const ranked = [...probed].sort((a, b) => Number(b.up) - Number(a.up));
+  const alive = probed.filter((p) => p.up);
+  // Claiming an instance whose plugin is not running means the very next call
+  // stalls for the whole wait budget. Only fall back to a dead one when nothing
+  // is alive, since the launcher may still start it.
+  const ranked = alive.length ? alive : [...probed].sort((a, b) => Number(b.up) - Number(a.up));
 
   // Lease as part of claiming. Two sessions that both merely *pick* the same
   // free instance would race on the first real call and one would be blocked;
   // taking the lease here makes the choice atomic.
   for (const { i, up } of ranked) {
-    if (!acquireLease(i.id).ok) continue;
+    if (!acquireLease(i.id, i.host, i.port).ok) continue;
+    markDefaultChosen();
     setDefaultInstance(i.id);
     console.error(
       `[x64dbg-mcp] auto-claimed instance "${i.id}" for this session` +
-      (up ? '' : ' (no plugin is answering yet)')
+      (up ? '' : ' (WARNING: no plugin is answering; calls will wait then fail)')
     );
     return;
   }
-  console.error('[x64dbg-mcp] lost the race for every free instance; calls will name the holder.');
+  console.error('[x64dbg-mcp] lost the race for every free instance; will retry on the next call.');
 }
 
 /**
@@ -178,7 +191,7 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
         // Ownership, not just routing. x64dbg_instances is exempt: it is the
         // diagnostic used to find out who holds what.
         if (config.lease && toolName !== 'x64dbg_instances') {
-          const lease = acquireLease(instance.id);
+          const lease = acquireLease(instance.id, instance.host, instance.port);
           if (!lease.ok) {
             const who = lease.holder ? describeHolder(lease.holder) : 'another process';
             return {

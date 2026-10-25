@@ -77,9 +77,13 @@ Two models on one x64dbg corrupt each other silently: breakpoints collide, one
 `run` clears the other's paused state, and both event streams mix. So an
 instance is **leased** to one MCP server process at a time.
 
-- A lease is a file (`%TEMP%\x64dbg-mcp\leases\<id>.lease`) naming the owner
-  pid, refreshed every 10s. Works across independent Claude Code sessions,
-  which are separate processes.
+- A lease is a file (`%TEMP%\x64dbg-mcp\leases\ep_<host>_<port>.lease`) naming
+  the owner pid, refreshed every 10s. Works across independent Claude Code
+  sessions, which are separate processes.
+- **Keyed by endpoint, not by instance id.** Two ids can name one debugger
+  (a duplicate entry, or a copy provisioned onto the default's port); keyed by
+  id they would hold two "different" leases over one x64dbg. `x64dbg_instances
+  list` marks such ids with `shared_with`, and startup logs a warning.
 - A stale lease (owner gone, or heartbeat older than 35s) is reclaimed.
 - A call on a leased instance fails with the holder's pid and age:
   `Instance "inst2" is in use by pid 53520 on DESKTOP-..., holding it for 16s.`

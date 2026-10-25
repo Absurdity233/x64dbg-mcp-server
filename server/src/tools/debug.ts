@@ -81,6 +81,47 @@ async function attachCommand(pid: string): Promise<{ command: string; exec: any 
   return { command: dotted, exec };
 }
 
+/**
+ * Refuse to load a path another instance is already debugging.
+ *
+ * Most Windows programs resolve Config/, Logs/ and save files from the module
+ * path, so two debuggers on the same exe overwrite each other. Returns a tool
+ * result to pass through, or null when the load may proceed.
+ */
+function sharedTargetConflict(file: string): { content: Array<{ type: 'text'; text: string }>; isError: true } | null {
+  if (config.allowSharedTarget) return null;
+  const existing = findTargetClaim(file);
+  if (!existing || existing.instance === currentInstance().id) return null;
+
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        action: 'load',
+        path: file,
+        loaded: false,
+        conflict: { instance: existing.instance, pid: existing.pid, host: existing.host },
+        message:
+          `"${file}" is already being debugged by instance "${existing.instance}" ` +
+          `(pid ${existing.pid}). Both runs would share Config/ and Logs/. ` +
+          'Clone the folder with scripts/provision-target.ps1 and load the copy, ' +
+          'or set X64DBG_MCP_ALLOW_SHARED_TARGET=1 if that is intended.',
+      }, null, 2),
+    }],
+    isError: true as const,
+  };
+}
+
+/** Record that this instance now owns `file`, keyed by the debuggee pid. */
+async function claimLoadedTarget(file: string): Promise<void> {
+  try {
+    const info = await httpClient.get<{ pid?: number }>('/api/process/info');
+    if (info?.pid) claimTarget(file, currentInstance().id, info.pid);
+  } catch {
+    // Advisory bookkeeping only - never fail a load over it.
+  }
+}
+
 export function registerDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_debug',
@@ -178,12 +219,20 @@ export function registerDebugTools(server: McpServer) {
           }
 
           const file = info.path;
+
+          // recover reloads the binary exactly like load does, so it must go
+          // through the same shared-target check - otherwise a crashed session
+          // could be "recovered" onto an executable another instance is running.
+          const guard = sharedTargetConflict(file);
+          if (guard) return guard;
+
           const command = info.cmdline
             ? `init ${quoteArg(file)}, ${quoteArg(info.cmdline)}`
             : `init ${quoteArg(file)}`;
           await httpClient.post('/api/command/exec', { command });
           const started = await waitForState('paused', timeout_ms ?? 60000, poll_ms ?? 200);
           if (started.reached) await consume();
+          if (started.reached) await claimLoadedTarget(file);
 
           const specs = sessionBreakpoints();
           const rearmed: Array<{ address: string; ok: boolean; error?: string }> = [];
@@ -344,35 +393,8 @@ export function registerDebugTools(server: McpServer) {
             const file = requireString(path, 'path');
             loadedPath = file;
 
-            // Two debuggers on the same executable share Config/ and Logs/,
-            // because those resolve from the module path. Different binaries
-            // are fine; the same path silently corrupts both runs.
-            if (!config.allowSharedTarget) {
-              const existing = findTargetClaim(file);
-              if (existing && existing.instance !== currentInstance().id) {
-                return {
-                  content: [{
-                    type: 'text',
-                    text: JSON.stringify({
-                      action,
-                      path: file,
-                      loaded: false,
-                      conflict: {
-                        instance: existing.instance,
-                        pid: existing.pid,
-                        host: existing.host,
-                      },
-                      message:
-                        `"${file}" is already being debugged by instance "${existing.instance}" ` +
-                        `(pid ${existing.pid}). Both runs would share Config/ and Logs/. ` +
-                        'Clone the folder with scripts/provision-target.ps1 and load the copy, ' +
-                        'or set X64DBG_MCP_ALLOW_SHARED_TARGET=1 if that is intended.',
-                    }, null, 2),
-                  }],
-                  isError: true,
-                };
-              }
-            }
+            const guard = sharedTargetConflict(file);
+            if (guard) return guard;
 
             command = cmdline ? `init ${quoteArg(file)}, ${quoteArg(cmdline)}` : `init ${quoteArg(file)}`;
             exec = await httpClient.post('/api/command/exec', { command });
@@ -398,14 +420,7 @@ export function registerDebugTools(server: McpServer) {
           // Record which live process owns this path. Keyed by the debuggee pid,
           // so the claim expires when the target dies even if the agent is still
           // running.
-          if (loadedPath && waited.reached) {
-            try {
-              const info = await httpClient.get<{ pid?: number }>('/api/process/info');
-              if (info?.pid) claimTarget(loadedPath, currentInstance().id, info.pid);
-            } catch {
-              // Advisory bookkeeping only - never fail a load over it.
-            }
-          }
+          if (loadedPath && waited.reached) await claimLoadedTarget(loadedPath);
 
           return {
             content: [{

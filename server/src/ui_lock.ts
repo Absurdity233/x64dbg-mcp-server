@@ -131,12 +131,12 @@ export async function withUiLock<T>(
   };
 
   const started = Date.now();
-  let stealAllowed = true;
   for (;;) {
-    if (acquireOnce(holder, stealAllowed)) break;
-    // A failed steal means the holder is alive; stop trying to unlink its file
-    // on every poll and just queue.
-    stealAllowed = false;
+    // Steal checking is cheap (read + pid probe) and must stay enabled for the
+    // whole wait: the previous holder may die *while* we are queueing, and with
+    // stealing disabled after the first attempt the waiter would then sit out
+    // the entire timeout on a lock nobody owns.
+    if (acquireOnce(holder, true)) break;
 
     if (Date.now() - started >= timeoutMs) {
       const current = readHolder();
