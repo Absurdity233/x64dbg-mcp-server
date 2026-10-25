@@ -11,8 +11,10 @@ import {
   getInstance,
   isMultiInstance,
   listInstances,
+  setDefaultInstance,
   type InstanceEndpoint,
 } from './instances.js';
+import { acquireLease, describeHolder, ownsLease, peekLease, releaseAllLeases } from './lease.js';
 import { ensureX64dbg } from './launcher.js';
 import { checkPluginCompat } from './compat.js';
 import { getVersion } from './version.js';
@@ -65,6 +67,62 @@ function compactJsonBlocks(result: any): void {
 }
 
 /**
+ * With several instances and no explicit default, take the first one nobody
+ * else owns. Independent Claude Code sessions then land on different debuggers
+ * without any per-session configuration. Done once, on the first call.
+ */
+let autoAssigned = false;
+
+async function pluginAnswers(instance: InstanceEndpoint): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 700);
+    const res = await fetch(`http://${instance.host}:${instance.port}/api/health`, {
+      headers: instance.token ? { Authorization: `Bearer ${instance.token}` } : {},
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function autoAssignDefaultInstance(): Promise<void> {
+  if (autoAssigned) return;
+  autoAssigned = true;
+  if (!config.lease || !isMultiInstance() || process.env.X64DBG_MCP_INSTANCE) return;
+
+  const free = listInstances().filter((i) => ownsLease(i.id) || !peekLease(i.id));
+  if (!free.length) {
+    console.error(
+      '[x64dbg-mcp] every instance is leased by another session; tool calls will name the holder. ' +
+      'Provision more instances, or set X64DBG_MCP_LEASE=off.'
+    );
+    return;
+  }
+
+  // Prefer one that is actually running: a leased-but-stopped instance would
+  // just stall the first call for the whole wait budget.
+  const probed = await Promise.all(free.map(async (i) => ({ i, up: await pluginAnswers(i) })));
+  const ranked = [...probed].sort((a, b) => Number(b.up) - Number(a.up));
+
+  // Lease as part of claiming. Two sessions that both merely *pick* the same
+  // free instance would race on the first real call and one would be blocked;
+  // taking the lease here makes the choice atomic.
+  for (const { i, up } of ranked) {
+    if (!acquireLease(i.id).ok) continue;
+    setDefaultInstance(i.id);
+    console.error(
+      `[x64dbg-mcp] auto-claimed instance "${i.id}" for this session` +
+      (up ? '' : ' (no plugin is answering yet)')
+    );
+    return;
+  }
+  console.error('[x64dbg-mcp] lost the race for every free instance; calls will name the holder.');
+}
+
+/**
  * One wrapper for every tool registration.
  *
  * It does three things the 25 tool files should not each have to know about:
@@ -104,15 +162,38 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
       }
 
       args[args.length - 1] = async (...callArgs: any[]) => {
+        const toolName = String(args[0]);
         const raw = (callArgs[0] ?? {}) as Record<string, unknown>;
         let instance: InstanceEndpoint;
         try {
+          if (!raw.instance) await autoAssignDefaultInstance();
           instance = getInstance(typeof raw.instance === 'string' ? raw.instance : undefined);
         } catch (err) {
           return {
             content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
             isError: true,
           };
+        }
+
+        // Ownership, not just routing. x64dbg_instances is exempt: it is the
+        // diagnostic used to find out who holds what.
+        if (config.lease && toolName !== 'x64dbg_instances') {
+          const lease = acquireLease(instance.id);
+          if (!lease.ok) {
+            const who = lease.holder ? describeHolder(lease.holder) : 'another process';
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Instance "${instance.id}" is in use by ${who}. ` +
+                  'Two models driving one x64dbg corrupt each other: breakpoints collide, one run ' +
+                  'clears the other\'s paused state, and both event streams mix. ' +
+                  'Use a different instance (x64dbg_instances action=list), wait, or set ' +
+                  'X64DBG_MCP_LEASE=off to disable ownership enforcement.',
+              }],
+              isError: true,
+            };
+          }
         }
 
         // Handlers do not need to know the field exists.
@@ -213,6 +294,7 @@ async function main() {
   // Graceful shutdown
   const cleanup = () => {
     httpClient.destroy();
+    releaseAllLeases();
     process.exit(0);
   };
   process.on('SIGINT', cleanup);

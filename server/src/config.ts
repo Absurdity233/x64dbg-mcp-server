@@ -51,6 +51,13 @@ export const config = {
   waitMs: parseWait(process.env.X64DBG_MCP_WAIT_MS),
   // Response formatting (see parseCompact).
   compact: parseCompact(process.env.X64DBG_MCP_COMPACT),
+  // Refuse to drive an instance another live process owns (X64DBG_MCP_LEASE=off
+  // restores the old advisory behaviour).
+  lease: (process.env.X64DBG_MCP_LEASE ?? '').trim().toLowerCase() !== 'off',
+  // Allow two instances to debug the same executable path, which shares its
+  // Config/ and Logs/ (X64DBG_MCP_ALLOW_SHARED_TARGET=1).
+  allowSharedTarget:
+    ['1', 'true', 'on'].includes((process.env.X64DBG_MCP_ALLOW_SHARED_TARGET ?? '').trim().toLowerCase()),
 };
 
 export function getBaseUrl(): string {

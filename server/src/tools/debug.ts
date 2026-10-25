@@ -1,8 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { config } from '../config.js';
+import { currentInstance } from '../context.js';
 import { httpClient } from '../http_client.js';
 import { waitFor, describe, consume, resetCursor } from '../events.js';
 import { recordLaunch, launchInfo, breakpoints as sessionBreakpoints, noteRecovery } from '../session.js';
+import { claimTarget, findTargetClaim, releaseTarget } from '../target_claims.js';
 import { requireString, quoteArg } from './util.js';
 
 const SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -284,6 +287,8 @@ export function registerDebugTools(server: McpServer) {
           // The next session clears the plugin buffer, but our cursor must not
           // lag behind or the first wait_for_event would replay old events.
           resetCursor();
+          const info = launchInfo();
+          if (info.path) releaseTarget(info.path);
           return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
         }
 
@@ -333,9 +338,42 @@ export function registerDebugTools(server: McpServer) {
         case 'attach': {
           let command: string;
           let exec: any;
+          let loadedPath: string | null = null;
 
           if (action === 'load') {
             const file = requireString(path, 'path');
+            loadedPath = file;
+
+            // Two debuggers on the same executable share Config/ and Logs/,
+            // because those resolve from the module path. Different binaries
+            // are fine; the same path silently corrupts both runs.
+            if (!config.allowSharedTarget) {
+              const existing = findTargetClaim(file);
+              if (existing && existing.instance !== currentInstance().id) {
+                return {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                      action,
+                      path: file,
+                      loaded: false,
+                      conflict: {
+                        instance: existing.instance,
+                        pid: existing.pid,
+                        host: existing.host,
+                      },
+                      message:
+                        `"${file}" is already being debugged by instance "${existing.instance}" ` +
+                        `(pid ${existing.pid}). Both runs would share Config/ and Logs/. ` +
+                        'Clone the folder with scripts/provision-target.ps1 and load the copy, ' +
+                        'or set X64DBG_MCP_ALLOW_SHARED_TARGET=1 if that is intended.',
+                    }, null, 2),
+                  }],
+                  isError: true,
+                };
+              }
+            }
+
             command = cmdline ? `init ${quoteArg(file)}, ${quoteArg(cmdline)}` : `init ${quoteArg(file)}`;
             exec = await httpClient.post('/api/command/exec', { command });
             // Remember how we started it so recover() can rebuild the session.
@@ -357,6 +395,18 @@ export function registerDebugTools(server: McpServer) {
           // wait_for_event.
           const startup = waited.reached ? await consume() : { events: [], dropped: 0 };
 
+          // Record which live process owns this path. Keyed by the debuggee pid,
+          // so the claim expires when the target dies even if the agent is still
+          // running.
+          if (loadedPath && waited.reached) {
+            try {
+              const info = await httpClient.get<{ pid?: number }>('/api/process/info');
+              if (info?.pid) claimTarget(loadedPath, currentInstance().id, info.pid);
+            } catch {
+              // Advisory bookkeeping only - never fail a load over it.
+            }
+          }
+
           return {
             content: [{
               type: 'text',
@@ -373,10 +423,13 @@ export function registerDebugTools(server: McpServer) {
           };
         }
 
-        case 'detach':
+        case 'detach': {
+          const info = launchInfo();
+          if (info.path) releaseTarget(info.path);
           endpoint = '/api/command/exec';
           payload = { command: 'detach' };
           break;
+        }
 
         case 'wait_for_pause': {
           const result = await waitForState('paused', timeout_ms ?? 120000, poll_ms ?? 200);

@@ -6,7 +6,20 @@ import {
   setDefaultInstance,
   type InstanceEndpoint,
 } from '../instances.js';
+import { ownsLease, peekLease, releaseLease } from '../lease.js';
 import { requireString } from './util.js';
+
+/** 'ours' | 'free' | the live holder. */
+function leaseView(instance: InstanceEndpoint): unknown {
+  if (ownsLease(instance.id)) return 'ours';
+  const holder = peekLease(instance.id);
+  if (!holder) return 'free';
+  return {
+    pid: holder.pid,
+    host: holder.host,
+    held_for_s: Math.round((Date.now() - holder.started_at) / 1000),
+  };
+}
 
 /**
  * Inventory of the x64dbg processes this MCP server can drive.
@@ -67,10 +80,10 @@ async function probe(inst: InstanceEndpoint): Promise<Probe> {
 export function registerInstanceTools(server: McpServer) {
   server.tool(
     'x64dbg_instances',
-    'Inspect and select x64dbg instances. Actions: list (every configured instance, whether its plugin answers, and what it is debugging), use (make one the default for this MCP server process), status (detail for one instance). Every other tool accepts an optional "instance" argument when more than one is configured.',
+    'Inspect and select x64dbg instances. Actions: list (every configured instance, whether its plugin answers, what it is debugging, and who owns it), use (make one the default for this MCP server process), release (give up ownership so another session can use it), status (detail for one instance). Every other tool accepts an optional "instance" argument when more than one is configured.',
     {
-      action: z.enum(['list', 'use', 'status']).describe('Operation to perform'),
-      id: z.string().optional().describe('use/status: instance id'),
+      action: z.enum(['list', 'use', 'status', 'release']).describe('Operation to perform'),
+      id: z.string().optional().describe('use/status/release: instance id'),
     },
     async (args) => {
       switch (args.action) {
@@ -83,6 +96,7 @@ export function registerInstanceTools(server: McpServer) {
               endpoint: `${inst.host}:${inst.port}`,
               x64dbgPath: inst.x64dbgPath,
               default: inst.id === defaultId,
+              lease: leaseView(inst),
               ...(await probe(inst)),
             }))
           );
@@ -96,6 +110,25 @@ export function registerInstanceTools(server: McpServer) {
 
         case 'use': {
           const id = requireString(args.id, 'id');
+          // Switching to an instance another session owns would make every
+          // following call fail; say so here rather than one call later.
+          const holder = !ownsLease(id) ? peekLease(id) : null;
+          if (holder) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  default: getDefaultInstance().id,
+                  switched: false,
+                  owner: { pid: holder.pid, host: holder.host, held_for_s: Math.round((Date.now() - holder.started_at) / 1000) },
+                  message:
+                    `"${id}" is owned by another session. Pick a free instance from action=list, ` +
+                    'or ask that session to run action=release.',
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
           const inst = setDefaultInstance(id);
           return {
             content: [{
@@ -103,6 +136,7 @@ export function registerInstanceTools(server: McpServer) {
               text: JSON.stringify({
                 default: inst.id,
                 endpoint: `${inst.host}:${inst.port}`,
+                switched: true,
                 note: 'Applies to tool calls in this MCP server process that omit "instance".',
               }, null, 2),
             }],
@@ -121,7 +155,30 @@ export function registerInstanceTools(server: McpServer) {
           return {
             content: [{
               type: 'text',
-              text: JSON.stringify({ id: inst.id, endpoint: `${inst.host}:${inst.port}`, ...(await probe(inst)) }, null, 2),
+              text: JSON.stringify({
+                id: inst.id,
+                endpoint: `${inst.host}:${inst.port}`,
+                lease: leaseView(inst),
+                ...(await probe(inst)),
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'release': {
+          const id = requireString(args.id, 'id');
+          const owned = ownsLease(id);
+          if (owned) releaseLease(id);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                id,
+                released: owned,
+                note: owned
+                  ? 'Another session can claim it now.'
+                  : 'This process does not hold that lease.',
+              }, null, 2),
             }],
           };
         }

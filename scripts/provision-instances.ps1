@@ -154,19 +154,40 @@ for ($n = $StartIndex; $n -lt ($StartIndex + $Count); $n++) {
     }
 }
 
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+
 $manifest = Join-Path $Dest 'instances.json'
 $json = $entries | ConvertTo-Json -Depth 5
 # ConvertTo-Json emits an object instead of an array for a single element.
 if ($entries.Count -eq 1) { $json = "[$json]" }
-[System.IO.File]::WriteAllText($manifest, $json, (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText($manifest, $json, $utf8)
+
+# Stable manifest that the MCP server reads on its own when
+# X64DBG_MCP_INSTANCES is not set, so provisioning needs no .claude.json edit.
+# Merged by id: running with -StartIndex 4 must not drop instances 1..3.
+$stableDir = Join-Path $env:USERPROFILE '.x64dbg-mcp'
+$stable = Join-Path $stableDir 'instances.json'
+$all = @()
+if (Test-Path -LiteralPath $stable) {
+    try {
+        $all = @(Get-Content -LiteralPath $stable -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        Write-Host "warning: existing $stable is not valid JSON; replacing it"
+        $all = @()
+    }
+}
+$newIds = @($entries | ForEach-Object { $_.id })
+$all = @($all | Where-Object { $_.id -notin $newIds }) + $entries
+$allJson = $all | ConvertTo-Json -Depth 5
+if (@($all).Count -eq 1) { $allJson = "[$allJson]" }
+New-Item -ItemType Directory -Force -Path $stableDir | Out-Null
+[System.IO.File]::WriteAllText($stable, $allJson, $utf8)
 
 Write-Host ''
 Write-Host "Manifest: $manifest"
-Write-Host ''
-Write-Host 'Add this to the MCP server entry in .claude.json (env block):'
-Write-Host ''
-Write-Host '  "X64DBG_MCP_INSTANCES": ' -NoNewline
-Write-Host ($json -replace "`r?`n", '') -ForegroundColor Cyan
+Write-Host "Auto-loaded manifest: $stable"
+Write-Host 'The MCP server reads that file when X64DBG_MCP_INSTANCES is unset -'
+Write-Host 'no .claude.json edit needed. Explicit env vars still take precedence.'
 Write-Host ''
 Write-Host 'Launch each instance (x64dbg.exe reads the ini next to it):'
 foreach ($e in $entries) { Write-Host ("  Start-Process `"{0}`"" -f $e.x64dbgPath) }

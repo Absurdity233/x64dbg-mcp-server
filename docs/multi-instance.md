@@ -20,7 +20,13 @@ the default port.
 
 The script prints the JSON to paste into `.claude.json`.
 
-## 2. Configure the MCP server
+Provisioning also writes `%USERPROFILE%\.x64dbg-mcp\instances.json`. The MCP
+server reads that file automatically and **adds** those instances on top of the
+default one, so the common case needs no configuration at all: run the script,
+restart Claude Code, and the new instances appear. `X64DBG_MCP_INSTANCES`
+overrides the file completely when set.
+
+## 2. Configure the MCP server (optional)
 
 ```json
 "x64dbg-bromoket": {
@@ -63,6 +69,43 @@ exists to prevent.
 
 Every response ends with `[state] ... [instance <id>]`, so the transcript shows
 which debugger answered.
+
+## Exclusive ownership
+
+Routing alone does not stop two sessions from pointing at the same debugger.
+Two models on one x64dbg corrupt each other silently: breakpoints collide, one
+`run` clears the other's paused state, and both event streams mix. So an
+instance is **leased** to one MCP server process at a time.
+
+- A lease is a file (`%TEMP%\x64dbg-mcp\leases\<id>.lease`) naming the owner
+  pid, refreshed every 10s. Works across independent Claude Code sessions,
+  which are separate processes.
+- A stale lease (owner gone, or heartbeat older than 35s) is reclaimed.
+- A call on a leased instance fails with the holder's pid and age:
+  `Instance "inst2" is in use by pid 53520 on DESKTOP-..., holding it for 16s.`
+- With several instances and no `X64DBG_MCP_INSTANCE`, the first call claims a
+  free instance atomically, preferring one whose plugin is answering. Three
+  sessions, two instances: the third gets the explicit error above rather than
+  quietly sharing.
+- `x64dbg_instances action=release id=<id>` gives it up; `list` shows
+  `lease: "ours" | "free" | {pid, ...}`.
+- `X64DBG_MCP_LEASE=off` disables enforcement.
+
+## Shared target files are refused
+
+Most Windows programs resolve `Config/`, `Logs/` and save files from the module
+path, so two debuggers on the same exe overwrite each other. `load` records a
+claim keyed by the **debuggee pid** (so it expires with the process) and refuses
+a second instance loading the same path:
+
+```text
+"C:\...\xxoo.exe" is already being debugged by instance "inst2" (pid 25960).
+Both runs would share Config/ and Logs/. Clone the folder with
+scripts/provision-target.ps1 and load the copy, or set
+X64DBG_MCP_ALLOW_SHARED_TARGET=1 if that is intended.
+```
+
+The claim is released on `stop_debug` and `detach`.
 
 ## What is isolated
 

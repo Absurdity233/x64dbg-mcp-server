@@ -204,10 +204,15 @@ function Get-HumanActivity {
   $recent = (-not $ours) -and ($idle -ge 0) -and ($idle -lt $script:GuardMs)
   $moving = $false
   if ($recent) {
-    $a = Get-CursorPosNow
-    Start-Sleep -Milliseconds 80
-    $b = Get-CursorPosNow
-    $moving = ($a.X -ne $b.X -or $a.Y -ne $b.Y)
+    # Three samples: a two-sample check misses an oscillation that happens to
+    # return to the same pixel.
+    $prev = Get-CursorPosNow
+    for ($i = 0; $i -lt 2; $i++) {
+      Start-Sleep -Milliseconds 60
+      $next = Get-CursorPosNow
+      if ($next.X -ne $prev.X -or $next.Y -ne $prev.Y) { $moving = $true; break }
+      $prev = $next
+    }
   }
   return [pscustomobject]@{ IdleMs = $idle; Recent = $recent; Moving = $moving; Ours = $ours }
 }
@@ -639,7 +644,6 @@ function Invoke-PostClick([int]$cx, [int]$cy) {
   # works with the window in the background and never touches the global cursor.
   # Use it whenever the target handles WM_LBUTTONDOWN normally; fall back to
   # Invoke-RealClick for apps that read raw input / GetAsyncKeyState.
-  Assert-NoHumanActivity 'click'
   $t = Resolve-InputTarget $cx $cy
   $script:LastTarget = $t.H
   $lp = [IntPtr](($t.Y -shl 16) -bor ($t.X -band 0xFFFF))
@@ -656,7 +660,6 @@ function Invoke-UiClick([int]$cx, [int]$cy) {
 }
 
 function Invoke-RealClick([int]$cx, [int]$cy) {
-  Assert-NoHumanActivity 'move the cursor and click'
   $focused = Focus-Target
   if (-not $focused -and [MCPUI.U]::GetForegroundWindow() -ne $script:h) {
     throw "cannot click: the target window is not in the foreground and cannot be activated"
@@ -680,7 +683,6 @@ function Invoke-RealClick([int]$cx, [int]$cy) {
 }
 
 function Invoke-Type([string]$s) {
-  Assert-NoHumanActivity 'type'
   # WM_CHAR is posted to the window, so it does not need focus. Only the real
   # mode insists on the foreground, because that is the mode that pretends to
   # be a user typing.
@@ -842,6 +844,9 @@ function Invoke-UiAction {
   }
 
   'clicktext' {
+    # Checked before OCR: no point spending ~200ms recognising a window the
+    # model is not allowed to touch.
+    Assert-NoHumanActivity 'click'
     $ocr = Invoke-Ocr
     $found = Find-Text $ocr $Match -UseRegex:$Regex
     if ($found.Words.Count -eq 0) {
@@ -857,6 +862,9 @@ function Invoke-UiAction {
   }
 
   'typeinto' {
+    # One check for the whole click+type sequence: checking again between them
+    # could abort after the click, leaving a half-applied action.
+    Assert-NoHumanActivity 'click and type'
     # Click the element carrying -Match (by OCR), then type -Text into it.
     #
     # Two-step is not enough for inputs with a placeholder: clicking the label
@@ -889,11 +897,20 @@ function Invoke-UiAction {
     Write-Output (Invoke-Type $Text)
   }
 
-  'click' { Write-Output (Invoke-PostClick $X $Y) }
+  'click' {
+    Assert-NoHumanActivity 'click'
+    Write-Output (Invoke-PostClick $X $Y)
+  }
 
-  'realclick' { Write-Output (Invoke-RealClick $X $Y) }
+  'realclick' {
+    Assert-NoHumanActivity 'move the cursor and click'
+    Write-Output (Invoke-RealClick $X $Y)
+  }
 
-  'type' { Write-Output (Invoke-Type $Text) }
+  'type' {
+    Assert-NoHumanActivity 'type'
+    Write-Output (Invoke-Type $Text)
+  }
 
   'key' {
     Assert-NoHumanActivity 'send a key'

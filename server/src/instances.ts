@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { config } from './config.js';
 
 /**
@@ -94,20 +96,73 @@ function register(inst: InstanceEndpoint): void {
   registry.set(inst.id, inst);
 }
 
+/**
+ * A manifest written by scripts/provision-instances.ps1, so provisioning is
+ * self-wiring: no X64DBG_MCP_INSTANCES edit in .claude.json is needed. Only
+ * consulted when the env var is unset, so explicit configuration always wins.
+ */
+function readManifest(): { text: string; path: string } | null {
+  const candidates = [
+    process.env.X64DBG_MCP_MANIFEST,
+    process.env.USERPROFILE ? join(process.env.USERPROFILE, '.x64dbg-mcp', 'instances.json') : undefined,
+  ].filter((p): p is string => !!p);
+
+  for (const path of candidates) {
+    try {
+      return { text: readFileSync(path, 'utf8'), path };
+    } catch {
+      // Not there - try the next location.
+    }
+  }
+  return null;
+}
+
 function build(): void {
   registry.clear();
-  const parsed = parseInstances(process.env.X64DBG_MCP_INSTANCES);
-  if (parsed) {
-    for (const inst of parsed) register(inst);
+
+  const explicit = parseInstances(process.env.X64DBG_MCP_INSTANCES);
+  if (explicit) {
+    // Explicit configuration is authoritative - no merging, no surprises.
+    for (const inst of explicit) register(inst);
+    console.error(`[x64dbg-mcp] loaded ${explicit.length} instance(s) from X64DBG_MCP_INSTANCES`);
   } else {
+    // The install the user already runs stays the default...
     register({
       id: DEFAULT_INSTANCE_ID,
       host: config.host,
       port: config.port,
       token: config.token,
       x64dbgPath: config.x64dbgPath || undefined,
-      label: 'single instance (legacy env vars)',
+      label: 'default instance (legacy env vars)',
     });
+
+    // ...and provisioned copies are added on top, so provisioning is
+    // self-wiring without touching .claude.json. Entries that would duplicate
+    // the default's endpoint are skipped: a copy provisioned at the default's
+    // own port cannot be used while the original is running.
+    const manifest = readManifest();
+    if (manifest) {
+      const extra = parseInstances(manifest.text) ?? [];
+      let added = 0;
+      for (const inst of extra) {
+        if (registry.has(inst.id)) continue;
+        const clash = [...registry.values()].some(
+          (r) => r.port === inst.port && r.host === inst.host
+        );
+        if (clash) {
+          console.error(
+            `[x64dbg-mcp] skipping manifest instance "${inst.id}": ` +
+            `${inst.host}:${inst.port} is already the default instance`
+          );
+          continue;
+        }
+        register(inst);
+        added++;
+      }
+      if (added) {
+        console.error(`[x64dbg-mcp] ${added} extra instance(s) from ${manifest.path}`);
+      }
+    }
   }
 
   // The default is the one X64DBG_MCP_INSTANCE names, else the first declared.
