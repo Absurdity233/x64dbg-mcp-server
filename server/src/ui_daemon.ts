@@ -15,7 +15,10 @@ import { dirname, join } from 'node:path';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'ui.ps1');
 
-const IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
+// Starting PowerShell costs ~3s (CLR + WinRT + Add-Type), so a cold start is
+// far more expensive than keeping an idle process around. 10 minutes was short
+// enough that a session with pauses paid it repeatedly.
+const IDLE_SHUTDOWN_MS = parseInt(process.env.X64DBG_MCP_UI_IDLE_MS ?? '', 10) || 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 120_000;
 
 export interface UiRequest {
