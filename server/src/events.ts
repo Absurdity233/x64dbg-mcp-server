@@ -20,36 +20,75 @@ interface EventsResponse {
 }
 
 /**
- * Highest sequence number seen per x64dbg instance, so polls only return new
- * events. Keyed by instance: a single shared counter would let one target's
- * event stream advance past another's, and both would silently lose events.
+ * Highest sequence number handed to the caller, per x64dbg endpoint.
+ *
+ * Keyed by endpoint, not by instance id: two ids can name one debugger, and
+ * then two cursors would advance independently over one stream and both
+ * silently skip events.
+ *
+ * The cursor is per *consumer*, not global: drain() and waitFor() both use it,
+ * so an unrelated get_events call in the middle of a wait_for_event would
+ * advance the cursor past the event the wait was looking for.
  */
 const cursors = new Map<string, number>();
+let consumerSeq = 0;
 
 function cursorKey(): string {
-  return currentInstance().id;
+  const inst = currentInstance();
+  return `${inst.host}:${inst.port}`;
 }
 
-export function currentCursor(): number {
-  return cursors.get(cursorKey()) ?? 0;
+/**
+ * Cursors are per (endpoint, consumer). A "consumer" is one logical reader -
+ * a specific wait_for_event call, or the get_events stream - so concurrent
+ * readers of the same debugger cannot steal each other's events. Calls that
+ * pass no consumer id share the process-wide "drain" cursor.
+ */
+function scopedKey(consumer?: string): string {
+  return `${cursorKey()}|${consumer ?? 'drain'}`;
 }
 
-export function resetCursor(): void {
-  cursors.set(cursorKey(), 0);
+export function currentCursor(consumer?: string): number {
+  return cursors.get(scopedKey(consumer)) ?? 0;
 }
 
-function advance(res: EventsResponse): void {
-  const key = cursorKey();
+export function resetCursor(consumer?: string): void {
+  cursors.set(scopedKey(consumer), 0);
+}
+
+/** Allocate a fresh consumer id for one blocking wait. */
+export function newConsumer(): string {
+  return `c${++consumerSeq}`;
+}
+
+export function dropConsumer(consumer: string): void {
+  cursors.delete(scopedKey(consumer));
+}
+
+function advance(res: EventsResponse, consumer?: string): void {
+  const key = scopedKey(consumer);
   if (res.latest_seq > (cursors.get(key) ?? 0)) cursors.set(key, res.latest_seq);
 }
 
+/** Highest event sequence buffered right now, per endpoint (no cursor change). */
+export async function headSeq(): Promise<number> {
+  try {
+    const res = await httpClient.get<EventsResponse>('/api/command/events', { since: '0', max: '0' });
+    return res.latest_seq ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Snapshot of everything buffered since the cursor. Does not block. */
-export async function drain(): Promise<{ events: DebugEvent[]; dropped: number }> {
+export async function drain(
+  consumer?: string
+): Promise<{ events: DebugEvent[]; dropped: number }> {
   try {
     const res = await httpClient.get<EventsResponse>('/api/command/events', {
-      since: String(currentCursor()),
+      since: String(currentCursor(consumer)),
     });
-    advance(res);
+    advance(res, consumer);
     return { events: res.events ?? [], dropped: res.dropped ?? 0 };
   } catch {
     return { events: [], dropped: 0 };
@@ -93,50 +132,60 @@ export async function waitFor(
   // buffered already, so the next request must not hold for new ones.
   let hasMore = false;
 
-  while (true) {
-    const remaining = timeout_ms - (Date.now() - started);
-    if (remaining <= 0) {
-      return { matched: null, others, elapsed_ms: Date.now() - started, dropped };
-    }
+  // This wait gets its own cursor, starting wherever the shared drain cursor
+  // is. Without that, a get_events or another wait in the same session would
+  // advance the cursor past the event this call is looking for.
+  const consumer = newConsumer();
+  cursors.set(scopedKey(consumer), currentCursor());
 
-    const params: Record<string, string> = {
-      since: String(currentCursor()),
-      // Hold for at most eventHoldMs per request so a plugin restart is noticed
-      // promptly, but never longer than the caller's remaining budget. When the
-      // previous batch was truncated there is already data to read, so do not
-      // park at all - the hold is only for waiting on future events.
-      timeout: String(hasMore ? 0 : Math.min(remaining, config.eventHoldMs)),
-    };
-    if (filterTypes && filterTypes.length) params.types = filterTypes.join(',');
-    // Server-side waits park on a condition variable, so a single request can
-    // return a whole burst; cap it so one huge module load cannot blow up the
-    // tool response.
-    params.max = String(config.eventBatchMax);
-
-    let res: EventsResponse;
-    try {
-      res = await httpClient.get<EventsResponse>('/api/command/events/wait', params);
-    } catch (err) {
-      // Plugin gone or endpoint missing - fall back to a short sleep so we do
-      // not spin, then let the next iteration fail or succeed.
-      await new Promise((r) => setTimeout(r, Math.min(remaining, 500)));
-      continue;
-    }
-
-    dropped += res.dropped ?? 0;
-    hasMore = res.has_more === true;
-    advance(res);
-
-    for (const ev of res.events ?? []) {
-      if (predicate(ev)) {
-        return { matched: ev, others, elapsed_ms: Date.now() - started, dropped };
+  try {
+    while (true) {
+      const remaining = timeout_ms - (Date.now() - started);
+      if (remaining <= 0) {
+        return { matched: null, others, elapsed_ms: Date.now() - started, dropped };
       }
-      others.push(ev);
-    }
 
-    // A single hold expiring is not the caller's deadline: keep re-issuing
-    // until the overall timeout budget is spent. (The loop head checks it.)
-    if (res.timed_out) continue;
+      const params: Record<string, string> = {
+        since: String(currentCursor(consumer)),
+        // Hold for at most eventHoldMs per request so a plugin restart is noticed
+        // promptly, but never longer than the caller's remaining budget. When the
+        // previous batch was truncated there is already data to read, so do not
+        // park at all - the hold is only for waiting on future events.
+        timeout: String(hasMore ? 0 : Math.min(remaining, config.eventHoldMs)),
+      };
+      if (filterTypes && filterTypes.length) params.types = filterTypes.join(',');
+      // Server-side waits park on a condition variable, so a single request can
+      // return a whole burst; cap it so one huge module load cannot blow up the
+      // tool response.
+      params.max = String(config.eventBatchMax);
+
+      let res: EventsResponse;
+      try {
+        res = await httpClient.get<EventsResponse>('/api/command/events/wait', params);
+      } catch (err) {
+        // Plugin gone or endpoint missing - fall back to a short sleep so we do
+        // not spin, then let the next iteration fail or succeed.
+        await new Promise((r) => setTimeout(r, Math.min(remaining, 500)));
+        continue;
+      }
+
+      dropped += res.dropped ?? 0;
+      hasMore = res.has_more === true;
+      advance(res, consumer);
+
+      for (const ev of res.events ?? []) {
+        if (predicate(ev)) {
+          return { matched: ev, others, elapsed_ms: Date.now() - started, dropped };
+        }
+        others.push(ev);
+      }
+
+      // A single hold expiring is not the caller's deadline: keep re-issuing
+      // until the overall timeout budget is spent. (The loop head checks it.)
+      if (res.timed_out) continue;
+    }
+  } finally {
+    dropConsumer(consumer);
   }
 }
 
