@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { config } from './config.js';
 
 /**
  * Exclusive ownership of an x64dbg *endpoint*.
@@ -43,6 +44,8 @@ export interface LeaseInfo {
   host: string;
   started_at: number;
   heartbeat: number;
+  /** Last tool call routed to this endpoint (missing on older lease files). */
+  last_call?: number;
   token: string;
 }
 
@@ -88,6 +91,15 @@ function isStale(info: LeaseInfo): boolean {
   const sameHost = info.host === hostname();
   if (sameHost && !pidAlive(info.pid)) return true;
   return Date.now() - info.heartbeat > STALE_MS;
+}
+
+/** Milliseconds since the owner last routed a tool call here. */
+function idleFor(info: LeaseInfo): number {
+  return Date.now() - (info.last_call ?? info.heartbeat);
+}
+
+function isIdle(info: LeaseInfo): boolean {
+  return config.leaseIdleMs > 0 && idleFor(info) > config.leaseIdleMs;
 }
 
 function writeLease(key: string, info: LeaseInfo): boolean {
@@ -155,14 +167,16 @@ export function acquireLease(instanceId: string, host: string, port: number): Ac
   const key = leaseKey(host, port);
   if (held.has(key)) return { ok: true, reclaimed: false };
 
+  const now = Date.now();
   const info: LeaseInfo = {
     instance: instanceId,
     endpoint: `${host}:${port}`,
     pid: process.pid,
     host: hostname(),
-    started_at: Date.now(),
-    heartbeat: Date.now(),
-    token: `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    started_at: now,
+    heartbeat: now,
+    last_call: now,
+    token: `${process.pid}-${now}-${Math.random().toString(36).slice(2)}`,
   };
 
   if (writeLease(key, info)) return take(key, info, host, port, false);
@@ -174,7 +188,9 @@ export function acquireLease(instanceId: string, host: string, port: number): Ac
     return { ok: false, holder: null };
   }
 
-  if (!isStale(current)) return { ok: false, holder: current };
+  // A live but idle session yields: otherwise the first Claude Code window to
+  // touch a debugger blocks every other window until that process exits.
+  if (!isStale(current) && !isIdle(current)) return { ok: false, holder: current };
 
   try {
     unlinkSync(leasePath(key));
@@ -185,9 +201,71 @@ export function acquireLease(instanceId: string, host: string, port: number): Ac
   return { ok: false, holder: readLease(key) };
 }
 
+/** Mark the endpoint as used just now (called on every routed tool call). */
+export function touchLease(host: string, port: number): void {
+  const entry = held.get(leaseKey(host, port));
+  if (entry) entry.info.last_call = Date.now();
+}
+
 /** True when this process owns the endpoint. */
 export function ownsLease(host: string, port: number): boolean {
   return held.has(leaseKey(host, port));
+}
+
+export type TakeoverResult =
+  | { ok: true; previous: LeaseInfo | null }
+  | { ok: false; holder: LeaseInfo | null };
+
+/**
+ * Explicitly take an endpoint from another live session.
+ *
+ * Without `force` this only succeeds when the holder has been idle for
+ * X64DBG_MCP_LEASE_IDLE_MS; with `force` it overwrites any live lease. The
+ * previous owner's heartbeat notices the token change and stops claiming it,
+ * so its next call gets a normal conflict instead of driving a debugger it no
+ * longer owns.
+ */
+export function takeOverLease(
+  instanceId: string,
+  host: string,
+  port: number,
+  force = false
+): TakeoverResult {
+  const key = leaseKey(host, port);
+  if (held.has(key)) return { ok: true, previous: null };
+
+  const current = readLease(key);
+  const live = current && !isStale(current);
+  if (live && !force && !isIdle(current)) {
+    return { ok: false, holder: current };
+  }
+
+  const now = Date.now();
+  const info: LeaseInfo = {
+    instance: instanceId,
+    endpoint: `${host}:${port}`,
+    pid: process.pid,
+    host: hostname(),
+    started_at: now,
+    heartbeat: now,
+    last_call: now,
+    token: `${process.pid}-${now}-${Math.random().toString(36).slice(2)}`,
+  };
+
+  try {
+    mkdirSync(DIR, { recursive: true });
+    const fd = openSync(leasePath(key), 'w');
+    try {
+      writeSync(fd, JSON.stringify(info));
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return { ok: false, holder: readLease(key) };
+  }
+
+  take(key, info, host, port, true);
+  return { ok: true, previous: current };
 }
 
 /** Read-only view: the live holder of an endpoint, or null if it is free. */
@@ -222,7 +300,8 @@ export function releaseAllLeases(): void {
 /** Describe a holder for an error message. */
 export function describeHolder(info: LeaseInfo): string {
   const age = Math.round((Date.now() - info.started_at) / 1000);
-  return `pid ${info.pid} on ${info.host}, holding ${info.endpoint} for ${age}s`;
+  const idle = Math.round(idleFor(info) / 1000);
+  return `pid ${info.pid} on ${info.host}, holding ${info.endpoint} for ${age}s (idle ${idle}s)`;
 }
 
 // A killed process cannot run handlers; this covers the normal exit.

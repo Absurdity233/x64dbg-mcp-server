@@ -21,7 +21,9 @@ import { config } from './config.js';
  *
  * Fields per instance: id (from the key), host (default 127.0.0.1), port
  * (required), token (defaults to X64DBG_MCP_TOKEN), x64dbgPath (optional,
- * used by the launcher), label (optional, shown in tool output).
+ * used by the launcher), elevated (optional, launch with an elevated token),
+ * elevatedTask (optional, scheduled task used instead of a UAC prompt),
+ * label (optional, shown in tool output).
  */
 
 export interface InstanceEndpoint {
@@ -30,6 +32,8 @@ export interface InstanceEndpoint {
   port: number;
   token: string;
   x64dbgPath?: string;
+  elevated?: boolean;
+  elevatedTask?: string;
   label?: string;
 }
 
@@ -46,6 +50,8 @@ function fromRaw(id: string, raw: unknown): InstanceEndpoint | null {
     port,
     token: typeof o.token === 'string' ? o.token : config.token,
     x64dbgPath: typeof o.x64dbgPath === 'string' && o.x64dbgPath ? o.x64dbgPath : undefined,
+    elevated: typeof o.elevated === 'boolean' ? o.elevated : undefined,
+    elevatedTask: typeof o.elevatedTask === 'string' && o.elevatedTask ? o.elevatedTask : undefined,
     label: typeof o.label === 'string' && o.label ? o.label : undefined,
   };
 }
@@ -133,6 +139,8 @@ function build(): void {
       port: config.port,
       token: config.token,
       x64dbgPath: config.x64dbgPath || undefined,
+      elevated: config.elevated || undefined,
+      elevatedTask: config.elevatedTask || undefined,
       label: 'default instance (legacy env vars)',
     });
 

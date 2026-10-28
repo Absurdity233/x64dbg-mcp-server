@@ -43,8 +43,14 @@ overrides the file completely when set.
 
 - `X64DBG_MCP_INSTANCES` — array or object of endpoints. Fields: `id`, `port`
   (required), `host` (default `127.0.0.1`), `token` (default
-  `X64DBG_MCP_TOKEN`), `x64dbgPath` (used by the auto-launcher), `label`.
+  `X64DBG_MCP_TOKEN`), `x64dbgPath` (used by the auto-launcher), `elevated`
+  (launch with an elevated token), `elevatedTask` (scheduled task used instead
+  of a UAC prompt), `label`.
 - `X64DBG_MCP_INSTANCE` — this server process's default instance.
+- `X64DBG_MCP_AUTOLAUNCH=off` — never start a debugger implicitly; only
+  `x64dbg_instances action=start` launches one.
+- `X64DBG_MCP_LEASE_IDLE_MS` — release a lease after this many ms without a
+  tool call (default `0`, never). See “Exclusive ownership”.
 - With `X64DBG_MCP_INSTANCES` unset, the old single-instance behaviour is
   unchanged: one instance called `default`, built from
   `X64DBG_MCP_HOST/PORT/TOKEN/X64DBG_PATH`.
@@ -59,9 +65,17 @@ Every tool takes an optional `instance` argument:
 x64dbg_debug      { action: "load", path: "C:\\target.exe", instance: "beta" }
 x64dbg_memory     { action: "read", address: "0x401000", size: "16", instance: "beta" }
 x64dbg_instances  { action: "list" }
+x64dbg_instances  { action: "start", id: "beta" } // claim, launch, and select
+x64dbg_instances  { action: "start", id: "beta", elevated: true }
 x64dbg_instances  { action: "use", id: "beta" }   // default for this server process
+x64dbg_instances  { action: "steal", id: "beta", force: true } // take a stuck session's endpoint
 x64dbg_instances  { action: "status", id: "beta" }
 ```
+
+`start` waits for the selected copy's plugin to answer before returning. It
+also acquires the instance lease and makes that instance the default, so the
+next `x64dbg_debug action=load` needs no `instance` argument. `timeout_ms` can
+override the 60-second startup budget.
 
 An unknown id is a hard error listing the configured ids — it never falls back
 to the default, because silently driving the wrong target is the failure this
@@ -85,8 +99,15 @@ instance is **leased** to one MCP server process at a time.
   id they would hold two "different" leases over one x64dbg. `x64dbg_instances
   list` marks such ids with `shared_with`, and startup logs a warning.
 - A stale lease (owner gone, or heartbeat older than 35s) is reclaimed.
-- A call on a leased instance fails with the holder's pid and age:
-  `Instance "inst2" is in use by pid 53520 on DESKTOP-..., holding it for 16s.`
+- Every routed call updates `last_call` in the lease. With
+  `X64DBG_MCP_LEASE_IDLE_MS` set, a lease idle for longer is reclaimed
+  automatically, so a Claude Code window left open overnight does not block a
+  new session. The default is `0` (strict first-come, first-served).
+- A call on a leased instance fails with the holder's pid, age and idle time:
+  `Instance "inst2" is in use by pid 53520 on DESKTOP-..., holding it for 16s (idle 2s).`
+  The error also lists free instances and the two ways out: `action=use` on a
+  free one, or `action=steal` (which requires `force: true` while the holder is
+  still active).
 - With several instances and no `X64DBG_MCP_INSTANCE`, the first call claims a
   free instance atomically, preferring one whose plugin is answering. Three
   sessions, two instances: the third gets the explicit error above rather than
@@ -94,6 +115,41 @@ instance is **leased** to one MCP server process at a time.
 - `x64dbg_instances action=release id=<id>` gives it up; `list` shows
   `lease: "ours" | "free" | {pid, ...}`.
 - `X64DBG_MCP_LEASE=off` disables enforcement.
+
+## Launch and elevation
+
+`x64dbg_instances list/status` report `x64dbg_pid` and `x64dbg_elevated`. The
+launcher queries process paths with `QueryFullProcessImageName`, not WMI:
+`Win32_Process.ExecutablePath` comes back empty for an elevated x64dbg when the
+MCP server is not elevated, which used to make the launcher believe no x64dbg
+was running and start a second window on the same plugin port.
+
+Implicit launches are serialised across MCP server processes with a lock in
+`%TEMP%\x64dbg-mcp\launch\`. The second process waits for the first one's
+plugin instead of opening another GUI.
+
+Starting x64dbg **elevated** has two modes:
+
+1. **UAC prompt** (default). `start elevated=true` runs
+   `Start-Process -Verb RunAs`; you answer the prompt, the launcher waits for
+   the plugin. `X64DBG_MCP_UAC_TIMEOUT_MS` bounds the wait (default 120s).
+2. **No prompt, via scheduled task.** Run this once from an elevated
+   PowerShell:
+
+   ```powershell
+   .\scripts\install-elevated-task.ps1 -Id inst2 -X64dbgPath "F:\...\inst2\x64\x64dbg.exe"
+   ```
+
+   Then set `X64DBG_MCP_ELEVATED_TASK` (single instance) or add
+   `"elevated": true, "elevatedTask": "<task name>"` to that instance's manifest
+   entry. Elevated launches use `schtasks /run`, with no UAC prompt. This is a
+   persistent auto-elevation path for that executable — remove it with
+   `-Remove` when you no longer need it.
+
+Defaults can be set with `X64DBG_MCP_ELEVATED=1`. Windows cannot raise an
+existing process: if x64dbg is already running at medium integrity,
+`start elevated=true` returns `running-unelevated` and leaves it alone. Close
+that window (or let the session end) and start again.
 
 ## Shared target files are refused
 
@@ -148,6 +204,20 @@ through `%TEMP%\x64dbg-mcp\ui.lock`, waiters queue for `lock_timeout_ms`
 (default 30 s) and then get an error naming the holder.
 
 Screenshot/OCR/windows/info are read-only and never take the lock.
+
+### Integrity levels (UIPI)
+
+Before an input or screen-read action, `x64dbg_ui` asks the daemon for the
+integrity level of the target window and of itself. Windows UIPI silently drops
+`SendInput`/`PostMessage` from a medium-integrity process to a high-integrity
+window, so clicking an elevated target looks successful but does nothing; OCR
+and `PrintWindow` often come back black for the same reason.
+
+When the target is elevated and the daemon is not, input actions fail with
+`error: "integrity-mismatch"` and an explanation; read-only actions run but
+carry an `integrity_warning`. The fix is to run Claude Code as administrator
+(the MCP server and the daemon inherit the token), or observe the target
+through debugger memory instead of its UI.
 
 ### Coordinate calibration
 

@@ -14,7 +14,8 @@
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
   [ValidateSet('info', 'shot', 'ocr', 'findtext', 'clicktext', 'typeinto',
-               'click', 'realclick', 'type', 'key', 'activity', 'windows', 'findwindow', 'serve')]
+               'click', 'realclick', 'type', 'key', 'activity', 'windows', 'findwindow',
+               'elevation', 'serve')]
   [string]$Action = 'info',
   [int]$X = 0,
   [int]$Y = 0,
@@ -77,6 +78,10 @@ Add-Type -MemberDefinition @'
 [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+[DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr p, int access, out IntPtr token);
+[DllImport("advapi32.dll", SetLastError = true)] public static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int len, out int ret);
 public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
 public struct RECT { public int Left, Top, Right, Bottom; }
 public struct POINT { public int X, Y; }
@@ -215,6 +220,31 @@ function Get-HumanActivity {
     }
   }
   return [pscustomobject]@{ IdleMs = $idle; Recent = $recent; Moving = $moving; Ours = $ours }
+}
+
+function Get-ProcessElevation([int]$ProcessId) {
+  if ($ProcessId -le 0) { return 'unknown' }
+  # PROCESS_QUERY_LIMITED_INFORMATION is readable across integrity levels;
+  # PROCESS_QUERY_INFORMATION is not, which is why this is not Get-Process.
+  $h = [MCPUI.U]::OpenProcess(0x1000, $false, $ProcessId)
+  if ($h -eq [IntPtr]::Zero) { return 'unknown' }
+  try {
+    $token = [IntPtr]::Zero
+    if (-not [MCPUI.U]::OpenProcessToken($h, 0x8, [ref]$token)) { return 'unknown' }
+    try {
+      $value = 0
+      $returned = 0
+      # TokenElevation = 20, one DWORD; 1 = elevated (high integrity).
+      if (-not [MCPUI.U]::GetTokenInformation($token, 20, [ref]$value, 4, [ref]$returned)) {
+        return 'unknown'
+      }
+      if ($value -eq 1) { return 'true' } else { return 'false' }
+    } finally {
+      [void][MCPUI.U]::CloseHandle($token)
+    }
+  } finally {
+    [void][MCPUI.U]::CloseHandle($h)
+  }
 }
 
 function Assert-NoHumanActivity([string]$what) {
@@ -798,6 +828,22 @@ function Invoke-UiAction {
     [MCPUI.U]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
     if ($global:found.Count -eq 0) { Write-Output "no titled windows" }
     else { $global:found | ForEach-Object { Write-Output $_ } }
+  }
+
+  'elevation' {
+    # Is the window's process elevated, and is this daemon? Windows UIPI drops
+    # SendInput/PostMessage from a lower-integrity process to a higher one, and
+    # the failure is silent - the click simply does nothing.
+    [uint32]$procid = 0
+    if ($TargetPid -gt 0) {
+      $procid = [uint32]$TargetPid
+    } elseif ($script:h -ne [IntPtr]::Zero) {
+      $null = [MCPUI.U]::GetWindowThreadProcessIdOut($script:h, [ref]$procid)
+    }
+    $target = Get-ProcessElevation ([int]$procid)
+    $daemon = Get-ProcessElevation ([int]$PID)
+    Write-Output ("pid={0} target_elevated={1} daemon_elevated={2} daemon_pid={3}" -f `
+      $procid, $target, $daemon, $PID)
   }
 
   'shot' { Invoke-Shot $Out }

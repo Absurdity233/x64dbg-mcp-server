@@ -16,7 +16,14 @@ import {
   setDefaultInstance,
   type InstanceEndpoint,
 } from './instances.js';
-import { acquireLease, describeHolder, ownsLease, peekLease, releaseAllLeases } from './lease.js';
+import {
+  acquireLease,
+  describeHolder,
+  ownsLease,
+  peekLease,
+  releaseAllLeases,
+  touchLease,
+} from './lease.js';
 import { ensureX64dbg } from './launcher.js';
 import { checkPluginCompat } from './compat.js';
 import { getVersion } from './version.js';
@@ -126,9 +133,17 @@ async function autoAssignDefaultInstance(): Promise<void> {
     if (!acquireLease(i.id, i.host, i.port).ok) continue;
     markDefaultChosen();
     setDefaultInstance(i.id);
+
+    // A free but stopped instance used to be claimed and then fail on the very
+    // next call after the whole wait budget. Start it here instead; the first
+    // call already waits for the debugger either way.
+    const started = !up && config.autoLaunch
+      ? await ensureX64dbg(i, { timeoutMs: 60_000, elevated: i.elevated })
+      : null;
+
     console.error(
       `[x64dbg-mcp] auto-claimed instance "${i.id}" for this session` +
-      (up ? '' : ' (WARNING: no plugin is answering; calls will wait then fail)')
+      (up ? '' : started?.ok ? ' (started by the launcher)' : ' (WARNING: no plugin is answering)')
     );
     return;
   }
@@ -158,6 +173,7 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
   (server as any).tool = (...args: any[]) => {
     const handler = args[args.length - 1];
     if (typeof handler === 'function') {
+      const registeredToolName = String(args[0]);
       // Every registration in this server uses (name, description, rawShape, handler).
       //
       // The instance parameter is only advertised when there is more than one
@@ -165,7 +181,13 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
       // costs ~1k tokens across the 26 tools - not worth paying when there is
       // nothing to choose between.
       const schemaArg = args[2];
-      if (isMultiInstance() && schemaArg && typeof schemaArg === 'object' && !(schemaArg as any)._def) {
+      if (
+        registeredToolName !== 'x64dbg_instances' &&
+        isMultiInstance() &&
+        schemaArg &&
+        typeof schemaArg === 'object' &&
+        !(schemaArg as any)._def
+      ) {
         args[2] = {
           ...schemaArg,
           instance: z.string().optional().describe(
@@ -175,11 +197,16 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
       }
 
       args[args.length - 1] = async (...callArgs: any[]) => {
-        const toolName = String(args[0]);
+        const toolName = registeredToolName;
         const raw = (callArgs[0] ?? {}) as Record<string, unknown>;
         let instance: InstanceEndpoint;
         try {
-          if (!raw.instance) await autoAssignDefaultInstance();
+          // Inventory is deliberately side-effect free. It manages leases in
+          // its explicit start/use/release actions; list/status must not claim
+          // a debugger merely because the user asked what is available.
+          if (!raw.instance && toolName !== 'x64dbg_instances') {
+            await autoAssignDefaultInstance();
+          }
           instance = getInstance(typeof raw.instance === 'string' ? raw.instance : undefined);
         } catch (err) {
           return {
@@ -194,6 +221,12 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
           const lease = acquireLease(instance.id, instance.host, instance.port);
           if (!lease.ok) {
             const who = lease.holder ? describeHolder(lease.holder) : 'another process';
+            const free = listInstances()
+              .filter((i) => i.id !== instance.id && (ownsLease(i.host, i.port) || !peekLease(i.host, i.port)))
+              .map((i) => i.id);
+            const idleHint = config.leaseIdleMs > 0
+              ? ` An idle session yields after ${Math.round(config.leaseIdleMs / 1000)}s.`
+              : '';
             return {
               content: [{
                 type: 'text',
@@ -201,12 +234,15 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
                   `Instance "${instance.id}" is in use by ${who}. ` +
                   'Two models driving one x64dbg corrupt each other: breakpoints collide, one run ' +
                   'clears the other\'s paused state, and both event streams mix. ' +
-                  'Use a different instance (x64dbg_instances action=list), wait, or set ' +
-                  'X64DBG_MCP_LEASE=off to disable ownership enforcement.',
+                  `Free instance(s): ${free.join(', ') || 'none'}. ` +
+                  `Use x64dbg_instances action=use id=<free>, wait, or ` +
+                  `action=steal id="${instance.id}" force=true if that session is stuck.` +
+                  idleHint,
               }],
               isError: true,
             };
           }
+          touchLease(instance.host, instance.port);
         }
 
         // Handlers do not need to know the field exists.
@@ -216,6 +252,11 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
         return runWithInstance(instance, async () => {
           const result = await handler(clean, ...callArgs.slice(1));
           compactJsonBlocks(result);
+          // Instance inventory/startup already probes endpoints with a short,
+          // bounded timeout. Appending the generic state line here would route
+          // through HttpClient and make list/status wait up to two minutes when
+          // the default debugger is intentionally offline.
+          if (toolName === 'x64dbg_instances') return result;
           // Handlers that already reported a precise state (e.g. run, which
           // knows whether the stop was stable) opt out to avoid contradicting
           // themselves with a stale sample taken a few milliseconds later.
@@ -285,13 +326,56 @@ async function main() {
   // Only the default instance is auto-started; the rest are started on demand
   // (or by the provisioning script) so N configured instances do not open N
   // GUI windows at every session start.
-  if (launch) {
-    void ensureX64dbg(defaultInstance).then(({ launched, ok }) => {
-      if (!ok && !launched) {
-        console.error('[x64dbg-mcp] x64dbg is not running and could not be started. ' +
-          'Set X64DBG_PATH or pass --x64dbg=<path>.');
-      }
-    });
+  if (launch && config.autoLaunch) {
+    const holder = peekLease(defaultInstance.host, defaultInstance.port);
+    if (holder && !ownsLease(defaultInstance.host, defaultInstance.port)) {
+      // Two MCP servers starting together used to both spawn the default
+      // x64dbg; one of the windows then could not bind the plugin port.
+      console.error(
+        `[x64dbg-mcp] ${defaultInstance.id} (${defaultInstance.host}:${defaultInstance.port}) ` +
+        `is owned by pid ${holder.pid}; not starting a second x64dbg. ` +
+        'A call will fail with the holder, or use x64dbg_instances action=list/use/steal.'
+      );
+    } else if (isMultiInstance()) {
+      // Do not open a second GUI just because the default is stopped: if any
+      // configured instance is already answering, the first tool call will
+      // auto-claim that one. Starting the default unconditionally used to
+      // leave two windows open when two sessions shared the same config.
+      void (async () => {
+        const up = (await Promise.all(instances.map((i) => pluginAnswers(i)))).some(Boolean);
+        if (up) {
+          console.error(
+            '[x64dbg-mcp] another instance is already answering; not auto-starting the default. ' +
+            'Instances start on demand (x64dbg_instances action=start).'
+          );
+          return;
+        }
+        const res = await ensureX64dbg(defaultInstance, {
+          timeoutMs: 60_000,
+          elevated: defaultInstance.elevated,
+        });
+        if (!res.ok) {
+          console.error(
+            `[x64dbg-mcp] ${defaultInstance.id} is not up: ${res.reason ?? 'launch failed'}` +
+            (res.detail ? ` (${res.detail})` : '') +
+            '. Set X64DBG_PATH, start it manually, or use x64dbg_instances action=start.'
+          );
+        }
+      })();
+    } else {
+      void ensureX64dbg(defaultInstance, {
+        timeoutMs: 60_000,
+        elevated: defaultInstance.elevated,
+      }).then((res) => {
+        if (!res.ok) {
+          console.error(
+            `[x64dbg-mcp] ${defaultInstance.id} is not up: ${res.reason ?? 'launch failed'}` +
+            (res.detail ? ` (${res.detail})` : '') +
+            '. Set X64DBG_PATH, start it manually, or use x64dbg_instances action=start.'
+          );
+        }
+      });
+    }
   }
 
   // Compare the installed plugin's version and route table against what this

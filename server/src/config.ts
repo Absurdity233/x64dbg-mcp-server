@@ -27,6 +27,15 @@ function parseCompact(raw: string | undefined): 'auto' | 'on' | 'off' {
   return 'auto';
 }
 
+function parseMs(raw: string | undefined, fallback: number): number {
+  const value = parseInt(raw ?? '', 10);
+  return Number.isNaN(value) || value < 0 ? fallback : value;
+}
+
+function parseBool(raw: string | undefined): boolean {
+  return ['1', 'true', 'on', 'yes'].includes((raw ?? '').trim().toLowerCase());
+}
+
 export const config = {
   host: process.env.X64DBG_MCP_HOST ?? '127.0.0.1',
   port: parseInt(process.env.X64DBG_MCP_PORT ?? '27042', 10),
@@ -58,6 +67,19 @@ export const config = {
   // Config/ and Logs/ (X64DBG_MCP_ALLOW_SHARED_TARGET=1).
   allowSharedTarget:
     ['1', 'true', 'on'].includes((process.env.X64DBG_MCP_ALLOW_SHARED_TARGET ?? '').trim().toLowerCase()),
+  // Start the default x64dbg at MCP startup (X64DBG_MCP_AUTOLAUNCH=off disables).
+  // With -off, only x64dbg_instances action=start launches a debugger.
+  autoLaunch: (process.env.X64DBG_MCP_AUTOLAUNCH ?? '').trim().toLowerCase() !== 'off',
+  // Release a lease after this many ms without a tool call, so an idle Claude
+  // Code session does not block a second one forever. 0 = never.
+  leaseIdleMs: parseMs(process.env.X64DBG_MCP_LEASE_IDLE_MS, 0),
+  // Start x64dbg elevated by default (X64DBG_MCP_ELEVATED=1).
+  elevated: parseBool(process.env.X64DBG_MCP_ELEVATED),
+  // Highest-privilege scheduled task created by scripts/install-elevated-task.ps1.
+  // When set, elevated launches use it instead of a UAC prompt.
+  elevatedTask: process.env.X64DBG_MCP_ELEVATED_TASK ?? '',
+  // How long to wait for the user to answer a UAC prompt.
+  uacTimeoutMs: parseMs(process.env.X64DBG_MCP_UAC_TIMEOUT_MS, 120_000),
 };
 
 export function getBaseUrl(): string {

@@ -9,7 +9,8 @@ import {
   type InstanceEndpoint,
 } from '../instances.js';
 import { config } from '../config.js';
-import { acquireLease, ownsLease, peekLease, releaseLease } from '../lease.js';
+import { acquireLease, ownsLease, peekLease, releaseLease, takeOverLease } from '../lease.js';
+import { ensureX64dbg, findInstanceProcess } from '../launcher.js';
 
 import { requireString } from './util.js';
 
@@ -22,7 +23,14 @@ function leaseView(instance: InstanceEndpoint): unknown {
     pid: holder.pid,
     host: holder.host,
     held_for_s: Math.round((Date.now() - holder.started_at) / 1000),
+    idle_s: Math.round((Date.now() - (holder.last_call ?? holder.heartbeat)) / 1000),
   };
+}
+
+/** x64dbg's own pid and integrity level, when its executable is running. */
+async function processView(instance: InstanceEndpoint): Promise<Record<string, unknown>> {
+  const proc = await findInstanceProcess(instance);
+  return proc ? { x64dbg_pid: proc.pid, x64dbg_elevated: proc.elevated } : {};
 }
 
 /**
@@ -84,10 +92,21 @@ async function probe(inst: InstanceEndpoint): Promise<Probe> {
 export function registerInstanceTools(server: McpServer) {
   server.tool(
     'x64dbg_instances',
-    'Inspect and select x64dbg instances. Actions: list (every configured instance, whether its plugin answers, what it is debugging, and who owns it), use (make one the default for this MCP server process), release (give up ownership so another session can use it), status (detail for one instance). Every other tool accepts an optional "instance" argument when more than one is configured.',
+    'Inspect, start, and select x64dbg instances. Actions: list (every configured instance, whether its plugin answers, what it is debugging, its elevation, and who owns it), start (claim and launch an instance, optionally elevated, then make it the default), use (make a running instance the default), release (give up ownership), steal (take an endpoint from another live session; force skips the idle check), status (detail for one instance). Every other tool accepts an optional "instance" argument when more than one is configured.',
     {
-      action: z.enum(['list', 'use', 'status', 'release']).describe('Operation to perform'),
-      id: z.string().optional().describe('use/status/release: instance id'),
+      action: z.enum(['list', 'start', 'use', 'status', 'release', 'steal'])
+        .describe('Operation to perform'),
+      id: z.string().optional().describe('start/use/status/release/steal: instance id; start defaults to the current instance'),
+      timeout_ms: z.number().int().min(1000).max(300000).optional()
+        .describe('start: maximum time to wait for the plugin to come online (default 60000)'),
+      elevated: z.boolean().optional().describe(
+        'start: launch x64dbg with an elevated token (UAC, or the configured scheduled task). ' +
+        'Default: the instance\'s "elevated" setting. An already-running medium-integrity process cannot be raised.'
+      ),
+      force: z.boolean().optional().describe(
+        'steal: take the endpoint even while the holder is actively using it. Only for a stuck session - ' +
+        'the previous owner\'s next call will conflict.'
+      ),
     },
     async (args) => {
       switch (args.action) {
@@ -108,6 +127,7 @@ export function registerInstanceTools(server: McpServer) {
                 ...(dups.has(ep) ? { shared_with: dups.get(ep)!.filter((x) => x !== inst.id) } : {}),
                 lease: leaseView(inst),
                 ...(await probe(inst)),
+                ...(await processView(inst)),
               };
             })
           );
@@ -115,6 +135,103 @@ export function registerInstanceTools(server: McpServer) {
             content: [{
               type: 'text',
               text: JSON.stringify({ default: defaultId, instances: rows }, null, 2),
+            }],
+          };
+        }
+
+        case 'start': {
+          const id = args.id?.trim() || getDefaultInstance().id;
+          const inst = listInstances().find((i) => i.id === id);
+          if (!inst) {
+            throw new Error(
+              `Unknown x64dbg instance "${id}". Configured: ` +
+              listInstances().map((i) => i.id).join(', ')
+            );
+          }
+
+          // Starting an instance is also selecting it for this MCP process.
+          // Claim first so two clients cannot both launch/drive the same copy.
+          const alreadyOwned = ownsLease(inst.host, inst.port);
+          if (config.lease && !alreadyOwned) {
+            const got = acquireLease(inst.id, inst.host, inst.port);
+            if (!got.ok) {
+              const holder = got.holder;
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    id,
+                    started: false,
+                    ...(holder ? {
+                      owner: {
+                        pid: holder.pid,
+                        host: holder.host,
+                        held_for_s: Math.round((Date.now() - holder.started_at) / 1000),
+                      },
+                    } : {}),
+                    message: `Instance "${id}" is already owned by another session.`,
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+          }
+
+          const elevated = args.elevated ?? inst.elevated ?? false;
+          const result = await ensureX64dbg(inst, {
+            timeoutMs: args.timeout_ms ?? 60_000,
+            elevated,
+          });
+          if (!result.ok) {
+            // Do not strand a lease when startup failed. Preserve a lease this
+            // process already held before the call, since other work may use it.
+            if (config.lease && !alreadyOwned) releaseLease(inst.host, inst.port);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  id,
+                  endpoint: `${inst.host}:${inst.port}`,
+                  started: false,
+                  process_launched: result.launched,
+                  reason: result.reason,
+                  ...(result.detail ? { detail: result.detail } : {}),
+                  elevated_requested: elevated,
+                  ...(await processView(inst)),
+                  message:
+                    result.reason === 'running-unelevated'
+                      ? 'x64dbg is already running without elevation. Windows cannot raise an existing ' +
+                        'process: close that window and call start again, or start x64dbg elevated yourself.'
+                      : result.reason === 'uac-cancelled'
+                        ? 'The UAC prompt was cancelled or dismissed.'
+                        : result.reason === 'elevated-task-failed'
+                          ? 'The configured elevated scheduled task could not be started. Run ' +
+                            'scripts/install-elevated-task.ps1 once from an elevated PowerShell, or clear ' +
+                            'X64DBG_MCP_ELEVATED_TASK to use a UAC prompt instead.'
+                          : 'x64dbg did not expose the MCP plugin before the timeout. Check the ' +
+                            'instance path, plugin installation, port, and auth token.',
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+
+          setDefaultInstance(id);
+          markDefaultChosen();
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                id,
+                endpoint: `${inst.host}:${inst.port}`,
+                started: true,
+                process_launched: result.launched,
+                elevated_requested: elevated,
+                default: true,
+                lease: leaseView(inst),
+                ...(await probe(inst)),
+                ...(await processView(inst)),
+              }, null, 2),
             }],
           };
         }
@@ -204,6 +321,83 @@ export function registerInstanceTools(server: McpServer) {
                 endpoint: `${inst.host}:${inst.port}`,
                 lease: leaseView(inst),
                 ...(await probe(inst)),
+                ...(await processView(inst)),
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'steal': {
+          const id = requireString(args.id, 'id');
+          const inst = listInstances().find((i) => i.id === id);
+          if (!inst) {
+            throw new Error(
+              `Unknown x64dbg instance "${id}". Configured: ` +
+              listInstances().map((i) => i.id).join(', ')
+            );
+          }
+          if (!config.lease) {
+            setDefaultInstance(id);
+            markDefaultChosen();
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  id,
+                  stolen: false,
+                  default: id,
+                  note: 'X64DBG_MCP_LEASE=off: ownership is not enforced, so there was nothing to take.',
+                }, null, 2),
+              }],
+            };
+          }
+
+          const got = takeOverLease(inst.id, inst.host, inst.port, !!args.force);
+          if (!got.ok) {
+            const holder = got.holder;
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  id,
+                  stolen: false,
+                  ...(holder ? {
+                    owner: {
+                      pid: holder.pid,
+                      host: holder.host,
+                      held_for_s: Math.round((Date.now() - holder.started_at) / 1000),
+                      idle_s: Math.round((Date.now() - (holder.last_call ?? holder.heartbeat)) / 1000),
+                    },
+                  } : {}),
+                  message:
+                    'The holder is still active. Pass force=true only if that session is stuck; ' +
+                    'its next call will then conflict instead of silently sharing the debugger.',
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+
+          setDefaultInstance(id);
+          markDefaultChosen();
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                id,
+                endpoint: `${inst.host}:${inst.port}`,
+                stolen: true,
+                previous: got.previous
+                  ? {
+                      pid: got.previous.pid,
+                      host: got.previous.host,
+                      held_for_s: Math.round((Date.now() - got.previous.started_at) / 1000),
+                    }
+                  : null,
+                default: id,
+                lease: leaseView(inst),
+                ...(await probe(inst)),
+                ...(await processView(inst)),
               }, null, 2),
             }],
           };

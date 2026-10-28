@@ -18,6 +18,12 @@ import { requireString } from './util.js';
  */
 const REAL_INPUT_ACTIONS = new Set(['realclick', 'clicktext', 'typeinto', 'type', 'key']);
 
+/** Every action that injects input (and is therefore blocked by UIPI). */
+const INPUT_ACTIONS = new Set(['click', 'realclick', 'clicktext', 'typeinto', 'type', 'key']);
+
+/** Actions that read the target's pixels/text, which also cross integrity. */
+const WINDOW_ACTIONS = new Set([...INPUT_ACTIONS, 'screenshot', 'ocr', 'findtext']);
+
 /** Cache of pid -> window handle, so a UI flow does not re-enumerate windows. */
 const windowCache = new Map<number, { hwnd: number; at: number }>();
 // A window handle is stable for the life of a debug session. Resolve it through
@@ -38,6 +44,29 @@ async function findMainWindow(pid: number): Promise<number | null> {
 
   windowCache.set(pid, { hwnd, at: Date.now() });
   return hwnd;
+}
+
+/**
+ * Integrity levels of the target process and of the UI daemon.
+ *
+ * Windows UIPI silently drops synthesized input and PrintWindow calls from a
+ * medium-integrity process to a high-integrity window, so a click on an
+ * elevated target "succeeds" while doing nothing. Ask the daemon before
+ * touching the window so this becomes an explicit error instead.
+ */
+async function probeElevation(
+  pid: number | null,
+  hwnd: number | undefined
+): Promise<{ target: boolean; daemon: boolean } | null> {
+  const req: any = { action: 'elevation' };
+  if (pid) req.pid = pid;
+  if (hwnd) req.hwnd = hwnd;
+
+  const res = await uiDaemon.run(req);
+  if (!res.ok) return null;
+  const m = /target_elevated=(true|false)[\s\S]*?daemon_elevated=(true|false)/.exec(res.output);
+  if (!m) return null;
+  return { target: m[1] === 'true', daemon: m[2] === 'true' };
 }
 
 export function registerUiTools(server: McpServer) {
@@ -79,9 +108,9 @@ export function registerUiTools(server: McpServer) {
     },
     async (args) => {
       let hwnd = args.hwnd;
+      let pid: number | null = null;
       // activity is a machine-level diagnostic; it must work without a session.
       if (!hwnd && args.action !== 'activity') {
-        let pid: number | null = null;
         try {
           const info = await httpClient.get<any>('/api/process/info');
           pid = info?.pid ?? null;
@@ -126,6 +155,40 @@ export function registerUiTools(server: McpServer) {
         requireString(args.match, 'match');
       }
 
+      // Fail before the silent nothing: an elevated window ignores input from
+      // the medium-integrity daemon, and PrintWindow tends to come back black.
+      let integrityWarning: string | undefined;
+      if (hwnd && WINDOW_ACTIONS.has(args.action)) {
+        const elev = await probeElevation(pid, hwnd);
+        if (elev && elev.target && !elev.daemon) {
+          const message =
+            'The target window belongs to an elevated (high-integrity) process, but the UI daemon runs ' +
+            'at medium integrity. Windows UIPI blocks SendInput/PostMessage and PrintWindow across that ' +
+            'boundary, so this action would silently do nothing. Restart Claude Code as administrator ' +
+            '(the MCP server and this daemon inherit that token), or observe the target through debugger ' +
+            'memory instead.';
+          if (INPUT_ACTIONS.has(args.action)) {
+            return {
+              isError: true,
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  hwnd,
+                  action: args.action,
+                  instance: currentInstance().id,
+                  ok: false,
+                  error: 'integrity-mismatch',
+                  target_elevated: true,
+                  daemon_elevated: false,
+                  message,
+                }, null, 2),
+              }],
+            };
+          }
+          integrityWarning = message;
+        }
+      }
+
       const runOnce = () => uiDaemon.run(req);
       // Message-mode input never touches the global cursor or the foreground
       // window, so it does not need the machine-wide lock.
@@ -151,6 +214,7 @@ export function registerUiTools(server: McpServer) {
         instance: currentInstance().id,
         ok: res.ok,
         output: res.output || res.error,
+        ...(integrityWarning ? { integrity_warning: integrityWarning } : {}),
       };
 
       // findtext/clicktext/typeinto report a miss as a plain "NOTFOUND" line;
