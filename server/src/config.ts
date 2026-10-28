@@ -60,6 +60,13 @@ export const config = {
   waitMs: parseWait(process.env.X64DBG_MCP_WAIT_MS),
   // Response formatting (see parseCompact).
   compact: parseCompact(process.env.X64DBG_MCP_COMPACT),
+  // Cap non-JSON text blocks (disassembly, OCR, raw dumps) at this many chars.
+  // JSON blocks are left intact so paging/structured results stay parseable.
+  // 0 disables the cap (X64DBG_MCP_MAX_BYTES).
+  maxOutputBytes: parseMs(process.env.X64DBG_MCP_MAX_BYTES, 65_536),
+  // Default timeout for GET requests. Long polls (/events) opt out; POSTs keep
+  // X64DBG_MCP_TIMEOUT because run/trace are unbounded. 0 disables the cap.
+  readTimeoutMs: parseMs(process.env.X64DBG_MCP_READ_TIMEOUT_MS, 30_000),
   // Refuse to drive an instance another live process owns (X64DBG_MCP_LEASE=off
   // restores the old advisory behaviour).
   lease: (process.env.X64DBG_MCP_LEASE ?? '').trim().toLowerCase() !== 'off',

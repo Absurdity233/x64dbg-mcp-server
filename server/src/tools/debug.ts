@@ -122,6 +122,55 @@ async function claimLoadedTarget(file: string): Promise<void> {
   }
 }
 
+/** Actions that end/steal the session and therefore collide with a live trace. */
+const TRACE_UNSAFE_ACTIONS = new Set([
+  'pause', 'force_pause', 'stop_debug', 'restart_debug', 'detach', 'load', 'attach',
+]);
+
+interface TraceStatus {
+  tracing?: boolean;
+  file?: string;
+  last_file?: string;
+  message?: string;
+}
+
+/**
+ * Refuse to pause/stop/load over a live run-trace.
+ *
+ * In x64dbg, pausing while TraceIntoConditional/TraceOverConditional is running
+ * ends the trace, and issuing stop/StopRunTrace at that moment has left the
+ * engine in a state that corrupted the next debug session. The trace tools know
+ * how to unwind this (`/api/trace/stop` pauses first, then StopRunTrace), so
+ * point the caller there instead of letting a generic pause/stop do damage.
+ */
+async function traceGuard(action: string, force?: boolean): Promise<any | null> {
+  if (force || !TRACE_UNSAFE_ACTIONS.has(action)) return null;
+  try {
+    const st = await httpClient.get<TraceStatus>('/api/trace/status');
+    if (!st?.tracing) return null;
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({
+          action,
+          blocked: true,
+          tracing: true,
+          trace_file: st.file,
+          message:
+            'A trace is running. Pausing or stopping the debugger here terminates the run-trace and ' +
+            'has corrupted the debug engine in practice. Use x64dbg_tracing action=stop first ' +
+            '(it pauses, then calls StopRunTrace), or pass force:true if you need to interrupt it.',
+        }, null, 2),
+      }],
+      isError: true as const,
+    };
+  } catch {
+    // Plugin down, no session, or an older plugin without /api/trace/status:
+    // let the action itself produce the authoritative error.
+    return null;
+  }
+}
+
 export function registerDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_debug',
@@ -147,10 +196,17 @@ export function registerDebugTools(server: McpServer) {
         .describe("wait_for_event: event types to match, e.g. ['breakpoint','exception']. Omit for any event."),
       match_address: z.string().optional()
         .describe("wait_for_event: only match events whose address equals this expression"),
+      force: z.boolean().optional().describe(
+        'pause/force_pause/stop_debug/restart_debug/detach/load/attach: proceed even while a trace is ' +
+        'running. Without it the call is refused because interrupting a run-trace corrupts the engine.'
+      ),
     },
-    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address, wait, stable_ms }) => {
+    async ({ action, address, path, cmdline, pid, timeout_ms, poll_ms, include_health, event_types, match_address, wait, stable_ms, force }) => {
       let endpoint = '';
       let payload: any = undefined;
+
+      const blockedByTrace = await traceGuard(action, force);
+      if (blockedByTrace) return blockedByTrace;
 
       switch (action) {
         case 'pause': {

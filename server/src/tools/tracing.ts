@@ -6,7 +6,7 @@ import { requireString } from './util.js';
 export function registerTracingTools(server: McpServer) {
   server.tool(
     'x64dbg_tracing',
-    'Execution tracing. Actions: into, over, run, stop, status, animate, conditional_run, log_setup (write a trace log to file), hitcount, type, set_type, trace_thread (record the thread id and GetTickCount() in every row; the tick is what makes event alignment exact), step_filter (restrict tracing to a module), trace_all_threads (start a trace and tag rows with the current thread id), auto (continuous tracing across pauses, written to numbered segments), auto_status, auto_stop. A run-trace only advances while the target runs: pausing ends it, which is what auto exists to work around.',
+    'Execution tracing. Actions: into/over/run/stop/status/animate/conditional_run/log_setup/hitcount/type/set_type/trace_thread/step_filter/trace_all_threads/auto/auto_status/auto_stop. A run-trace advances only while the target runs; pausing ends it (use auto for continuous tracing). Always stop a trace with action=stop, never by pausing the debugger.',
     {
       action: z.enum([
         'into', 'over', 'run', 'stop', 'status', 'animate',

@@ -8,7 +8,7 @@
 or any MCP client in plain English and it sets breakpoints, reads memory, disassembles, traces,
 dumps PEs, and bypasses anti-debug — live, inside the debugger.
 
-**23 mega-tools** over **153 REST endpoints**, fully typed with Zod. A C++ plugin runs inside
+**26 mega-tools** over **170 REST endpoints**, fully typed with Zod. A C++ plugin runs inside
 x64dbg; a tiny TypeScript server bridges it to your client over stdio. Everything stays on
 `127.0.0.1` — nothing leaves your machine.
 
@@ -87,7 +87,7 @@ Open a target in x64dbg and start talking to your assistant.
 
 ## Tools at a glance
 
-23 action-based tools spanning the whole debugger:
+26 action-based tools spanning the whole debugger:
 
 - **Control** — run/step/pause, raw commands, scripts, expression eval
 - **CPU & memory** — registers (incl. AVX-512), read/write/alloc/protect, memory map
@@ -97,6 +97,7 @@ Open a target in x64dbg and start talking to your assistant.
 - **Symbols & search** — labels, comments, bookmarks, AOB pattern + string scan
 - **Process & system** — threads/TEB, handles, TCP, PEB, **anti-debug hide**
 - **Patching & dumping** — byte patches, PE dump, IAT fix, patch export
+- **Instances & UI** — multi-instance routing with leases, elevated launch, window OCR/click/type
 
 Every tool, action, and endpoint is documented in **[docs/REFERENCE.md](docs/REFERENCE.md)**.
 

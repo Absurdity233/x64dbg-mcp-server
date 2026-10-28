@@ -6,7 +6,7 @@ quick tour; this is the exhaustive version (kept for humans doing deep work and 
 agents operating the plugin).
 
 - [How it works](#how-it-works)
-- [Tool reference (23 mega-tools)](#tool-reference-23-mega-tools)
+- [Tool reference (26 mega-tools)](#tool-reference-26-mega-tools)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Building from source](#building-from-source)
@@ -19,27 +19,28 @@ agents operating the plugin).
                          stdio                        HTTP (localhost)
  MCP Client  <───────────────────>  TypeScript MCP  <──────────────────>  C++ Plugin
  (Claude,                           Server            127.0.0.1:27042     (inside x64dbg)
-  Cursor,                           23 mega-tools                         153 REST endpoints
+  Cursor,                           26 mega-tools                         170 REST endpoints
   etc.)                             Zod validation                        Bridge/Plugin SDK
 ```
 
 - **C++ Plugin** (`x64dbg_mcp.dp64` / `.dp32`) runs inside x64dbg as a lightweight REST API
-  server on `127.0.0.1:27042`. It wraps the x64dbg Bridge/Plugin SDK with 153 JSON endpoints
-  across 22 handler files.
+  server on `127.0.0.1:27042`. It wraps the x64dbg Bridge/Plugin SDK with 170 JSON endpoints
+  across 23 handler files.
 - **TypeScript MCP Server** (`x64dbg-mcp-server` on npm) implements the MCP protocol over
-  stdio. The 23 mega-tools use Zod discriminated unions to validate parameters, then route
-  requests to the correct REST endpoint on the plugin via localhost HTTP.
+  stdio. The 26 mega-tools use flat Zod schemas (one `action` enum plus optional fields, with
+  required-field checks at call time) to validate parameters, then route requests to the
+  correct REST endpoint on the plugin via localhost HTTP.
 
 The MCP server waits for the plugin to become available, performs periodic health checks, and
-automatically reconnects if x64dbg restarts. By default it waits indefinitely per request
-(debugger operations such as run/trace are unbounded); set `X64DBG_MCP_TIMEOUT` for a hard
-ceiling. Transient connection failures retry up to 3 times with exponential backoff (timeouts
-are not retried).
+automatically reconnects if x64dbg restarts. Reads default to `X64DBG_MCP_READ_TIMEOUT_MS`
+(30s, long-polls excluded); writes and debugger control keep `X64DBG_MCP_TIMEOUT` (0 = wait
+indefinitely, since run/trace are unbounded). Transient connection failures retry up to 3 times
+with exponential backoff (timeouts are not retried).
 
 **Why stdio?** No SSE reconnection issues, no port conflicts, no dropped connections. The MCP
 client spawns the server as a child process — it just works.
 
-## Tool reference (23 mega-tools)
+## Tool reference (26 mega-tools)
 
 Each tool accepts an `action` parameter that selects the specific operation. Parameters are
 validated with Zod schemas at runtime.
@@ -93,7 +94,14 @@ validated with Zod schemas at runtime.
 | `x64dbg_process` | `basic`, `detailed`, `cmdline`, `elevated`, `dbversion`, `set_cmdline` | Process info, PID, PEB, elevation status, debugger version |
 | `x64dbg_threads` | `list`, `current`, `count`, `info`, `teb`, `name`, `switch`, `suspend`, `resume` | Thread enumeration, TEB access, thread control |
 | `x64dbg_handles` | `list_handles`, `list_tcp`, `list_windows`, `list_heaps`, `get_name`, `close` | Handles, TCP connections, windows, heaps |
-| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger` | PEB/TEB inspection, DEP status, hide debugger from anti-debug |
+| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger`, `harden`, `vm_probes`, `probe_breakpoints` | PEB/TEB inspection, DEP status, hide debugger, VM-probe scan |
+
+### Instances & UI
+
+| Tool | Actions | Description |
+|------|---------|-------------|
+| `x64dbg_instances` | `list`, `start`, `use`, `status`, `release`, `steal` | Multi-instance routing, leases, elevated launch |
+| `x64dbg_ui` | `windows`, `info`, `activity`, `screenshot`, `ocr`, `findtext`, `clicktext`, `typeinto`, `click`, `realclick`, `type`, `key` | Window capture and input for the debuggee |
 
 ### Patching & dumping
 
@@ -113,6 +121,16 @@ Environment variables for the MCP server:
 | `X64DBG_MCP_TIMEOUT` | `0` | Per-request timeout in milliseconds. `0` = wait indefinitely (default), since debugger operations like run/trace are unbounded. Set a positive value for a hard ceiling. |
 | `X64DBG_MCP_RETRIES` | `3` | Retry count on transient connection failures (not applied to timeouts, 4xx/5xx, or malformed responses) |
 | `X64DBG_MCP_TOKEN` | *(empty)* | Bearer token sent on every request. Must match the plugin's **Settings > Token**. Empty = no auth. |
+| `X64DBG_MCP_READ_TIMEOUT_MS` | `30000` | Timeout for GET requests. Long-polls (`/api/command/events*`) opt out. `0` disables the cap. |
+| `X64DBG_MCP_MAX_BYTES` | `65536` | Cap on non-JSON text replies (disassembly, OCR, dumps). JSON is left intact so paging stays parseable. `0` disables. |
+| `X64DBG_MCP_LEASE` | `on` | Set `off` to stop refusing an instance another live MCP process owns. |
+| `X64DBG_MCP_LEASE_IDLE_MS` | `0` | Release a lease after this long without a tool call. `0` = never yield. |
+| `X64DBG_MCP_AUTOLAUNCH` | `on` | Set `off` to never start x64dbg implicitly; only `x64dbg_instances action=start` launches. |
+| `X64DBG_MCP_ELEVATED` | `off` | Launch x64dbg elevated by default. |
+| `X64DBG_MCP_ELEVATED_TASK` | *(empty)* | Highest-privilege scheduled task used instead of a UAC prompt (see `scripts/install-elevated-task.ps1`). |
+| `X64DBG_MCP_UAC_TIMEOUT_MS` | `120000` | How long to wait for the user to answer a UAC prompt. |
+| `X64DBG_MCP_INSTANCES` | *(unset)* | JSON array/object of `{id, port, host?, token?, x64dbgPath?, elevated?, elevatedTask?, label?}`. See [multi-instance](multi-instance.md). |
+| `X64DBG_MCP_INSTANCE` | *(first)* | Default instance for this server process. |
 
 Set these in your MCP client config if needed:
 
@@ -158,8 +176,8 @@ The plugin also provides GUI dialogs accessible from `Plugins > x64dbg MCP Serve
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  TypeScript MCP Server (x64dbg-mcp-server)                      │
 │                                                                 │
-│  23 tools registered via @modelcontextprotocol/sdk              │
-│  Zod discriminated unions validate action + parameters          │
+│  26 tools registered via @modelcontextprotocol/sdk              │
+│  Flat Zod schemas: action enum + optional fields                │
 │  HttpClient: auto-reconnect, health checks, retry logic         │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ HTTP GET/POST (127.0.0.1:27042)
@@ -167,7 +185,7 @@ The plugin also provides GUI dialogs accessible from `Plugins > x64dbg MCP Serve
 │  C++ Plugin DLL (x64dbg_mcp.dp64 / .dp32)                      │
 │                                                                 │
 │  Winsock2 HTTP server, JSON via nlohmann/json                   │
-│  22 handler files, 153 REST endpoints                           │
+│  23 handler files, 170 REST endpoints                           │
 │  c_bridge_executor: thread-safe calls to x64dbg SDK             │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ x64dbg Bridge/Plugin SDK

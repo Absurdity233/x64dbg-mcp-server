@@ -76,6 +76,32 @@ function compactJsonBlocks(result: any): void {
 }
 
 /**
+ * Cap huge non-JSON text blocks (disassembly, OCR, raw dumps).
+ *
+ * JSON blocks are deliberately left alone: truncating a JSON document mid-way
+ * makes it unparseable, and the list tools already page their results. Text
+ * output has no such structure, so cut it at the last newline before the cap
+ * and say how much was dropped.
+ */
+function truncateTextBlocks(result: any): void {
+  const max = config.maxOutputBytes;
+  if (!max || !Array.isArray(result?.content)) return;
+  for (const block of result.content) {
+    if (!block || block.type !== 'text' || typeof block.text !== 'string') continue;
+    const text = block.text;
+    if (text.length <= max) continue;
+    const trimmed = text.trimStart();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) continue;
+
+    const nl = text.lastIndexOf('\n', max);
+    const end = nl > max * 0.8 ? nl : max;
+    block.text =
+      text.slice(0, end) +
+      `\n...[truncated: ${end} of ${text.length} chars; raise X64DBG_MCP_MAX_BYTES]`;
+  }
+}
+
+/**
  * With several instances and no explicit default, take the first one nobody
  * else owns. Independent Claude Code sessions then land on different debuggers
  * without any per-session configuration. Done once, on the first call.
@@ -252,6 +278,7 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
         return runWithInstance(instance, async () => {
           const result = await handler(clean, ...callArgs.slice(1));
           compactJsonBlocks(result);
+          truncateTextBlocks(result);
           // Instance inventory/startup already probes endpoints with a short,
           // bounded timeout. Appending the generic state line here would route
           // through HttpClient and make list/status wait up to two minutes when

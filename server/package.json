@@ -1,7 +1,7 @@
 {
   "name": "x64dbg-mcp-server",
   "version": "2.4.0",
-  "description": "MCP server for x64dbg debugger - 25 mega-tools for AI-powered reverse engineering and debugging",
+  "description": "MCP server for x64dbg debugger - 26 mega-tools for AI-powered reverse engineering and debugging",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -14,6 +14,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test test/lease.test.mjs test/instances.test.mjs",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
     "dev": "tsc --watch"

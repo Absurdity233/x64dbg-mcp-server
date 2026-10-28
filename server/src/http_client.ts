@@ -66,7 +66,10 @@ export class HttpClient {
       }
     }
 
-    return this.request<T>(url.toString(), { method: 'GET', headers: this.auth_headers() });
+    // Event long-polls park server-side for up to X64DBG_MCP_EVENT_HOLD_MS;
+    // a read timeout would abort a wait that is working as designed.
+    const timeoutMs = /\/events(\/|$)/.test(path) ? 0 : config.readTimeoutMs;
+    return this.request<T>(url.toString(), { method: 'GET', headers: this.auth_headers() }, timeoutMs);
   }
 
   async post<T = unknown>(path: string, body?: unknown): Promise<T> {
@@ -80,7 +83,9 @@ export class HttpClient {
       options.body = JSON.stringify(body);
     }
 
-    return this.request<T>(url.toString(), options);
+    // Writes and debugger-control POSTs keep the global timeout: run/trace are
+    // unbounded by nature and default to "no timeout".
+    return this.request<T>(url.toString(), options, config.timeout);
   }
 
   destroy() {
@@ -225,7 +230,7 @@ export class HttpClient {
     );
   }
 
-  private async request<T>(url: string, options: RequestInit): Promise<T> {
+  private async request<T>(url: string, options: RequestInit, timeoutMs = config.timeout): Promise<T> {
     // CRITICAL: If not connected, wait for the plugin to come online
     // This prevents Claude from seeing connection errors and giving up
     await this.wait_for_connection();
@@ -239,8 +244,8 @@ export class HttpClient {
         // wait as long as the plugin needs (same as talking to it with curl).
         const controller = new AbortController();
         const timeout_id =
-          config.timeout > 0
-            ? setTimeout(() => controller.abort(), config.timeout)
+          timeoutMs > 0
+            ? setTimeout(() => controller.abort(), timeoutMs)
             : null;
 
         const response = await fetch(url, {
@@ -308,9 +313,9 @@ export class HttpClient {
         if (last_error.name === 'AbortError') {
           this.consecutive_failures++;
           throw new Error(
-            `Request aborted after ${config.timeout}ms (X64DBG_MCP_TIMEOUT). The plugin may be ` +
-            `busy with a long operation (run, trace, step-over-call). Raise the limit with ` +
-            `X64DBG_MCP_TIMEOUT=<ms>, or set X64DBG_MCP_TIMEOUT=0 to wait indefinitely.`
+            `Request aborted after ${timeoutMs}ms. Reads use X64DBG_MCP_READ_TIMEOUT_MS ` +
+            `(default 30000); writes/run/trace use X64DBG_MCP_TIMEOUT. The plugin may be busy ` +
+            `with a long operation. Raise the relevant limit, or set it to 0 to wait indefinitely.`
           );
         }
 

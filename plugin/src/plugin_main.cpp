@@ -362,6 +362,20 @@ static void save_settings() {
     BridgeSettingFlush();
 }
 
+// Identity of the x64dbg process hosting this plugin. The MCP server uses this
+// to report instance pid/elevation without spawning a PowerShell process, and
+// "elevated" is the same TokenElevation UIPI uses when deciding whether input
+// can cross into this process's windows.
+static bool current_process_is_elevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD returned = 0;
+    const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated != 0;
+}
+
 // ============================================================================
 // Route registration
 // ============================================================================
@@ -372,7 +386,9 @@ void register_all_routes(c_http_router& router) {
         return s_http_response::ok({
             {"version", PLUGIN_VERSION_STR},
             {"plugin",  PLUGIN_NAME},
-            {"status",  "ok"}
+            {"status",  "ok"},
+            {"pid",     GetCurrentProcessId()},
+            {"elevated", current_process_is_elevated()}
         });
     });
 

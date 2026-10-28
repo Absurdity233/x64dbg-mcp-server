@@ -48,6 +48,9 @@ interface Probe {
   module?: string;
   state?: string;
   cip?: string;
+  /** x64dbg's own pid/elevation, when the plugin reports them (2.5+). */
+  x64dbg_pid?: number;
+  x64dbg_elevated?: boolean | null;
 }
 
 async function fetchJson(
@@ -80,13 +83,21 @@ async function probe(inst: InstanceEndpoint): Promise<Probe> {
     fetchJson(inst, '/api/debug/state'),
   ]);
 
-  return {
+  const result: Probe = {
     reachable: true,
     pid: info?.pid ?? undefined,
     module: state?.module ?? undefined,
     state: state?.state ?? undefined,
     cip: state?.cip ?? undefined,
   };
+
+  // Newer plugins identify themselves in /api/health, so a normal list does
+  // not need the PowerShell process scan at all. Older plugins omit these and
+  // the caller falls back to processView().
+  if (typeof health.pid === 'number') result.x64dbg_pid = health.pid;
+  if (typeof health.elevated === 'boolean') result.x64dbg_elevated = health.elevated;
+
+  return result;
 }
 
 export function registerInstanceTools(server: McpServer) {
@@ -116,6 +127,12 @@ export function registerInstanceTools(server: McpServer) {
           const rows = await Promise.all(
             listInstances().map(async (inst) => {
               const ep = `${inst.host}:${inst.port}`;
+              const probed = await probe(inst);
+              // Only pay for the process scan when the installed plugin is too
+              // old to report its own pid/elevation.
+              const extra = probed.x64dbg_pid === undefined || probed.x64dbg_elevated === undefined
+                ? await processView(inst)
+                : {};
               return {
                 id: inst.id,
                 label: inst.label,
@@ -126,8 +143,8 @@ export function registerInstanceTools(server: McpServer) {
                 // keyed by endpoint, so only one of them can ever be used.
                 ...(dups.has(ep) ? { shared_with: dups.get(ep)!.filter((x) => x !== inst.id) } : {}),
                 lease: leaseView(inst),
-                ...(await probe(inst)),
-                ...(await processView(inst)),
+                ...probed,
+                ...extra,
               };
             })
           );
@@ -313,6 +330,10 @@ export function registerInstanceTools(server: McpServer) {
               listInstances().map((i) => i.id).join(', ')
             );
           }
+          const probed = await probe(inst);
+          const extra = probed.x64dbg_pid === undefined || probed.x64dbg_elevated === undefined
+            ? await processView(inst)
+            : {};
           return {
             content: [{
               type: 'text',
@@ -320,8 +341,8 @@ export function registerInstanceTools(server: McpServer) {
                 id: inst.id,
                 endpoint: `${inst.host}:${inst.port}`,
                 lease: leaseView(inst),
-                ...(await probe(inst)),
-                ...(await processView(inst)),
+                ...probed,
+                ...extra,
               }, null, 2),
             }],
           };

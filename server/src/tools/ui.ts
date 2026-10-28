@@ -24,6 +24,13 @@ const INPUT_ACTIONS = new Set(['click', 'realclick', 'clicktext', 'typeinto', 't
 /** Actions that read the target's pixels/text, which also cross integrity. */
 const WINDOW_ACTIONS = new Set([...INPUT_ACTIONS, 'screenshot', 'ocr', 'findtext']);
 
+/**
+ * Actions that need PrintWindow/OCR. A paused Direct2D target can block
+ * PrintWindow indefinitely, so these are refused while the debugger is paused
+ * unless the caller explicitly passes force:true.
+ */
+const PAUSED_UNSAFE_ACTIONS = new Set(['screenshot', 'ocr', 'findtext', 'clicktext', 'typeinto']);
+
 /** Cache of pid -> window handle, so a UI flow does not re-enumerate windows. */
 const windowCache = new Map<number, { hwnd: number; at: number }>();
 // A window handle is stable for the life of a debug session. Resolve it through
@@ -72,7 +79,7 @@ async function probeElevation(
 export function registerUiTools(server: McpServer) {
   server.tool(
     'x64dbg_ui',
-    'Interact with the debuggee\'s window - the half x64dbg cannot do. Actions: windows (list top-level windows), info (geometry), screenshot (PNG to file, then read it), ocr (recognise on-screen text with positions), findtext (locate a string, return its client coordinates), clicktext (OCR + realclick on the match - no hardcoded coordinates), typeinto (OCR + click + type), click (posted message, does not move the mouse), realclick (SendInput, needed by custom-drawn UIs), type (WM_CHAR into the focused control), key (single virtual key).',
+    'Interact with the debuggee\'s window. Actions: windows, info, activity (diagnostics), screenshot/ocr/findtext (capture; pause-guarded), clicktext/typeinto/click/realclick/type/key (input; UIPI-guarded). Prefer input:"message"; use "real" only for raw-input UIs. Details: docs/REFERENCE.md.',
     {
       action: z.enum([
         'windows', 'info', 'activity', 'screenshot', 'ocr', 'findtext', 'clicktext', 'typeinto',
@@ -104,6 +111,10 @@ export function registerUiTools(server: McpServer) {
         'so it is serialised across all instances. "message" posts WM_* straight to the target window: no focus, ' +
         'no global cursor, and several targets can be driven in parallel. Use "message" first; fall back to ' +
         '"real" only if the app ignores posted messages (raw input / GetAsyncKeyState).'
+      ),
+      force: z.boolean().optional().describe(
+        'screenshot/ocr/findtext/clicktext/typeinto: proceed even when the debugger is paused. ' +
+        'Without it these are refused because PrintWindow/OCR on a paused Direct2D window can hang.'
       ),
     },
     async (args) => {
@@ -153,6 +164,38 @@ export function registerUiTools(server: McpServer) {
       if (args.action === 'type' || args.action === 'typeinto') requireString(args.text, 'text');
       if (args.action === 'findtext' || args.action === 'clicktext' || args.action === 'typeinto') {
         requireString(args.match, 'match');
+      }
+
+      // A paused Direct2D window can block PrintWindow until the timeout (or
+      // forever, depending on the driver). Refuse capture/OCR up front and tell
+      // the caller to resume; force:true is the explicit escape hatch for modal
+      // dialogs that really must be read/clicked while the target is paused.
+      if (!args.force && PAUSED_UNSAFE_ACTIONS.has(args.action)) {
+        try {
+          const st = await httpClient.get<any>('/api/debug/state');
+          if (st?.state === 'paused') {
+            return {
+              isError: true,
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  hwnd,
+                  action: args.action,
+                  instance: currentInstance().id,
+                  ok: false,
+                  error: 'debugger-paused',
+                  state: st.state,
+                  message:
+                    'The debugger is paused; PrintWindow/OCR can block on a paused Direct2D window. ' +
+                    'Resume first (x64dbg_debug action=run), or pass force:true if the window must be ' +
+                    'captured/clicked while paused (e.g. a modal dialog).',
+                }, null, 2),
+              }],
+            };
+          }
+        } catch {
+          // No session or plugin down: the action itself will report it.
+        }
       }
 
       // Fail before the silent nothing: an elevated window ignores input from
