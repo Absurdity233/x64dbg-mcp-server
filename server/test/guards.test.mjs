@@ -10,7 +10,16 @@ import path from 'node:path';
 // the audit log. Uses a fake plugin over HTTP, so no x64dbg is required.
 
 const SERVER_DIR = path.resolve(import.meta.dirname, '..');
-const state = { tracing: false, paused: false, failProcess: false, processHits: 0 };
+const state = {
+  tracing: false,
+  paused: false,
+  failProcess: false,
+  processHits: 0,
+  symbols: {},
+  memory: {},
+  patchWrites: [],
+  memWrites: [],
+};
 
 /** Tool responses end with a "[state] ..." line; strip it before JSON.parse. */
 function parseJson(text) {
@@ -28,8 +37,11 @@ const fail = (res, code, message) => json(res, code, { success: false, error: { 
 function startFakePlugin() {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
-    req.resume();
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
+      let payload = {};
+      try { payload = body ? JSON.parse(body) : {}; } catch { payload = {}; }
       switch (url.pathname) {
         case '/api/health':
           return ok(res, { version: '2.4.0', plugin: 'fake', status: 'ok', pid: 4242, elevated: false });
@@ -73,8 +85,38 @@ function startFakePlugin() {
             .filter((e) => e.seq > since);
           return ok(res, { events, count: events.length, latest_seq: 300, dropped: 0 });
         }
-        case '/api/memory/write':
-          return ok(res, { written: 1 });
+        case '/api/symbols/resolve': {
+          const name = url.searchParams.get('name') ?? '';
+          const address = state.symbols[name];
+          if (!address) return fail(res, 404, 'Cannot resolve: ' + name);
+          return ok(res, { name, address });
+        }
+        case '/api/memory/read': {
+          const addr = (url.searchParams.get('address') ?? '').toLowerCase();
+          const size = Number(url.searchParams.get('size') ?? '6');
+          const hex = state.memory[addr] ?? Array(size).fill('90').join(' ');
+          return ok(res, { address: addr, size, hex, ascii: '' });
+        }
+        case '/api/patches/apply': {
+          const addr = String(payload.address ?? '').toLowerCase();
+          const bytes = String(payload.bytes ?? '');
+          const original = state.memory[addr] ?? '';
+          state.memory[addr] = bytes;
+          state.patchWrites.push({ address: addr, bytes, original });
+          return ok(res, {
+            address: addr,
+            bytes_patched: bytes.split(/\s+/).length,
+            new_bytes: bytes,
+            original_bytes: original,
+          });
+        }
+        case '/api/memory/write': {
+          const addr = String(payload.address ?? '').toLowerCase();
+          const bytes = String(payload.bytes ?? '');
+          state.memory[addr] = bytes;
+          state.memWrites.push({ address: addr, bytes });
+          return ok(res, { written: bytes.split(/\s+/).length });
+        }
         default:
           return fail(res, 404, 'fake plugin has no route ' + url.pathname);
       }
@@ -245,4 +287,50 @@ test('guards, paging, structured errors and audit', { timeout: 60000 }, async (t
   const auditFile = path.join(tempDir, 'x64dbg-mcp', 'audit.log');
   const lines = fs.readFileSync(auditFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(lines.some((l) => l.tool === 'x64dbg_memory' && l.action === 'write' && l.instance === 'default'));
+});
+
+test('block_terminate patches and restores termination APIs', { timeout: 60000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'x64dbg-mcp-bt-'));
+  state.paused = true;
+  state.symbols = {
+    'kernelbase.TerminateProcess': '0x1000',
+    'kernelbase.ExitProcess': '0x2000',
+    'kernelbase.TerminateThread': '0x3000',
+    'ntdll.NtTerminateProcess': '0x4000',
+    'ntdll.NtTerminateThread': '0x5000',
+    'ntdll.RtlExitUserThread': '0x6000',
+  };
+  state.memory = {
+    '0x1000': '48 89 5C 24 08 57',
+    '0x2000': '40 53 48 83 EC 20',
+    '0x3000': '4C 8B DC 49 89 5B',
+    '0x4000': '4C 8B D1',
+    '0x5000': '4C 8B D1',
+    '0x6000': '40',
+  };
+  state.patchWrites = [];
+  state.memWrites = [];
+
+  const server = await startFakePlugin();
+  const mcp = startMcp(server.address().port, tempDir);
+  t.after(() => {
+    try { mcp.child.kill(); } catch {}
+    server.close();
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  });
+  await mcp.ready;
+
+  let r = await mcp.call('x64dbg_antidebug', { action: 'block_terminate' });
+  assert.equal(r.isError, false);
+  const blocked = parseJson(r.text);
+  assert.equal(blocked.patched.length, 6);
+  assert.equal(state.memory['0x1000'], 'B8 01 00 00 00 C3');
+  assert.equal(state.memory['0x4000'], '33 C0 C3');
+  assert.equal(state.memory['0x6000'], 'C3');
+
+  r = await mcp.call('x64dbg_antidebug', { action: 'block_terminate', restore: true });
+  assert.equal(r.isError, false);
+  assert.equal(state.memory['0x1000'], '48 89 5C 24 08 57');
+  assert.equal(state.memory['0x4000'], '4C 8B D1');
+  assert.equal(state.memWrites.length, 6);
 });

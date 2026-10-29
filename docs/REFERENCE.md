@@ -118,7 +118,7 @@ validated with Zod schemas at runtime.
 | `x64dbg_process` | `basic`, `detailed`, `cmdline`, `elevated`, `dbversion`, `set_cmdline` | Process info, PID, PEB, elevation status, debugger version |
 | `x64dbg_threads` | `list`, `current`, `count`, `info`, `teb`, `name`, `switch`, `suspend`, `resume` | Thread enumeration, TEB access, thread control |
 | `x64dbg_handles` | `list_handles`, `list_tcp`, `list_windows`, `list_heaps`, `get_name`, `close` | Handles, TCP connections, windows, heaps |
-| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger`, `harden`, `vm_probes`, `probe_breakpoints` | PEB/TEB inspection, DEP status, hide debugger, VM-probe scan |
+| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger`, `harden`, `vm_probes`, `probe_breakpoints`, `block_terminate` | PEB/TEB inspection, DEP status, hide debugger, VM-probe scan, stub termination APIs in a paused target (`restore:true` reverts) |
 
 ### Instances & UI
 
