@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
-import { requireString } from './util.js';
+import { pageResult, requireString } from './util.js';
 
 export function registerSearchTools(server: McpServer) {
   server.tool(
@@ -17,8 +17,11 @@ export function registerSearchTools(server: McpServer) {
       module: z.string().optional().describe('string: module to search (empty = all)'),
       encoding: z.enum(['utf8', 'ascii', 'unicode', 'auto']).optional().describe('string/string_at: text encoding'),
       max_length: z.number().optional().describe('string_at: maximum string length (default 256)'),
+      limit: z.number().int().min(1).max(5000).optional().describe('pattern/string/symbol_auto_complete/memory: max items returned (default 500)'),
+      offset: z.number().int().min(0).optional().describe('pattern/string/symbol_auto_complete/memory: skip this many items'),
     },
     async (args) => {
+      const page = (data: unknown) => pageResult(data, args.offset ?? 0, args.limit ?? 500);
       switch (args.action) {
         case 'pattern': {
           const body: Record<string, unknown> = {
@@ -28,7 +31,7 @@ export function registerSearchTools(server: McpServer) {
           if (args.address) body.address = args.address;
           if (args.size) body.size = args.size;
           const data = await httpClient.post('/api/search/pattern', body);
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(page(data), null, 2) }] };
         }
         case 'string': {
           const data = await httpClient.post('/api/search/string', {
@@ -36,7 +39,7 @@ export function registerSearchTools(server: McpServer) {
             module: args.module ?? '',
             encoding: args.encoding ?? 'utf8',
           });
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(page(data), null, 2) }] };
         }
         case 'string_at': {
           const data = await httpClient.get('/api/search/string_at', {
@@ -51,14 +54,14 @@ export function registerSearchTools(server: McpServer) {
             search: requireString(args.query, 'query'),
             max_results: args.max_results ?? 256,
           });
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(page(data), null, 2) }] };
         }
         case 'memory': {
           const data = await httpClient.post('/api/search/memory', {
             pattern: requireString(args.query, 'query'),
             max_results: args.max_results ?? 100,
           });
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(page(data), null, 2) }] };
         }
         case 'encode_type': {
           const data = await httpClient.get('/api/search/encode_type', {

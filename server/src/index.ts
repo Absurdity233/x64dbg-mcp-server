@@ -1,9 +1,12 @@
 #!/usr/bin/env node
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { config } from './config.js';
-import { httpClient } from './http_client.js';
+import { httpClient, PluginError } from './http_client.js';
 import { runWithInstance } from './context.js';
 import {
   applyX64dbgPathOverride,
@@ -98,6 +101,75 @@ function truncateTextBlocks(result: any): void {
     block.text =
       text.slice(0, end) +
       `\n...[truncated: ${end} of ${text.length} chars; raise X64DBG_MCP_MAX_BYTES]`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Audit log for write actions
+// ---------------------------------------------------------------------------
+
+const AUDIT_LOG = join(tmpdir(), 'x64dbg-mcp', 'audit.log');
+
+/** Actions that change debugger/target state, keyed by tool name. */
+const WRITE_ACTIONS: Record<string, Set<string>> = {
+  x64dbg_debug: new Set([
+    'load', 'attach', 'detach', 'stop_debug', 'restart_debug', 'run', 'pause',
+    'force_pause', 'step_into', 'step_over', 'step_out', 'run_to_address', 'recover',
+  ]),
+  x64dbg_memory: new Set(['write', 'allocate', 'free', 'protect']),
+  x64dbg_patches: new Set(['apply', 'restore']),
+  x64dbg_registers: new Set(['set']),
+  x64dbg_breakpoints: new Set([
+    'set_software', 'set_hardware', 'set_memory', 'delete', 'enable', 'disable',
+    'toggle', 'set_condition', 'set_log', 'set_logging', 'configure',
+    'configure_batch', 'reset_hit_count',
+  ]),
+  x64dbg_command: new Set(['execute', 'script', 'set_init_script', 'save_database', 'clear_events']),
+  x64dbg_instances: new Set(['start', 'use', 'release', 'steal']),
+  x64dbg_tracing: new Set([
+    'into', 'over', 'run', 'stop', 'animate', 'conditional_run', 'log_setup',
+    'step_filter', 'trace_thread', 'trace_all_threads', 'auto', 'auto_stop', 'set_type',
+  ]),
+  x64dbg_ui: new Set(['click', 'realclick', 'clicktext', 'typeinto', 'type', 'key']),
+  x64dbg_exceptions: new Set(['set', 'delete', 'skip', 'preset']),
+  x64dbg_antidebug: new Set(['hide_debugger', 'harden', 'probe_breakpoints']),
+  x64dbg_dumping: new Set(['dump_module', 'rebuild', 'fix_iat', 'export_patch_file']),
+  x64dbg_control_flow: new Set(['add_function', 'delete_function']),
+  x64dbg_symbols: new Set(['set_label', 'set_comment', 'bookmark']),
+  x64dbg_handles: new Set(['close']),
+  x64dbg_process: new Set(['set_cmdline']),
+};
+
+function isWriteAction(tool: string, args: Record<string, unknown>): boolean {
+  const action = typeof args.action === 'string' ? args.action : '';
+  return WRITE_ACTIONS[tool]?.has(action) ?? false;
+}
+
+/**
+ * Append one JSON line per write action. Opt-in via X64DBG_MCP_AUDIT=1 so the
+ * default stays quiet. The full args are capped at 2 KB (a memory-write buffer
+ * can be megabytes) and auditing never fails the tool call.
+ */
+function auditToolCall(
+  tool: string,
+  instance: InstanceEndpoint,
+  args: Record<string, unknown>,
+  result: any
+): void {
+  if (!config.audit || !isWriteAction(tool, args)) return;
+  try {
+    mkdirSync(dirname(AUDIT_LOG), { recursive: true });
+    const raw = JSON.stringify(args);
+    appendFileSync(AUDIT_LOG, JSON.stringify({
+      ts: new Date().toISOString(),
+      instance: instance.id,
+      tool,
+      action: typeof args.action === 'string' ? args.action : undefined,
+      args: raw.length > 2000 ? `${raw.slice(0, 2000)}...` : raw,
+      isError: !!result?.isError,
+    }) + '\n');
+  } catch {
+    // Auditing is advisory bookkeeping; never fail a call because of it.
   }
 }
 
@@ -276,7 +348,34 @@ function installToolMiddleware(server: McpServer): { count: () => number } {
         delete clean.instance;
 
         return runWithInstance(instance, async () => {
-          const result = await handler(clean, ...callArgs.slice(1));
+          let result: any;
+          try {
+            result = await handler(clean, ...callArgs.slice(1));
+          } catch (err) {
+            if (err instanceof PluginError) {
+              const failure = {
+                content: [{
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    error: {
+                      code: err.code,
+                      message: err.message,
+                      ...(err.hint ? { hint: err.hint } : {}),
+                    },
+                    tool: toolName,
+                    instance: instance.id,
+                  }, null, 2),
+                }],
+                isError: true as const,
+              };
+              auditToolCall(toolName, instance, clean, failure);
+              return failure;
+            }
+            auditToolCall(toolName, instance, clean, { isError: true });
+            throw err;
+          }
+
+          auditToolCall(toolName, instance, clean, result);
           compactJsonBlocks(result);
           truncateTextBlocks(result);
           // Instance inventory/startup already probes endpoints with a short,

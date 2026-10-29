@@ -13,6 +13,39 @@ interface PluginResponse<T = unknown> {
 
 type ConnectionState = 'connected' | 'disconnected' | 'reconnecting';
 
+/** A definite answer from the plugin (success:false), with an actionable hint. */
+export class PluginError extends Error {
+  readonly code: number;
+  readonly hint?: string;
+
+  constructor(code: number, message: string, hint?: string) {
+    super(message);
+    this.name = 'PluginError';
+    this.code = code;
+    this.hint = hint;
+  }
+}
+
+function pluginHint(code: number, message: string): string | undefined {
+  switch (code) {
+    case 400:
+      return 'The plugin rejected the request parameters; check the action and its required fields.';
+    case 401:
+      return 'Token mismatch: align X64DBG_MCP_TOKEN with the plugin settings, then restart.';
+    case 404:
+      return 'Plugin route not found: the installed plugin may be older than the server. ' +
+        'Run x64dbg_process action=compat or reinstall the plugin.';
+    case 409:
+      return /trace/i.test(message)
+        ? 'A trace is active; stop it with x64dbg_tracing action=stop first.'
+        : 'The debugger is in the wrong state. Load or attach a target, and pause/resume as needed.';
+    case 500:
+      return 'The plugin hit an internal error; this action may be unsupported by this x64dbg build.';
+    default:
+      return undefined;
+  }
+}
+
 // Default wait for a plugin that is not answering. Single instance: 2 minutes,
 // because the editor may still be starting x64dbg. Multi-instance: 15 seconds,
 // because a stopped instance is a routing mistake, not a startup race - stalling
@@ -270,13 +303,15 @@ export class HttpClient {
 
           if (err_code === 401) {
             this.auth_rejected = true;
-            throw new Error(
+            throw new PluginError(
+              401,
               `Plugin rejected the auth token (401). Set X64DBG_MCP_TOKEN to match the ` +
-              `token configured in Plugins > x64dbg MCP Server > Settings.`
+              `token configured in Plugins > x64dbg MCP Server > Settings.`,
+              pluginHint(401, err_msg)
             );
           }
 
-          throw new Error(`Plugin error (${err_code}): ${err_msg}`);
+          throw new PluginError(err_code, err_msg, pluginHint(err_code, err_msg));
         }
 
         // Success
@@ -295,11 +330,10 @@ export class HttpClient {
 
         // Don't retry on definite plugin responses - they are deterministic, and
         // retrying a non-idempotent POST (memory/write, patches/apply, breakpoints/set)
-        // would double-apply the side effect. This covers 4xx, 5xx, and malformed
-        // JSON: the plugin answered, so the connection is alive.
+        // would double-apply the side effect. PluginError covers 4xx/5xx; the
+        // malformed-JSON case means the plugin answered but the body is wrong.
         if (
-          last_error.message.includes('Plugin error (4') ||
-          last_error.message.includes('Plugin error (5') ||
+          last_error instanceof PluginError ||
           last_error.message.startsWith('Invalid JSON response')
         ) {
           this.state = 'connected';

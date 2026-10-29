@@ -2,6 +2,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
 import { requireString } from './util.js';
+import { activeTrace, traceBlocked } from './trace_guard.js';
+
+/** Actions that start a trace; starting a second one over a live trace is unsafe. */
+const TRACE_START_ACTIONS = new Set([
+  'into', 'over', 'run', 'animate', 'conditional_run',
+  'trace_thread', 'trace_all_threads', 'auto',
+]);
 
 export function registerTracingTools(server: McpServer) {
   server.tool(
@@ -34,9 +41,25 @@ export function registerTracingTools(server: McpServer) {
       prefix: z.string().optional().describe('auto: segment file prefix (default seg)'),
       hold_ms: z.number().optional().describe('auto: dwell time after each pause before re-arming (default 0)'),
       max_segments: z.number().optional().describe('auto: stop after this many segments (0 = unlimited)'),
+      force: z.boolean().optional().describe(
+        'start actions (into/over/run/animate/conditional_run/trace_thread/trace_all_threads/auto): ' +
+        'proceed even when a trace is already running. Without it the call is refused.'
+      ),
     },
     async (args) => {
       const { action } = args;
+
+      if (!args.force && TRACE_START_ACTIONS.has(action)) {
+        const st = await activeTrace();
+        if (st) {
+          return traceBlocked(
+            action,
+            st,
+            'Another trace is already running. Stop it with action=stop (or auto_stop) first, ' +
+            'or pass force:true to start anyway.'
+          );
+        }
+      }
 
       switch (action) {
         case 'into':

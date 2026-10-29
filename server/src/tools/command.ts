@@ -1,8 +1,46 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
-import { drain, describe, resetCursor } from '../events.js';
+import { drain, describe, resetCursor, setCursor } from '../events.js';
 import { requireString } from './util.js';
+import { activeTrace, traceBlocked } from './trace_guard.js';
+
+/**
+ * First token of an x64dbg command that would disturb a live run-trace.
+ * Raw `execute`/`script` is an escape hatch, so the server-side guard has to
+ * inspect the command text itself - otherwise `x64dbg_command execute "pause"`
+ * bypasses every check in x64dbg_debug.
+ */
+const TRACE_DESTRUCTIVE_COMMANDS = new Set([
+  'pause', 'stop', 'stopdebug', 'stoptrace', 'stopruntrace',
+  'restart', 'restartadmin', 'init', 'attach', 'detach', 'load', 'close', 'quit',
+]);
+
+function firstDestructiveStatement(text: string): string | null {
+  for (const statement of text.split(/[;\r\n]+/)) {
+    const first = statement.trim().split(/\s+/)[0]?.toLowerCase();
+    if (first && TRACE_DESTRUCTIVE_COMMANDS.has(first)) return first;
+  }
+  return null;
+}
+
+async function commandTraceGuard(
+  action: string,
+  text: string,
+  force?: boolean
+): Promise<any | null> {
+  if (force) return null;
+  const keyword = firstDestructiveStatement(text);
+  if (!keyword) return null;
+  const st = await activeTrace();
+  if (!st) return null;
+  return traceBlocked(
+    action,
+    st,
+    `The command starts with the trace-destructive keyword "${keyword}". ` +
+    'Stop the trace first (x64dbg_tracing action=stop), or pass force:true.'
+  );
+}
 
 export function registerCommandTools(server: McpServer) {
   server.tool(
@@ -21,17 +59,30 @@ export function registerCommandTools(server: McpServer) {
       format: z.string().optional().describe('format: format string for the x64dbg expression engine'),
       file: z.string().optional().describe('set_init_script: path to the init script'),
       category: z.string().optional().describe('list_commands: filter by category (control, breakpoints, memory, analysis, trace, misc)'),
+      max_events: z.number().int().min(1).max(2000).optional()
+        .describe('get_events: max events to return (default 200). The rest stay buffered for the next call.'),
+      force: z.boolean().optional().describe(
+        'execute/script: proceed even when the command would pause/stop/reload during a live trace. ' +
+        'Without it such commands are refused because they can corrupt the debug engine.'
+      ),
     },
     async (args) => {
       let data: any;
       switch (args.action) {
-        case 'execute':
-          data = await httpClient.post('/api/command/exec', { command: requireString(args.command, 'command') });
+        case 'execute': {
+          const command = requireString(args.command, 'command');
+          const blocked = await commandTraceGuard('execute', command, args.force);
+          if (blocked) return blocked;
+          data = await httpClient.post('/api/command/exec', { command });
           break;
-        case 'script':
+        }
+        case 'script': {
           if (!Array.isArray(args.commands)) throw new Error("'commands' is required for this action");
+          const blocked = await commandTraceGuard('script', args.commands.join('\n'), args.force);
+          if (blocked) return blocked;
           data = await httpClient.post('/api/command/script', { commands: args.commands });
           break;
+        }
         case 'evaluate':
           data = await httpClient.post('/api/command/eval', { expression: requireString(args.expression, 'expression') });
           break;
@@ -48,15 +99,26 @@ export function registerCommandTools(server: McpServer) {
           data = await httpClient.get('/api/command/hash');
           break;
         case 'get_events': {
+          const max = Math.min(Math.max(args.max_events ?? 200, 1), 2000);
           const { events, dropped } = await drain();
+          const shown = events.slice(0, max);
+          // drain() advanced the cursor past the whole batch. Rewind it to the
+          // last event we are showing so the next get_events returns the rest
+          // instead of silently dropping them.
+          if (shown.length < events.length) {
+            const last = shown[shown.length - 1]?.seq;
+            if (typeof last === 'number') setCursor(last);
+          }
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 count: events.length,
+                returned: shown.length,
+                truncated: shown.length < events.length,
                 dropped,
-                summary: events.map(describe),
-                events,
+                summary: shown.map(describe),
+                events: shown,
               }, null, 2),
             }],
           };

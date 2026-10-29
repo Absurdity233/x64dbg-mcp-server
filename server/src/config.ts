@@ -87,6 +87,9 @@ export const config = {
   elevatedTask: process.env.X64DBG_MCP_ELEVATED_TASK ?? '',
   // How long to wait for the user to answer a UAC prompt.
   uacTimeoutMs: parseMs(process.env.X64DBG_MCP_UAC_TIMEOUT_MS, 120_000),
+  // Append write actions (memory/patches/breakpoints/commands/UI input) to
+  // %TEMP%\x64dbg-mcp\audit.log (X64DBG_MCP_AUDIT=1).
+  audit: parseBool(process.env.X64DBG_MCP_AUDIT),
 };
 
 export function getBaseUrl(): string {

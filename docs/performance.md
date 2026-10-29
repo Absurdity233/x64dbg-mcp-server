@@ -6,8 +6,8 @@ Measured on the local setup (x64dbg + plugin on loopback):
 |---|---|
 | Cheap tool call round trip (`x64dbg_process basic`) | **3.35 ms** |
 | 8 concurrent calls | **12–17 ms** (the MCP SDK does not serialise handlers) |
-| `tools/list` schema, single instance | 29,226 B ≈ **8.1k tokens** |
-| `tools/list` schema, two instances | 32,502 B ≈ **9.0k tokens** |
+| `tools/list` schema, single instance | 32,167 B ≈ **8.9k tokens** |
+| `tools/list` schema, two instances | 35,317 B ≈ **9.8k tokens** |
 | `handles list` before paging | 61.5 KB ≈ **17k tokens** in one reply |
 
 Local latency is not the problem - a call is a couple of HTTP requests to
@@ -17,8 +17,15 @@ a single unbounded list reply can be larger than the whole schema.
 ## What is optimised
 
 **Instance parameter is conditional.** `instance` is only added to the 26 tool
-schemas when more than one instance is configured; it costs ~1,026 tokens and
-is meaningless with a single target. Single-instance schema: 9.2k -> 8.1k.
+schemas when more than one instance is configured; it costs ~0.9k tokens and
+is meaningless with a single target. Single-instance schema: 9.8k -> 8.9k.
+
+**List replies are paged.** `x64dbg_database`, `x64dbg_analysis`
+(`xrefs_to/xrefs_from/basic_blocks`) and `x64dbg_search`
+(`pattern/string/symbol_auto_complete/memory`) take `limit`/`offset` and return
+`total/returned/truncated`; `get_events` takes `max_events` and leaves the rest
+in the plugin buffer. This replaces unbounded JSON replies (the plugin itself
+caps strings at 5000, which is still ~thousands of items).
 
 **Large JSON replies are compacted.** Every tool pretty-prints its result (131
 call sites). Instead of rewriting them, the tool wrapper re-serialises any JSON
@@ -97,9 +104,10 @@ cost and the misread rate, because the engine gets fewer, larger glyphs.
 
 ## Where the remaining cost is
 
-- **Tool descriptions**: 4,856 B ≈ 1.3k tokens, dominated by `x64dbg_ui`
-  (3.2 KB) and `x64dbg_tracing` (3.0 KB) enumerating every action. Trimming them
-  is the next easy win if schema size matters.
+- **Tool descriptions**: 4,588 B ≈ 1.3k tokens. `x64dbg_ui` and
+  `x64dbg_tracing` were trimmed to ~300/350 chars; the rest is spread across 24
+  tools. The schema itself (~8.9k tokens) is now the dominant fixed cost, and
+  most of that is per-action parameter definitions.
 - **26 tools** is a reasonable number; splitting them across several MCP servers
   would only add handshake overhead.
 - **Long-running debugger operations** (run to a breakpoint, trace) dominate

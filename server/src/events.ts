@@ -56,6 +56,14 @@ export function resetCursor(consumer?: string): void {
   cursors.set(scopedKey(consumer), 0);
 }
 
+/**
+ * Move one consumer's cursor. Used by get_events when the caller caps a batch:
+ * the events beyond the cap stay in the plugin buffer for the next call.
+ */
+export function setCursor(seq: number, consumer?: string): void {
+  cursors.set(scopedKey(consumer), seq);
+}
+
 /** Allocate a fresh consumer id for one blocking wait. */
 export function newConsumer(): string {
   return `c${++consumerSeq}`;

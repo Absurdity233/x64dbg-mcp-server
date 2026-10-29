@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
+import { pageResult } from './util.js';
 
 export function registerAnalysisTools(server: McpServer) {
   server.tool(
@@ -8,9 +9,11 @@ export function registerAnalysisTools(server: McpServer) {
     'Get function info, xrefs, basic blocks or source location for an address',
     {
       action: z.enum(['function', 'xrefs_to', 'xrefs_from', 'basic_blocks', 'source', 'mnemonic_brief']).describe('Information to get'),
-      query: z.string().optional().default('cip').describe('Address to look up (or mnemonic for mnemonic_brief)')
+      query: z.string().optional().default('cip').describe('Address to look up (or mnemonic for mnemonic_brief)'),
+      limit: z.number().int().min(1).max(5000).optional().describe('xrefs_to/xrefs_from/basic_blocks: max items (default 500)'),
+      offset: z.number().int().min(0).optional().describe('xrefs_to/xrefs_from/basic_blocks: skip this many items'),
     },
-    async ({ action, query }) => {
+    async ({ action, query, limit, offset }) => {
       let data: any;
       switch (action) {
         case 'function': data = await httpClient.get('/api/analysis/function', { address: query }); break;
@@ -20,7 +23,11 @@ export function registerAnalysisTools(server: McpServer) {
         case 'source': data = await httpClient.get('/api/analysis/source', { address: query }); break;
         case 'mnemonic_brief': data = await httpClient.get('/api/analysis/mnemonic_brief', { mnemonic: query }); break;
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      // Only the list-shaped responses are paged; function/source objects are
+      // left exactly as the plugin returned them.
+      const pageable = action === 'xrefs_to' || action === 'xrefs_from' || action === 'basic_blocks';
+      const out = pageable ? pageResult(data, offset ?? 0, limit ?? 500) : data;
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
     }
   );
 
@@ -29,9 +36,11 @@ export function registerAnalysisTools(server: McpServer) {
     'List known constants, error codes, defined structs, or search strings in a module',
     {
       action: z.enum(['constants', 'error_codes', 'structs', 'strings']).describe('Type of list to retrieve'),
-      module: z.string().optional().describe('Module name (required for strings action)')
+      module: z.string().optional().describe('Module name (required for strings action)'),
+      limit: z.number().int().min(1).max(5000).optional().describe('max items (default 500)'),
+      offset: z.number().int().min(0).optional().describe('skip this many items'),
     },
-    async ({ action, module }) => {
+    async ({ action, module, limit, offset }) => {
       let data: any;
       switch (action) {
         case 'constants': data = await httpClient.get('/api/analysis/constants'); break;
@@ -42,7 +51,9 @@ export function registerAnalysisTools(server: McpServer) {
           data = await httpClient.get('/api/analysis/strings', { module });
           break;
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      // The plugin caps strings at 5000; constants/structs can also be large.
+      const out = pageResult(data, offset ?? 0, limit ?? 500);
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
     }
   );
 

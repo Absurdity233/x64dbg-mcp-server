@@ -40,6 +40,30 @@ with exponential backoff (timeouts are not retried).
 **Why stdio?** No SSE reconnection issues, no port conflicts, no dropped connections. The MCP
 client spawns the server as a child process — it just works.
 
+### Safety guards
+
+- **Live trace.** `x64dbg_debug` refuses `pause`, `force_pause`, `stop_debug`,
+  `restart_debug`, `detach`, `load`, `attach`, `recover` and `run_to_address`;
+  `x64dbg_command execute/script` refuses statements whose first token is
+  `pause/stop/StopRunTrace/restart/init/attach/detach/load/close/quit`; and
+  `x64dbg_tracing` refuses to start a second trace. Pass `force:true` to override
+  one call, or use `x64dbg_tracing action=stop` (it pauses, then calls
+  `StopRunTrace`).
+- **Paused debugger.** `x64dbg_ui` refuses `screenshot`, `ocr`, `findtext`,
+  `clicktext` and `typeinto` because `PrintWindow`/OCR can block on a paused
+  Direct2D window. Resume first, or pass `force:true` for a modal dialog.
+- **Integrity mismatch.** `x64dbg_ui` checks the target's integrity level and
+  returns `integrity-mismatch` instead of letting UIPI drop input silently.
+- **Elevation.** `x64dbg_instances start elevated=true` returns
+  `running-unelevated` for an already-running medium-integrity x64dbg (Windows
+  cannot raise an existing process).
+
+Large list responses are paged: `x64dbg_database`, `x64dbg_analysis`
+(`xrefs_to/xrefs_from/basic_blocks`) and `x64dbg_search`
+(`pattern/string/symbol_auto_complete/memory`) take `limit`/`offset`;
+`x64dbg_command get_events` takes `max_events` and leaves the rest buffered.
+Plugin errors are returned as `{"error":{"code","message","hint"}}`.
+
 ## Tool reference (26 mega-tools)
 
 Each tool accepts an `action` parameter that selects the specific operation. Parameters are
@@ -50,7 +74,7 @@ validated with Zod schemas at runtime.
 | Tool | Actions | Description |
 |------|---------|-------------|
 | `x64dbg_debug` | `run`, `pause`, `force_pause`, `step_into`, `step_over`, `step_out`, `stop_debug`, `restart_debug`, `run_to_address`, `state` | Control execution flow and query debugger state |
-| `x64dbg_command` | `execute`, `script`, `evaluate`, `format`, `set_init_script`, `get_init_script`, `get_hash`, `get_events` | Execute raw x64dbg commands, batch scripts, and expression evaluation |
+| `x64dbg_command` | `execute`, `script`, `evaluate`, `format`, `set_init_script`, `get_init_script`, `get_hash`, `get_events` | Execute raw x64dbg commands, batch scripts, and expression evaluation. `force` overrides the trace guard; `max_events` caps `get_events` |
 
 ### CPU & memory
 
@@ -76,7 +100,7 @@ validated with Zod schemas at runtime.
 | Tool | Actions | Description |
 |------|---------|-------------|
 | `x64dbg_breakpoints` | `set_software`, `set_hardware`, `set_memory`, `delete`, `enable`, `disable`, `toggle`, `set_condition`, `set_log`, `reset_hit_count`, `get`, `list`, `configure`, `configure_batch` | Full breakpoint management: software, hardware, memory, conditional, logging, batch |
-| `x64dbg_tracing` | `into`, `over`, `run`, `stop`, `status`, `animate`, `conditional_run`, `log_setup`, `hitcount`, `type`, `set_type` | Execution tracing, trace logging, hit counters, conditional tracing, live trace status |
+| `x64dbg_tracing` | `into`, `over`, `run`, `stop`, `status`, `animate`, `conditional_run`, `log_setup`, `hitcount`, `type`, `set_type` | Execution tracing, trace logging, hit counters, conditional tracing, live trace status. Start actions accept `force` |
 | `x64dbg_exceptions` | `set`, `delete`, `list`, `list_codes`, `skip` | Exception breakpoints, known exception codes, skip/pass exceptions |
 
 ### Symbols & annotations
@@ -123,6 +147,7 @@ Environment variables for the MCP server:
 | `X64DBG_MCP_TOKEN` | *(empty)* | Bearer token sent on every request. Must match the plugin's **Settings > Token**. Empty = no auth. |
 | `X64DBG_MCP_READ_TIMEOUT_MS` | `30000` | Timeout for GET requests. Long-polls (`/api/command/events*`) opt out. `0` disables the cap. |
 | `X64DBG_MCP_MAX_BYTES` | `65536` | Cap on non-JSON text replies (disassembly, OCR, dumps). JSON is left intact so paging stays parseable. `0` disables. |
+| `X64DBG_MCP_AUDIT` | `off` | Append write actions (memory/patches/breakpoints/commands/UI input) to `%TEMP%\x64dbg-mcp\audit.log`. |
 | `X64DBG_MCP_LEASE` | `on` | Set `off` to stop refusing an instance another live MCP process owns. |
 | `X64DBG_MCP_LEASE_IDLE_MS` | `0` | Release a lease after this long without a tool call. `0` = never yield. |
 | `X64DBG_MCP_AUTOLAUNCH` | `on` | Set `off` to never start x64dbg implicitly; only `x64dbg_instances action=start` launches. |
