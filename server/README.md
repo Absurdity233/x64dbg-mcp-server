@@ -120,5 +120,9 @@ localhost — no remote access, no data leaves your machine.
 
 ## License
 
-MIT · **Absurdity233** — [GitHub](https://github.com/Absurdity233). Built with
-[Claude Code](https://claude.ai/claude-code).
+MIT · fork maintained by **Absurdity233** — [GitHub](https://github.com/Absurdity233).
+
+A fork of **[bromoket/x64dbg_mcp](https://github.com/bromoket/x64dbg_mcp)** by
+[bromo](https://github.com/bromoket), used under the MIT license. The original 23 tools, the REST
+bridge and the plugin belong to that project; multi-instance routing, GUI driving, session
+recovery, function discovery, CPUID spoofing and the per-action write guards are this fork's work.

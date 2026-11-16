@@ -39,6 +39,19 @@
   },
   "mcpName": "io.github.Absurdity233/x64dbg",
   "author": "Absurdity233",
+  "contributors": [
+    {
+      "name": "bromo",
+      "url": "https://github.com/bromoket",
+      "comment": "original author of x64dbg_mcp, the MIT-licensed base of this fork"
+    }
+  ],
+  "upstream": {
+    "repo": "https://github.com/bromoket/x64dbg_mcp",
+    "author": "bromo",
+    "license": "MIT",
+    "note": "Fork. The plugin, REST bridge and original 23 tools come from upstream."
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "zod": "^3.25.1"

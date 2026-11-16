@@ -162,9 +162,9 @@ static INT_PTR CALLBACK about_dlg_proc(HWND hdlg, UINT msg, WPARAM wparam, LPARA
         // Status
         SetDlgItemTextA(hdlg, IDC_STATUS_LABEL, state->status_text);
 
-        // Discord
-        char discord_buf[64];
-        std::snprintf(discord_buf, sizeof(discord_buf), "Discord:  %s", PLUGIN_AUTHOR);
+        // Upstream attribution
+        char discord_buf[96];
+        std::snprintf(discord_buf, sizeof(discord_buf), "Based on %s", PLUGIN_UPSTREAM);
         SetDlgItemTextA(hdlg, IDC_DISCORD_LABEL, discord_buf);
 
         // Derive bold font for title

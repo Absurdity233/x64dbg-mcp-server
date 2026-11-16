@@ -8,6 +8,12 @@
 or any MCP client in plain English and it sets breakpoints, reads memory, disassembles, traces,
 dumps PEs, and bypasses anti-debug — live, inside the debugger.
 
+> **Fork of [bromoket/x64dbg_mcp](https://github.com/bromoket/x64dbg_mcp)** (MIT, by
+> [bromo](https://github.com/bromoket)). The plugin, the REST bridge and the original 23 tools
+> are that project's work; multi-instance routing, GUI driving, session recovery, function
+> discovery, CPUID spoofing and the write-action guards are this fork's addition.
+> See [Credits](#credits).
+
 **26 mega-tools** over **169 REST endpoints**, fully typed with Zod. A C++ plugin runs inside
 x64dbg; a tiny TypeScript server bridges it to your client over stdio. Everything stays on
 `127.0.0.1` — nothing leaves your machine.
@@ -133,6 +139,33 @@ other local processes, set a token in the plugin's **Settings** and pass it via
 Set `X64DBG_MCP_AUDIT=1` to append one JSON line per write action to the audit log; the default
 stays quiet, and a failed audit never fails the tool call.
 
+## Credits
+
+This project is a fork of **[bromoket/x64dbg_mcp](https://github.com/bromoket/x64dbg_mcp)**
+by **bromo** ([GitHub](https://github.com/bromoket)), used under the MIT license. The C++ plugin,
+the REST bridge, the TypeScript server skeleton and the original 23 tools come from that
+project — it is the base this fork stands on.
+
+What this fork added (v2.4.x):
+
+- **Multi-instance routing** — `instances.ts`, `lease.ts`, `target_claims.ts`, and the
+  `x64dbg_instances` tool: endpoint registry, exclusive leases with holder pid and idle time,
+  one-session-per-target-file claims.
+- **GUI driving** — `ui_daemon.ts`, `ui_lock.ts`, and the `x64dbg_ui` tool: window capture, OCR,
+  text search, and input injection with `message`/`real` modes and UIPI guards.
+- **Session recovery** — `load` / `attach` / `detach` / `wait_for_pause` / `wait_for_event` /
+  `recover` on `x64dbg_debug`.
+- **Function discovery** — the `x64dbg_functions` tool.
+- **CPUID spoofing** — `x64dbg_antidebug spoof_cpuid`.
+- **Per-action write gating and audit** — `WRITE_ACTIONS` keyed by tool *and* action, plus the
+  opt-in `X64DBG_MCP_AUDIT` log.
+- **Destructive-operation guards** — `trace_guard.ts` refusing interfering actions mid-trace.
+
+If you want the original project without these changes, use
+[bromoket/x64dbg_mcp](https://github.com/bromoket/x64dbg_mcp) directly.
+
 ## Author
 
-**Absurdity233** — [GitHub](https://github.com/Absurdity233). [MIT](LICENSE).
+Fork maintained by **Absurdity233** — [GitHub](https://github.com/Absurdity233).
+Original project by **bromo** — [bromoket/x64dbg_mcp](https://github.com/bromoket/x64dbg_mcp).
+[MIT](LICENSE).
