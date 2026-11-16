@@ -1,6 +1,12 @@
 #include "http/c_http_router.h"
 #include "bridge/c_bridge_executor.h"
 #include "util/format_utils.h"
+#include "util/antidebug_hard.h"
+#include "util/anti_vm.h"
+#include "util/host_artifacts.h"
+#include "util/kernel_driver.h"
+#include "util/ntdll_hook.h"
+#include "util/probe_scan.h"
 
 #include <algorithm>
 #include <cstring>
@@ -16,139 +22,65 @@ namespace handlers {
 
 namespace {
 
-// Instruction encodings that anti-VM / anti-debug code uses to inspect the
-// machine itself. Scanning for these is how you find the checks; the scan only
-// reports locations, it does not alter behaviour.
-struct probe_pattern {
-    const char* name;
-    const char* why;
-    std::vector<uint8_t> bytes;
-    bool wildcard_tail;   // trailing operand bytes vary, match the opcode only
-};
-
-// Only unambiguous encodings belong here. A single-byte opcode such as `in`
-// (0xEC) matches arbitrary displacement/immediate bytes in unrelated code -
-// scanning winver.exe that way produced 20 "VMware backdoor" hits, none of them
-// real. Multi-byte opcodes whose second byte is part of a fixed pattern are
-// what make a scan usable; `in` is reachable only through the two-byte form
-// with the port operand checked.
-const std::vector<probe_pattern>& vm_probes() {
-    static const std::vector<probe_pattern> patterns = {
-        {"cpuid",  "hypervisor-present bit and vendor leaf (0x40000000)", {0x0F, 0xA2}, false},
-        {"rdtsc",  "timing delta; the classic single-step / sandbox check", {0x0F, 0x31}, false},
-        {"rdtscp", "timing delta with serialisation", {0x0F, 0x01, 0xF9}, false},
-        {"smsw",   "SMSW stores CR0; the VM86/monitor bit differs", {0x0F, 0x01, 0xE0}, false},
-        {"str",    "STR reads the task register; 0 under a hypervisor", {0x0F, 0x00, 0xC8}, false},
-        {"sldt",   "LDT selector; VM86 reveals", {0x0F, 0x00, 0xC0}, false},
-        // sidt/sgdt/sldt take a memory operand, so the ModRM byte varies. Match
-        // the fixed 0F 01 + ModRM-prefix and let the caller see the address.
-        {"sidt",   "IDT base; hypervisors relocate it", {0x0F, 0x01, 0x0D}, true},
-        {"sgdt",   "GDT base; hypervisors relocate it", {0x0F, 0x01, 0x05}, true},
-        {"sidt",   "IDT base (register form)", {0x0F, 0x01, 0x1D}, true},
-    };
-    return patterns;
+// Resolve the module the caller means, defaulting to the main module. Shared by
+// every route that scans a module, so the "which module" answer is the same
+// everywhere - an inconsistency there is what makes two scans disagree.
+std::string resolve_module(c_bridge_executor& bridge, const std::string& requested,
+                           std::string* error) {
+    if (!requested.empty()) {
+        if (bridge.get_module_base(requested) == 0) {
+            *error = "module not found: " + requested;
+        }
+        return requested;
+    }
+    char main_name[MAX_MODULE_SIZE] = {};
+    if (!Script::Module::GetMainModuleName(main_name) || main_name[0] == '\0') {
+        *error = "Missing 'module' and the main module name is unavailable";
+        return {};
+    }
+    return main_name;
 }
 
-// Scan the given module's executable sections for the probe instructions.
-nlohmann::json scan_probes(c_bridge_executor& bridge, const std::string& module_name,
-                           size_t max_hits_per_pattern) {
-    const auto base = bridge.get_module_base(module_name);
-    if (base == 0) return nlohmann::json{{"error", "module not found: " + module_name}};
-
-    // Walk the section table for executable regions.
-    auto dos = bridge.read_memory(base, 0x40);
-    if (!dos.has_value() || dos->size() < 0x40) {
-        return nlohmann::json{{"error", "cannot read DOS header"}};
-    }
-    uint32_t e_lfanew = 0;
-    std::memcpy(&e_lfanew, dos->data() + 0x3C, 4);
-
-    auto pe = bridge.read_memory(base + e_lfanew, 24);
-    if (!pe.has_value() || pe->size() < 24) {
-        return nlohmann::json{{"error", "cannot read PE header"}};
-    }
-    uint16_t num_sections = 0, opt_size = 0;
-    std::memcpy(&num_sections, pe->data() + 6, 2);
-    std::memcpy(&opt_size, pe->data() + 20, 2);
-    if (num_sections == 0 || num_sections > 96) {
-        return nlohmann::json{{"error", "implausible section count"}};
-    }
-
-    const duint section_table = base + e_lfanew + 24 + opt_size;
-    auto sec_headers = bridge.read_memory(section_table, static_cast<size_t>(num_sections) * 40);
-    if (!sec_headers.has_value()) {
-        return nlohmann::json{{"error", "cannot read section table"}};
-    }
-
-    nlohmann::json results = nlohmann::json::array();
-    size_t total = 0;
-
-    for (uint16_t i = 0; i < num_sections; ++i) {
-        const size_t off = static_cast<size_t>(i) * 40;
-        uint32_t va = 0, vsize = 0, raw_size = 0, chars = 0;
-        char name[9] = {};
-        std::memcpy(name, sec_headers->data() + off, 8);
-        std::memcpy(&vsize, sec_headers->data() + off + 8, 4);
-        std::memcpy(&va, sec_headers->data() + off + 12, 4);
-        std::memcpy(&raw_size, sec_headers->data() + off + 16, 4);
-        std::memcpy(&chars, sec_headers->data() + off + 36, 4);
-
-        if (!(chars & IMAGE_SCN_MEM_EXECUTE)) continue;
-
-        const uint32_t span = vsize ? vsize : raw_size;
-        if (span == 0 || span > 64u * 1024 * 1024) continue;
-
-        auto code = bridge.read_memory(base + va, span);
-        if (!code.has_value()) continue;
-        const auto& buf = *code;
-
-        for (const auto& p : vm_probes()) {
-            size_t hits = 0;
-            if (buf.size() < p.bytes.size()) continue;
-
-            for (size_t k = 0; k + p.bytes.size() <= buf.size(); ++k) {
-                if (std::memcmp(buf.data() + k, p.bytes.data(), p.bytes.size()) != 0) continue;
-
-                // A raw byte match is not an instruction: the same bytes occur
-                // inside displacements, immediates and data. Confirm by asking
-                // the disassembler what actually starts at this address, and
-                // require the mnemonic to agree.
-                const duint at = base + va + k;
-                DISASM_INSTR di{};
-                DbgDisasmAt(at, &di);
-                if (di.instr_size <= 0 ||
-                    _stricmp(di.instruction, p.name) != 0) {
-                    continue;
-                }
-
-                if (hits < max_hits_per_pattern) {
-                    results.push_back({
-                        {"instruction", p.name},
-                        {"detects",     p.why},
-                        {"section",     name},
-                        {"address",     format_utils::format_address(at)},
-                        {"offset",      format_utils::format_hex(va + k)},
-                        {"disasm",      std::string(di.instruction)}
-                    });
-                }
-                ++hits;
-                ++total;
-                k += p.bytes.size() - 1;
-            }
-        }
-    }
-
-    return nlohmann::json{
-        {"module",        module_name},
-        {"base",          format_utils::format_address(base)},
-        {"hits",          results},
-        {"count",         results.size()},
-        {"total_matches", total},
-        {"truncated",     results.size() < total},
-        {"note",          "Locations only - nothing was patched or faked. Set a "
-                          "breakpoint on an address above and inspect the registers "
-                          "when it fires to see what the check decides."}
+// The ntdll stub set, parsed from the request. Unknown names are rejected rather
+// than ignored: a caller that asks for a hook and silently does not get it will
+// draw the wrong conclusion from the result.
+bool parse_hook_list(const nlohmann::json& body, std::vector<ntdll_hook::target_spec>* out,
+                     std::string* error) {
+    struct known {
+        const char* name;
+        unsigned long info_class;
+        ntdll_hook::action what;
     };
+    // ProcessDebugPort / ProcessDebugObjectHandle / ProcessDebugFlags. The class
+    // numbers are the ones NtQueryInformationProcess dispatch compares against.
+    // ProcessDebugFlags is the inverted one: it reports "not being debugged" as a
+    // non-zero value, so the correct stub returns success and leaves the caller's
+    // zeroed buffer alone.
+    static const known catalog[] = {
+        {"NtQueryInformationProcess",          7, ntdll_hook::action::fake_zero_success},
+        {"NtQueryInformationProcess",       0x1E, ntdll_hook::action::fake_zero_success},
+        {"NtQueryInformationProcess",       0x1F, ntdll_hook::action::return_success},
+    };
+
+    std::vector<std::string> requested;
+    if (body.contains("functions") && body["functions"].is_array()) {
+        for (const auto& f : body["functions"]) requested.push_back(f.get<std::string>());
+    }
+
+    for (const auto& k : catalog) {
+        if (!requested.empty() &&
+            std::find(requested.begin(), requested.end(), k.name) == requested.end()) {
+            continue;
+        }
+        out->push_back({k.name, k.info_class, k.what});
+    }
+
+    if (out->empty()) {
+        *error = "none of the requested functions is supported; supported: "
+                 "NtQueryInformationProcess";
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -369,127 +301,78 @@ void register_antidebug_routes(c_http_router& router) {
         });
     });
 
-    // POST /api/antidebug/harden - Broader anti-detection pass
+    // POST /api/antidebug/harden - Anti-detection pass
     //
-    // hide_debugger only clears two PEB fields. Real protected targets also
-    // check heap flags, the DR registers, the debug object handle and the
-    // process debug port. This route clears what can be cleared from a plugin
-    // without a kernel component, and reports what it could not touch.
-    router.post("/api/antidebug/harden", [](const s_http_request&) -> s_http_response {
+    // Body: { "level": "basic"|"deep"|"paranoid", "threads": bool,
+    //         "hooks": ["NtQueryInformationProcess"], "guard": bool }
+    //
+    // Three levels rather than one, because they cost very different amounts and
+    // each covers a different class of check:
+    //   basic     - two PEB fields; defeats IsDebuggerPresent and nothing else
+    //   deep      - + heap flags + per-thread sweep + DR registers
+    //   paranoid  - + ntdll stubs for ProcessDebugPort/ObjectHandle/Flags, and
+    //               optionally the kernel component
+    // See util/antidebug_hard.h for why each of those is not covered by the
+    // level below it.
+    router.post("/api/antidebug/harden", [](const s_http_request& req) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.require_debugging()) {
             return s_http_response::conflict("No active debug session");
         }
 
-        auto pid = static_cast<DWORD>(bridge.eval_expression("$pid"));
-        auto peb_addr = DbgGetPebAddress(pid);
-        if (peb_addr == 0) {
-            return s_http_response::internal_error("Failed to get PEB address");
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        const auto level_str = body.value("level", std::string("deep"));
+        const auto lvl = antidebug_hard::parse_level(level_str);
+
+        std::vector<std::string> hook_names;
+        if (body.contains("hooks") && body["hooks"].is_array()) {
+            for (const auto& h : body["hooks"]) hook_names.push_back(h.get<std::string>());
         }
 
-        auto applied = nlohmann::json::array();
-        auto skipped = nlohmann::json::array();
+        // "threads" defaults to true at deep and above: a per-thread sweep is
+        // the whole reason that level exists.
+        const bool all_threads = body.value("threads", lvl != antidebug_hard::level::basic);
 
-        auto poke = [&](duint addr, const std::vector<uint8_t>& bytes,
-                        const std::string& field, const std::string& note) {
-            auto r = bridge.write_memory(addr, bytes);
-            if (r.has_value()) {
-                applied.push_back({
-                    {"field", field},
-                    {"address", format_utils::format_address(addr)},
-                    {"note", note}
-                });
-            } else {
-                skipped.push_back({{"field", field}, {"reason", "write failed"}});
-            }
-        };
+        auto data = antidebug_hard::apply(bridge, lvl, all_threads, hook_names);
 
-        // PEB.BeingDebugged
-        poke(peb_addr + 0x2, {0x00}, "PEB.BeingDebugged", "clears IsDebuggerPresent");
-
-        // PEB.NtGlobalFlag
-#ifdef _WIN64
-        constexpr duint ntglobalflag_offset = 0xBC;
-        constexpr duint process_heap_offset = 0x30;
-#else
-        constexpr duint ntglobalflag_offset = 0x68;
-        constexpr duint process_heap_offset = 0x18;
-#endif
-        poke(peb_addr + ntglobalflag_offset, {0, 0, 0, 0}, "PEB.NtGlobalFlag",
-             "clears the FLG_HEAP_* debug bits");
-
-        // PEB.ProcessHeap -> Flags / ForceFlags. A debugger sets both.
-        auto heap_ptr = bridge.read_memory(peb_addr + process_heap_offset, sizeof(duint));
-        if (heap_ptr.has_value()) {
-            duint heap = 0;
-            memcpy(&heap, heap_ptr->data(), sizeof(duint));
-            if (heap != 0) {
-                poke(heap + 0x70, {0, 0, 0, 0}, "Heap.Flags", "x64 offset 0x70");
-                poke(heap + 0x74, {0, 0, 0, 0}, "Heap.ForceFlags", "x64 offset 0x74");
-            }
+        // The background guard is opt-in. It writes the PEB on every pause,
+        // which changes the target's memory underneath a caller who is trying to
+        // watch it change - so it must be asked for, not assumed.
+        if (body.value("guard", false)) {
+            antidebug_hard::start_guard(lvl);
+            data["guard"] = {{"running", antidebug_hard::guard_active()},
+                             {"note", "re-clears the PEB on every pause; stop with "
+                                      "harden_guard_stop"}};
         }
 
-        // Clear the hardware debug registers in the current thread context.
-        // x64dbg restores them on continue, so this only helps until the next
-        // resume; targets typically read DR at their own entry, before that.
-        // `r dr0=0` is rejected by DbgCmdExecDirect (the register command is
-        // queue-dispatched), so go through the queue and read back to confirm.
-        auto clear_dr = [&](const char* name) {
-            const std::string cmd = std::string("r ") + name + "=0";
-            bridge.exec_command_async(cmd);
-            Sleep(15);
-            const auto after = bridge.eval_expression(name);
-            if (after == 0) {
-                applied.push_back({{"field", name}, {"note", "hardware breakpoint register zeroed"}});
-            } else {
-                skipped.push_back({
-                    {"field", name},
-                    {"reason", "register still non-zero after write (x64dbg may restore it on resume)"}
-                });
-            }
-        };
-        clear_dr("dr0");
-        clear_dr("dr1");
-        clear_dr("dr2");
-        clear_dr("dr3");
-        clear_dr("dr6");
-        clear_dr("dr7");
+        // Say what the kernel component would add and whether it is there. A
+        // caller reading "harden succeeded" should not conclude the process is
+        // invisible to a driver.
+        data["kernel_driver"] = kernel_driver::describe();
+        return s_http_response::ok(data);
+    });
 
-        skipped.push_back({
-            {"field", "ProcessDebugPort/ProcessDebugObjectHandle"},
-            {"reason", "kernel-level query cannot be faked from a user-mode plugin; "
-                       "use ScyllaHide's driver component"}
-        });
-
-        return s_http_response::ok({
-            {"peb_address", format_utils::format_address(peb_addr)},
-            {"applied", applied},
-            {"skipped", skipped},
-            {"message", "Anti-debug hardening applied"}
-        });
+    // POST /api/antidebug/guard_stop - Stop the background PEB guard
+    router.post("/api/antidebug/guard_stop", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(antidebug_hard::stop_guard());
     });
 
     // GET /api/antidebug/vm_probes?module=&max_hits= - Locate anti-VM probes
     //
-    // Finds cpuid / rdtsc / sidt / str and friends in the module's executable
-    // sections. This is a discovery aid: knowing where a target inspects the
-    // machine is what lets you breakpoint it and read the decision, instead of
-    // guessing why behaviour differs between hosts.
+    // Discovery only. The table and the confirmation rule live in
+    // util/probe_scan.cpp so this route and the anti_vm stub engine can never
+    // disagree about what a "probe" is.
     router.get("/api/antidebug/vm_probes", [](const s_http_request& req) -> s_http_response {
         auto& bridge = get_bridge();
         if (!bridge.require_debugging()) {
             return s_http_response::conflict("No active debug session");
         }
 
-        auto module_name = req.get_query("module", "");
-        if (module_name.empty()) {
-            char main_name[MAX_MODULE_SIZE] = {};
-            if (!Script::Module::GetMainModuleName(main_name) || main_name[0] == '\0') {
-                return s_http_response::bad_request(
-                    "Missing 'module' and the main module name is unavailable");
-            }
-            module_name = main_name;
-        }
+        std::string error;
+        const auto module_name = resolve_module(bridge, req.get_query("module", ""), &error);
+        if (module_name.empty()) return s_http_response::bad_request(error);
 
         size_t max_hits = 200;
         const auto raw_max = req.get_query("max_hits", "");
@@ -503,18 +386,16 @@ void register_antidebug_routes(c_http_router& router) {
             if (max_hits > 2000) max_hits = 2000;
         }
 
-        return s_http_response::ok(scan_probes(bridge, module_name, max_hits));
+        return s_http_response::ok(probe_scan::scan(bridge, module_name, max_hits));
     });
 
     // POST /api/antidebug/probe_breakpoints - Instrument every anti-VM probe
     //
-    // Scanning tells you where the checks are; this makes them observable.
-    // Each hit gets a silent logging breakpoint that records the registers and
-    // the result the instruction produces, so the event log becomes a timeline
-    // of "which check ran, when, and what it decided" - which is the part that
+    // Scanning tells you where the checks are; this makes them observable. Each
+    // hit gets a silent logging breakpoint that records the registers and the
+    // result the instruction produces, so the event log becomes a timeline of
+    // "which check ran, when, and what it decided" - which is the part that
     // actually explains a behaviour difference between hosts.
-    //
-    // Silent + fast_resume so the target keeps running; nothing is modified.
     //
     // Body: { "module": "...", "max_hits": 200, "log_text": "...",
     //         "resume": true }
@@ -527,14 +408,9 @@ void register_antidebug_routes(c_http_router& router) {
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) body = nlohmann::json::object();
 
-        std::string module_name = body.value("module", "");
-        if (module_name.empty()) {
-            char main_name[MAX_MODULE_SIZE] = {};
-            if (!Script::Module::GetMainModuleName(main_name) || main_name[0] == '\0') {
-                return s_http_response::bad_request("Missing 'module' and no main module");
-            }
-            module_name = main_name;
-        }
+        std::string error;
+        const auto module_name = resolve_module(bridge, body.value("module", std::string("")), &error);
+        if (module_name.empty()) return s_http_response::bad_request(error);
 
         size_t max_hits = body.value("max_hits", static_cast<size_t>(200));
         if (max_hits == 0) max_hits = 1;
@@ -545,10 +421,10 @@ void register_antidebug_routes(c_http_router& router) {
         // thread, so a hit is attributable without pausing.
         const auto log_text = body.value(
             "log_text",
-            std::string("{p:cip} cpuid/rdtsc rax={p:rax} rbx={p:rbx} "
+            std::string("{p:cip} probe rax={p:rax} rbx={p:rbx} "
                         "rcx={p:rcx} rdx={p:rdx} tid={tid()} tick={GetTickCount()}"));
 
-        const auto scan = scan_probes(bridge, module_name, max_hits);
+        const auto scan = probe_scan::scan(bridge, module_name, max_hits);
         if (scan.contains("error")) {
             return s_http_response::internal_error(scan["error"].get<std::string>());
         }
@@ -573,13 +449,13 @@ void register_antidebug_routes(c_http_router& router) {
             bridge.exec_command("SetBreakpointFastResume " + addr + ", 1");
             // Name it so the event-log entry identifies the instruction.
             bridge.exec_command("SetBreakpointName " + addr + ", \"vmprobe:" +
-                                hit["instruction"].get<std::string>() + "\"");
+                                hit["probe"].get<std::string>() + "\"");
 
             armed.push_back({
-                {"instruction", hit["instruction"]},
-                {"address",     addr},
-                {"section",     hit["section"]},
-                {"detects",     hit["detects"]}
+                {"probe",   hit["probe"]},
+                {"address", addr},
+                {"section", hit["section"]},
+                {"detects", hit["detects"]}
             });
         }
 
@@ -598,7 +474,8 @@ void register_antidebug_routes(c_http_router& router) {
             {"log_text", log_text},
             {"note", "Each hit is written to the event log (x64dbg_command "
                      "get_events / wait_for_event, type 'breakpoint'). Nothing "
-                     "was patched: the checks still run and still decide."}
+                     "was patched: the checks still run and still decide. To change "
+                     "what they decide, use anti_vm."}
         };
 
         // fast_resume does not take effect for every instruction: measured on
@@ -612,6 +489,173 @@ void register_antidebug_routes(c_http_router& router) {
                 "run again; hits already logged are kept.";
         }
         return s_http_response::ok(out);
+    });
+
+    // POST /api/antidebug/anti_vm - Make the checks return "physical machine"
+    //
+    // This is the part that actually changes an answer. A breakpoint cannot:
+    // it fires before the instruction, so whatever it writes is overwritten by
+    // the cpuid/rdtsc it was watching. The stub runs the real instruction and
+    // edits the result - see util/code_stub.h.
+    //
+    // Body: { "module": "...", "max_hits": 200,
+    //         "arms": ["cpuid","rdtsc","vmware_backdoor"], "restore": false }
+    router.post("/api/antidebug/anti_vm", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        if (body.value("restore", false)) {
+            auto result = anti_vm::disarm(bridge);
+            result["remaining"] = anti_vm::list();
+            return s_http_response::ok(result);
+        }
+
+        std::string error;
+        const auto module_name = resolve_module(bridge, body.value("module", std::string("")), &error);
+        if (module_name.empty()) return s_http_response::bad_request(error);
+
+        std::vector<std::string> probes;
+        if (body.contains("arms") && body["arms"].is_array()) {
+            for (const auto& a : body["arms"]) probes.push_back(a.get<std::string>());
+        }
+
+        size_t max_hits = body.value("max_hits", static_cast<size_t>(200));
+        if (max_hits == 0) max_hits = 1;
+        if (max_hits > 500) max_hits = 500;
+
+        auto result = anti_vm::arm(bridge, module_name, probes, max_hits);
+        result["armed_total"] = anti_vm::list()["count"];
+        return s_http_response::ok(result);
+    });
+
+    // GET /api/antidebug/anti_vm/list - What is currently stubbed
+    router.get("/api/antidebug/anti_vm/list", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(anti_vm::list());
+    });
+
+    // POST /api/antidebug/hook_ntdll - Stub the Nt* oracles directly
+    //
+    // Body: { "functions": ["NtQueryInformationProcess"], "dry_run": bool }
+    // Caller-facing version of what harden(level=paranoid) installs, for when a
+    // specific check has to be neutralised in isolation.
+    router.post("/api/antidebug/hook_ntdll", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        if (body.value("restore", false)) {
+            auto result = ntdll_hook::restore();
+            result["remaining"] = ntdll_hook::list();
+            return s_http_response::ok(result);
+        }
+
+        std::vector<ntdll_hook::target_spec> specs;
+        std::string error;
+        if (!parse_hook_list(body, &specs, &error)) {
+            return s_http_response::bad_request(error);
+        }
+
+        nlohmann::json out = ntdll_hook::install(specs, body.value("dry_run", false));
+        out["active"] = ntdll_hook::list();
+        return s_http_response::ok(out);
+    });
+
+    // GET /api/antidebug/artifacts - What a VM check sees on this host
+    //
+    // Read-only survey. The point is to answer "which check is firing" with
+    // evidence instead of a guess, so the fix can be applied to the check that
+    // exists rather than to all of them.
+    router.get("/api/antidebug/artifacts", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(host_artifacts::survey());
+    });
+
+    // ---- kernel component ------------------------------------------------
+    //
+    // These four routes are the only ones that need the driver. They are
+    // separate from harden because the driver is optional and its failure modes
+    // (not loaded, access denied, offset unresolved) are different from a PEB
+    // write that did not stick.
+
+    router.get("/api/antidebug/kernel/status", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(kernel_driver::status());
+    });
+
+    router.post("/api/antidebug/kernel/attach", [](const s_http_request& req) -> s_http_response {
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        unsigned long pid = 0;
+        if (body.contains("pid")) {
+            if (body["pid"].is_number()) {
+                pid = body["pid"].get<unsigned long>();
+            } else {
+                const auto s = body["pid"].get<std::string>();
+                if (!s.empty()) {
+                    try { pid = std::stoul(s, nullptr, 0); }
+                    catch (...) { return s_http_response::bad_request("'pid' is not a number"); }
+                }
+            }
+        }
+
+        auto result = kernel_driver::attach(pid);
+        if (!result.value("ok", false)) {
+            return s_http_response::conflict(result.value("error", std::string("attach failed")));
+        }
+        return s_http_response::ok(result);
+    });
+
+    router.post("/api/antidebug/kernel/detach", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(kernel_driver::detach());
+    });
+
+    // POST /api/antidebug/kernel/apply - Clear EPROCESS fields
+    //
+    // Body: { "mask": 7, "debugport_offset": 0, "flags_offset": 0,
+    //         "cross_session_offset": 0 }
+    // Offsets are overrides for a kernel build the driver could not resolve;
+    // 0 leaves the driver's own resolution in place.
+    router.post("/api/antidebug/kernel/apply", [](const s_http_request& req) -> s_http_response {
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        // Default: the three fields a user-mode target can observe. KDPRINT is
+        // left out because it needs an offset the driver may not have resolved,
+        // and asking for a bit that cannot be applied turns a clean report into
+        // a partial one.
+        uint64_t mask = kernel_driver::default_mask;
+        if (body.contains("mask")) {
+            if (body["mask"].is_number_unsigned() || body["mask"].is_number_integer()) {
+                mask = body["mask"].get<uint64_t>();
+            } else if (body["mask"].is_string()) {
+                try { mask = std::stoull(body["mask"].get<std::string>(), nullptr, 0); }
+                catch (...) { return s_http_response::bad_request("'mask' is not a number"); }
+            }
+        }
+        if (mask == 0) return s_http_response::bad_request("'mask' selects nothing");
+
+        const auto dp = body.value("debugport_offset", 0u);
+        const auto fo = body.value("flags_offset", 0u);
+        const auto cs = body.value("cross_session_offset", 0u);
+
+        auto result = kernel_driver::apply(mask, dp, fo, cs);
+        if (!result.value("ok", false) && !result.contains("applied_mask")) {
+            return s_http_response::conflict(result.value("error", std::string("apply failed")));
+        }
+        return s_http_response::ok(result);
+    });
+
+    // GET /api/antidebug/kernel/query - What the driver has applied
+    router.get("/api/antidebug/kernel/query", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(kernel_driver::query());
     });
 
     // GET /api/antidebug/dep_status - DEP enabled status

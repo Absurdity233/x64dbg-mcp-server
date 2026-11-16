@@ -24,6 +24,8 @@ import { registerStackTools } from './stack.js';
 import { registerSymbolTools } from './symbols.js';
 import { registerThreadTools } from './threads.js';
 import { registerTracingTools } from './tracing.js';
+import { registerVmProtectTools } from './vmprotect.js';
+import { registerCrackTools } from './crack.js';
 
 export function registerAllTools(server: McpServer) {
   registerDebugTools(server);
@@ -50,4 +52,6 @@ export function registerAllTools(server: McpServer) {
   registerFunctionTools(server);
   registerInstanceTools(server);
   registerUiTools(server);
+  registerVmProtectTools(server);
+  registerCrackTools(server);
 }

@@ -15,6 +15,7 @@
 #include "util/trace_state.h"
 #include "util/trace_auto.h"
 #include "util/event_log.h"
+#include "util/antidebug_hard.h"
 #include "resources/plugin_icon.h"
 #include "ui/settings_dialog.h"
 #include "ui/about_dialog.h"
@@ -39,6 +40,8 @@ namespace handlers {
     void register_tracing_routes(c_http_router& router);
     void register_dumping_routes(c_http_router& router);
     void register_antidebug_routes(c_http_router& router);
+    void register_vm_routes(c_http_router& router);
+    void register_crack_routes(c_http_router& router);
     void register_exception_routes(c_http_router& router);
     void register_process_routes(c_http_router& router);
     void register_handles_routes(c_http_router& router);
@@ -266,6 +269,10 @@ static void cb_paused(CBTYPE, void*) {
     // on the debugger thread.
     mcp::trace_mark_stopped();
     mcp::trace_auto_notify_paused();
+    // The PEB guard re-clears the debug fields here, on the debugger thread's
+    // pause, because that is the only moment the write cannot race the target's
+    // own reads. It only signals; the worker does the write.
+    antidebug_hard::notify_paused();
     event_log::push("paused");
 }
 
@@ -455,6 +462,8 @@ void register_all_routes(c_http_router& router) {
     handlers::register_tracing_routes(router);
     handlers::register_dumping_routes(router);
     handlers::register_antidebug_routes(router);
+    handlers::register_vm_routes(router);
+    handlers::register_crack_routes(router);
     handlers::register_exception_routes(router);
     handlers::register_process_routes(router);
     handlers::register_handles_routes(router);
@@ -566,6 +575,9 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init_struct) {
 PLUG_EXPORT bool plugstop() {
     // Join the continuous-trace worker before anything it calls disappears.
     mcp::trace_auto_shutdown();
+    // Same for the PEB guard: it calls into the Bridge, so it must be off the
+    // debugger's back before the plugin unloads.
+    antidebug_hard::shutdown();
     // Unregister command + callbacks
     _plugin_unregistercommand(g_plugin_handle, "mcpserver");
     _plugin_unregistercallback(g_plugin_handle, CB_INITDEBUG);

@@ -59,3 +59,10 @@ server/update_readmes.js
 !plugin/sdk/jansson/*.lib
 !plugin/sdk/lz4/*.lib
 !plugin/sdk/XEDParse/*.lib
+
+# Test-target build output (plugin/test/*.cpp are the sources; the binaries are
+# rebuilt by hand with cl and must not be committed).
+plugin/test/*.exe
+plugin/test/*.obj
+plugin/test/*.txt
+

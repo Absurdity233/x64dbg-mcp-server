@@ -53,6 +53,13 @@ set(SOURCES
     src/util/format_utils.cpp
     src/util/trace_auto.cpp
     src/util/event_log.cpp
+    src/util/antidebug_hard.cpp
+    src/util/anti_vm.cpp
+    src/util/code_stub.cpp
+    src/util/host_artifacts.cpp
+    src/util/kernel_driver.cpp
+    src/util/ntdll_hook.cpp
+    src/util/probe_scan.cpp
     src/handlers/debug_handler.cpp
     src/handlers/register_handler.cpp
     src/handlers/memory_handler.cpp
@@ -71,6 +78,8 @@ set(SOURCES
     src/handlers/tracing_handler.cpp
     src/handlers/dumping_handler.cpp
     src/handlers/antidebug_handler.cpp
+    src/handlers/vm_handler.cpp
+    src/handlers/crack_handler.cpp
     src/handlers/exceptions_handler.cpp
     src/handlers/process_handler.cpp
     src/handlers/handles_handler.cpp
@@ -86,6 +95,10 @@ add_library(${PROJECT_NAME} SHARED ${SOURCES} plugin.def)
 # Include directories (SDK as SYSTEM to suppress its warnings)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # The kernel driver ABI header. The plugin and the driver include the same
+    # file, so the IOCTL structs cannot drift out of sync; see
+    # driver/x64dbg_mcp_hide.h.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../driver
 )
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/sdk

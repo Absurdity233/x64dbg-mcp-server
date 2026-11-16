@@ -388,29 +388,143 @@ async function blockTerminate(restore: boolean): Promise<any> {
   };
 }
 
+/** Driver-side hardening: NTDLL hook functions and the VM-probe arms. */
+const NTDLL_HOOKS = [
+  'NtQueryInformationProcess',
+  'NtSetInformationThread',
+  'NtQueryObject',
+  'NtQuerySystemInformation',
+] as const;
+
+const ANTI_VM_ARMS = ['cpuid', 'rdtsc', 'sidt', 'sgdt', 'sldt', 'str', 'smsw', 'vmx', 'in'] as const;
+
+const HARDEN_LEVELS = ['basic', 'deep', 'paranoid'] as const;
+
+interface KernelVersion {
+  abi?: string | number;
+  build?: string | number;
+  os_build?: string;
+  ep_debugport_offset?: string;
+  flags_source?: string;
+}
+
+interface KernelStatus {
+  driver_present?: boolean;
+  user_path?: string;
+  version?: KernelVersion;
+  error?: string;
+  /** Emitted by this tool, not the plugin, when the driver is not loaded. */
+  next_step?: string;
+}
+
+interface ArtifactFinding {
+  category?: string;
+  item?: string;
+  value?: string;
+  why?: string;
+}
+
+interface ArtifactReport {
+  findings?: ArtifactFinding[];
+  count?: number;
+  note?: string;
+}
+
+/**
+ * Host-side VM fingerprints, regrouped into "what the target will see" buckets.
+ *
+ * The plugin returns a flat finding list; grouping it by category is what makes
+ * it readable as an evasion checklist (registry first, then services/devices,
+ * then hardware strings, then window classes and process names).
+ */
+async function antiVmArtifacts() {
+  const data = await httpClient.get<ArtifactReport>('/api/antidebug/artifacts');
+  const findings = data?.findings ?? [];
+  const order: string[] = [];
+  const groups = new Map<string, Array<{ item: string; value: string; why: string }>>();
+
+  for (const finding of findings) {
+    const category = finding?.category?.trim() || 'uncategorized';
+    if (!groups.has(category)) {
+      groups.set(category, []);
+      order.push(category);
+    }
+    groups.get(category)!.push({
+      item: finding?.item ?? '',
+      value: finding?.value ?? '',
+      why: finding?.why ?? '',
+    });
+  }
+
+  return {
+    count: data?.count ?? findings.length,
+    note: data?.note ?? '',
+    groups: order.map((category) => ({ category, items: groups.get(category) ?? [] })),
+    findings,
+  };
+}
+
 export function registerAntiDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_antidebug',
-    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (also clears heap flags and the DR registers; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), spoof_cpuid (paused target: arm silent breakpoints on CPUID sites that check the hypervisor bit/vendor and rewrite the registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back).',
+    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (clears heap flags and the DR registers; level=basic|deep|paranoid, threads:boolean and hooks[] extend it into NTDLL hooking; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), spoof_cpuid (paused target: arm silent breakpoints on CPUID sites that check the hypervisor bit/vendor and rewrite the registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back), hook_ntdll (inline-hook NtQueryInformationProcess/NtSetInformationThread/NtQueryObject/NtQuerySystemInformation inside the debuggee and report stub_form_ok per function; dry_run:true probes without patching, restore:true writes the original bytes back), anti_vm (arm silent spoofing breakpoints on the given probe arms - cpuid, rdtsc, sidt, sgdt, sldt, str, smsw, vmx, in - and report armed/skipped/restored), kernel_status (GET: is the .sys anti-debug driver loaded, its path and detected ABI/build/EP-DebugPort offset - driver_present:false is the normal first-run state, load the .sys to continue), kernel_attach (POST: read DebugPort/Flags from the kernel for pid, empty pid = current process), kernel_apply (POST: write a mask of DEBUGPORT|FLAGS|CROSSSESSION, default 0x7, with optional per-build offsets), kernel_detach (POST: stop kernel-side modifications, restoring the original pointers), artifacts (GET: host-side VM fingerprints the target can read - registry keys, services, device paths, MAC OUI, disk model, ACPI/BIOS strings, window classes and process names - grouped by category as "what the target will see").',
     {
       action: z.enum([
         'peb', 'teb', 'dep', 'hide_debugger', 'harden', 'vm_probes',
         'probe_breakpoints', 'spoof_cpuid', 'block_terminate',
+        'hook_ntdll', 'anti_vm', 'kernel_status', 'kernel_attach',
+        'kernel_apply', 'kernel_detach', 'artifacts',
       ]).describe('Operation to perform'),
-      pid: z.string().optional().describe('peb: process id (default current)'),
+      pid: z.string().optional().describe('peb/kernel_attach: process id (default current)'),
       tid: z.string().optional().describe('teb: thread id (default current)'),
-      module: z.string().optional().describe('vm_probes/probe_breakpoints: module name (default the main module)'),
-      max_hits: z.number().optional().describe('vm_probes/probe_breakpoints: cap (default 200)'),
+      module: z.string().optional().describe('vm_probes/probe_breakpoints/anti_vm: module name (default the main module)'),
+      max_hits: z.number().optional().describe('vm_probes/probe_breakpoints/anti_vm: cap (default 200)'),
       log_text: z.string().optional().describe('probe_breakpoints: per-hit log format'),
       resume: z.boolean().optional().describe('probe_breakpoints: start the target after arming (default true)'),
       restore: z.boolean().optional().describe(
-        'block_terminate/spoof_cpuid: revert instead of applying (write original bytes / delete spoof breakpoints).'
+        'block_terminate/spoof_cpuid/hook_ntdll/anti_vm: revert instead of applying ' +
+        '(write original bytes / delete spoof breakpoints).'
       ),
       vendor: z.boolean().optional().describe(
         'spoof_cpuid: also spoof the 0x40000000 hypervisor-vendor leaf (default true).'
       ),
       only_checked: z.boolean().optional().describe(
         'spoof_cpuid: only arm CPUID sites near a recognizable hypervisor check (default true).'
+      ),
+
+      // harden
+      level: z.enum(HARDEN_LEVELS).optional().describe(
+        'harden: basic clears PEB fields only; deep also clears heap flags and debug registers; ' +
+        'paranoid additionally hides the debug objects NtQueryObject would enumerate (default deep).'
+      ),
+      threads: z.boolean().optional().describe('harden: also hide the debugger from every thread (default plugin-side)'),
+      hooks: z.array(z.enum(NTDLL_HOOKS)).optional().describe(
+        'harden: NTDLL functions to inline-hook as part of hardening; omit for the plugin default set.'
+      ),
+
+      // hook_ntdll
+      functions: z.array(z.enum(NTDLL_HOOKS)).optional().describe(
+        'hook_ntdll: functions to hook (default all four).'
+      ),
+      dry_run: z.boolean().optional().describe(
+        'hook_ntdll: verify the stub prologue matches without writing anything (default false).'
+      ),
+
+      // anti_vm
+      arms: z.array(z.enum(ANTI_VM_ARMS)).optional().describe(
+        'anti_vm: probe arms to arm (default all detected); cpuid, rdtsc, sidt, sgdt, sldt, str, ' +
+        'smsw, vmx, in. vmx/in are armed as fault-suppressing stubs, not value spoofs.'
+      ),
+
+      // kernel_apply
+      mask: z.number().optional().describe(
+        'kernel_apply: bitmask of what to hide - 0x1 DEBUGPORT, 0x2 FLAGS, 0x4 CROSSSESSION (default 0x7).'
+      ),
+      flags_offset: z.number().optional().describe(
+        'kernel_apply: override the EPROCESS flags offset (default from kernel_status.version).'
+      ),
+      cross_session_offset: z.number().optional().describe(
+        'kernel_apply: override the cross-session flags offset (default from kernel_status.version).'
       ),
     },
     async (args) => {
@@ -432,7 +546,10 @@ export function registerAntiDebugTools(server: McpServer) {
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'harden': {
-          const data = await httpClient.post('/api/antidebug/harden');
+          const body: Record<string, unknown> = { level: args.level ?? 'deep' };
+          if (args.threads !== undefined) body.threads = args.threads;
+          if (args.hooks?.length) body.hooks = args.hooks;
+          const data = await httpClient.post('/api/antidebug/harden', body);
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'vm_probes': {
@@ -463,6 +580,67 @@ export function registerAntiDebugTools(server: McpServer) {
         }
         case 'block_terminate': {
           const data = await blockTerminate(args.restore ?? false);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'hook_ntdll': {
+          const body: Record<string, unknown> = {
+            restore: args.restore ?? false,
+            dry_run: args.dry_run ?? false,
+          };
+          if (args.functions?.length) body.functions = args.functions;
+          const data = await httpClient.post('/api/antidebug/hook_ntdll', body);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'anti_vm': {
+          const body: Record<string, unknown> = {
+            module: args.module ?? '',
+            max_hits: args.max_hits ?? 200,
+            restore: args.restore ?? false,
+          };
+          if (args.arms?.length) body.arms = args.arms;
+          const data = await httpClient.post('/api/antidebug/anti_vm', body);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'kernel_status': {
+          const data = await httpClient.get<KernelStatus>('/api/antidebug/kernel/status');
+          // driver_present:false is the expected first-run answer, not a failure:
+          // say what to do next instead of handing back a bare false.
+          if (!data?.driver_present) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  ...data,
+                  next_step:
+                    'The kernel component is not loaded. Load the anti-debug driver ' +
+                    '(the .sys next to the plugin, or its user_path once loaded) before kernel_attach/apply; ' +
+                    'user-mode modes (harden, hook_ntdll, block_terminate) work without it. ' +
+                    'kernel_status.version is only populated once the driver answers.',
+                }, null, 2),
+              }],
+            };
+          }
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'kernel_attach': {
+          const data = await httpClient.post('/api/antidebug/kernel/attach', {
+            pid: args.pid ?? '',
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'kernel_apply': {
+          const body: Record<string, unknown> = { mask: args.mask ?? 0x7 };
+          if (args.flags_offset !== undefined) body.flags_offset = args.flags_offset;
+          if (args.cross_session_offset !== undefined) body.cross_session_offset = args.cross_session_offset;
+          const data = await httpClient.post('/api/antidebug/kernel/apply', body);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'kernel_detach': {
+          const data = await httpClient.post('/api/antidebug/kernel/detach');
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'artifacts': {
+          const data = await antiVmArtifacts();
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
       }
