@@ -8,19 +8,19 @@
 or any MCP client in plain English and it sets breakpoints, reads memory, disassembles, traces,
 dumps PEs, and bypasses anti-debug — live, inside the debugger.
 
-**23 mega-tools** over **153 REST endpoints**, fully typed with Zod. This package is the
+**26 mega-tools** over **169 REST endpoints**, fully typed with Zod. This package is the
 TypeScript MCP server; it bridges your client to a C++ plugin running inside x64dbg. Everything
 stays on `127.0.0.1`.
 
-> **v2.3.0** — hardened (malformed requests can't crash x64dbg; optional auth token; CORS locked
-> down), more tools return real data (`imports`/`exports`, `symbols`, `patches`, `strings`), and
-> a new `tracing status`. Plus the v2.2.x fixes (x32dbg loads, no spurious timeouts).
-> [Get the matching plugins →](https://github.com/bromoket/x64dbg_mcp/releases/latest)
+> **v2.4.0** — multi-instance routing with leases, GUI driving (`x64dbg_ui`), session recovery
+> (`load`/`attach`/`detach`/`wait_for_pause`/`recover`), function discovery
+> (`x64dbg_functions`), CPUID hypervisor-bit spoofing, and per-tool write-action gating.
+> [Get the matching plugins →](https://github.com/Absurdity233/x64dbg-mcp-server/releases/latest)
 
 ## Install
 
 **1. Plugin** — download `x64dbg_mcp.dp64` / `.dp32` from
-[GitHub Releases](https://github.com/bromoket/x64dbg_mcp/releases/latest) into your x64dbg
+[GitHub Releases](https://github.com/Absurdity233/x64dbg-mcp-server/releases/latest) into your x64dbg
 `x64/plugins/` and `x32/plugins/` folders. Start x64dbg; the log shows
 `[MCP] x64dbg MCP Server started on 127.0.0.1:27042`.
 
@@ -76,13 +76,13 @@ stdio transport — spawn `npx -y x64dbg-mcp-server` and speak the
 
 ## Tools
 
-23 action-based tools: **control** (run/step/commands), **CPU & memory** (registers, read/write/
+26 action-based tools: **control** (run/step/commands), **CPU & memory** (registers, read/write/
 alloc/protect, map), **stack** (call stack, SEH), **analysis** (disasm/assemble, xrefs, CFG,
 loops), **breakpoints & tracing** (sw/hw/memory/conditional/logging/batch), **symbols & search**
 (labels, comments, AOB + string scan), **process & system** (threads, handles, TCP, PEB,
 anti-debug hide), and **patching & dumping** (patches, PE dump, IAT fix).
 
-→ Every tool, action, and REST endpoint: **[full reference](https://github.com/bromoket/x64dbg_mcp/blob/master/docs/REFERENCE.md)**.
+→ Every tool, action, and REST endpoint: **[full reference](https://github.com/Absurdity233/x64dbg-mcp-server/blob/master/docs/REFERENCE.md)**.
 
 ## Configuration
 
@@ -113,12 +113,12 @@ localhost — no remote access, no data leaves your machine.
 
 ## Links
 
-- [GitHub repository](https://github.com/bromoket/x64dbg_mcp) — source, C++ plugin, build
-- [Full reference](https://github.com/bromoket/x64dbg_mcp/blob/master/docs/REFERENCE.md)
-- [Plugin releases](https://github.com/bromoket/x64dbg_mcp/releases) — prebuilt DLLs
+- [GitHub repository](https://github.com/Absurdity233/x64dbg-mcp-server) — source, C++ plugin, build
+- [Full reference](https://github.com/Absurdity233/x64dbg-mcp-server/blob/master/docs/REFERENCE.md)
+- [Plugin releases](https://github.com/Absurdity233/x64dbg-mcp-server/releases) — prebuilt DLLs
 - [x64dbg](https://x64dbg.com/)
 
 ## License
 
-MIT · **bromo** — [GitHub](https://github.com/bromoket). Built with
+MIT · **Absurdity233** — [GitHub](https://github.com/Absurdity233). Built with
 [Claude Code](https://claude.ai/claude-code).

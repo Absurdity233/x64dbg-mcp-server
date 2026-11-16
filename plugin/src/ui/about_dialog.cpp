@@ -123,7 +123,7 @@ static LPDLGTEMPLATE build_about_template() {
     // GitHub URL (centered, clickable — SS_NOTIFY enables STN_CLICKED)
     ptr = add_dialog_item(ptr,
         SS_CENTER | SS_NOTIFY, 7, 53, 146, 8,
-        IDC_URL_LABEL, 0x0082, "github.com/bromoket/x64dbg_mcp");
+        IDC_URL_LABEL, 0x0082, "github.com/Absurdity233/x64dbg-mcp-server");
 
     // Discord (centered, grey)
     ptr = add_dialog_item(ptr,

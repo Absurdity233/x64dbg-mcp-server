@@ -19,7 +19,7 @@ agents operating the plugin).
                          stdio                        HTTP (localhost)
  MCP Client  <───────────────────>  TypeScript MCP  <──────────────────>  C++ Plugin
  (Claude,                           Server            127.0.0.1:27042     (inside x64dbg)
-  Cursor,                           26 mega-tools                         170 REST endpoints
+  Cursor,                           26 mega-tools                         169 REST endpoints
   etc.)                             Zod validation                        Bridge/Plugin SDK
 ```
 
@@ -92,6 +92,7 @@ validated with Zod schemas at runtime.
 | `x64dbg_analysis` | `function`, `xrefs_to`, `xrefs_from`, `basic_blocks`, `source`, `mnemonic_brief` | Cross-references, function boundaries, basic blocks, source mapping |
 | `x64dbg_control_flow` | `cfg`, `branch_dest`, `is_jump_taken`, `loops`, `func_type`, `add_function`, `delete_function` | Control flow graph, branch analysis, loop detection, function management |
 | `x64dbg_database` | `constants`, `error_codes`, `structs`, `strings` | Query x64dbg's analysis database for constants, errors, structs, strings |
+| `x64dbg_functions` | `list`, `analyze` | Page x64dbg's analysed function list (`module`, `offset`, `limit` — default 500, max 5000), or run analysis first with `anal` / `analr` / `cfanal`. The list is empty until analysis has run |
 | `x64dbg_address_convert` | `va_to_file`, `file_to_va` | Convert between virtual addresses and file offsets |
 | `x64dbg_watchdog` | *(id parameter)* | Check if a watch expression watchdog has been triggered |
 
@@ -118,7 +119,7 @@ validated with Zod schemas at runtime.
 | `x64dbg_process` | `basic`, `detailed`, `cmdline`, `elevated`, `dbversion`, `set_cmdline` | Process info, PID, PEB, elevation status, debugger version |
 | `x64dbg_threads` | `list`, `current`, `count`, `info`, `teb`, `name`, `switch`, `suspend`, `resume` | Thread enumeration, TEB access, thread control |
 | `x64dbg_handles` | `list_handles`, `list_tcp`, `list_windows`, `list_heaps`, `get_name`, `close` | Handles, TCP connections, windows, heaps |
-| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger`, `harden`, `vm_probes`, `probe_breakpoints`, `block_terminate` | PEB/TEB inspection, DEP status, hide debugger, VM-probe scan, stub termination APIs in a paused target (`restore:true` reverts) |
+| `x64dbg_antidebug` | `peb`, `teb`, `dep`, `hide_debugger`, `harden`, `vm_probes`, `probe_breakpoints`, `spoof_cpuid`, `block_terminate` | PEB/TEB inspection, DEP status, hide debugger, VM-probe scan, CPUID hypervisor-bit spoofing (`only_checked`, `vendor`, `restore`), stub termination APIs in a paused target (`restore:true` reverts) |
 
 ### Instances & UI
 
@@ -210,7 +211,7 @@ The plugin also provides GUI dialogs accessible from `Plugins > x64dbg MCP Serve
 │  C++ Plugin DLL (x64dbg_mcp.dp64 / .dp32)                      │
 │                                                                 │
 │  Winsock2 HTTP server, JSON via nlohmann/json                   │
-│  23 handler files, 170 REST endpoints                           │
+│  23 handler files, 169 REST endpoints                           │
 │  c_bridge_executor: thread-safe calls to x64dbg SDK             │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ x64dbg Bridge/Plugin SDK
@@ -447,7 +448,7 @@ Both use the same MCP server — just `npx -y x64dbg-mcp-server`.
 
 This affected `x32dbg` on newer x64dbg snapshots and is fixed in **v2.2.2+**. Download the
 latest `x64dbg_mcp.dp32`/`.dp64` from
-[Releases](https://github.com/bromoket/x64dbg_mcp/releases) and replace the old DLLs. (Cause:
+[Releases](https://github.com/Absurdity233/x64dbg-mcp-server/releases) and replace the old DLLs. (Cause:
 older builds lacked an explicit `DllMain` entry point that newer x64dbg loaders require.)
 
 ### Request timeouts

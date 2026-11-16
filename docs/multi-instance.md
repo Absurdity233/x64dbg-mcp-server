@@ -29,7 +29,7 @@ overrides the file completely when set.
 ## 2. Configure the MCP server (optional)
 
 ```json
-"x64dbg-bromoket": {
+"x64dbg-mcp": {
   "type": "stdio",
   "command": "node",
   "args": ["F:\\reverse1\\.tools\\x64dbg_mcp-src\\server\\dist\\index.js"],

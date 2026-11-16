@@ -20,7 +20,7 @@ import urllib.request
 
 TOKEN = "e317318976298f9c154e1a961c1552c1"
 BASE = "http://127.0.0.1:27042"
-UI = r"F:\reverse1\.tools\x64dbg_mcp-src\server\scripts\ui.ps1"
+UI = r"F:\deepseek\mcp\x64dbg\x64dbg-mcp-2.4.0\server\scripts\ui.ps1"
 TARGET = r"F:\reverse1\Snarl-3.1.0-offline.exe"
 SHOT_DIR = r"F:\reverse1\.tools"
 CODE = "AAAA-BBBB-CCCC"

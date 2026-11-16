@@ -30,15 +30,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bromoket/x64dbg_mcp.git",
+    "url": "git+https://github.com/Absurdity233/x64dbg-mcp-server.git",
     "directory": "server"
   },
-  "homepage": "https://github.com/bromoket/x64dbg_mcp#readme",
+  "homepage": "https://github.com/Absurdity233/x64dbg-mcp-server#readme",
   "bugs": {
-    "url": "https://github.com/bromoket/x64dbg_mcp/issues"
+    "url": "https://github.com/Absurdity233/x64dbg-mcp-server/issues"
   },
-  "mcpName": "io.github.bromoket/x64dbg",
-  "author": "bromo",
+  "mcpName": "io.github.Absurdity233/x64dbg",
+  "author": "Absurdity233",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "zod": "^3.25.1"

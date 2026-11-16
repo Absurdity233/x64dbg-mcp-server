@@ -6,7 +6,7 @@
 
 // Plugin info
 constexpr auto PLUGIN_NAME = "x64dbg MCP Server";
-constexpr auto PLUGIN_AUTHOR = "bromo";
+constexpr auto PLUGIN_AUTHOR = "Absurdity233";
 constexpr auto PLUGIN_VERSION = 1;
 // Injected from server/package.json by CMake (see plugin/CMakeLists.txt). If
 // the plugin is built outside CMake the fallback makes the mismatch obvious
@@ -14,7 +14,7 @@ constexpr auto PLUGIN_VERSION = 1;
 #ifndef PLUGIN_VERSION_STR
 #define PLUGIN_VERSION_STR "0.0.0-unknown"
 #endif
-constexpr auto PLUGIN_REPO_URL = "https://github.com/bromoket/x64dbg_mcp";
+constexpr auto PLUGIN_REPO_URL = "https://github.com/Absurdity233/x64dbg-mcp-server";
 constexpr uint16_t DEFAULT_PORT = 27042;
 constexpr auto DEFAULT_HOST = "127.0.0.1";
 

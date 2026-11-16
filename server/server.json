@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.bromoket/x64dbg",
-  "description": "MCP server for x64dbg debugger - 23 mega-tools for AI-powered reverse engineering and debugging",
+  "name": "io.github.Absurdity233/x64dbg",
+  "description": "MCP server for x64dbg debugger - 26 mega-tools for AI-powered reverse engineering and debugging",
   "repository": {
-    "url": "https://github.com/bromoket/x64dbg_mcp",
+    "url": "https://github.com/Absurdity233/x64dbg-mcp-server",
     "source": "github"
   },
-  "version": "2.3.0",
+  "version": "2.4.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "x64dbg-mcp-server",
-      "version": "2.3.0",
+      "version": "2.4.0",
       "transport": {
         "type": "stdio"
       },
