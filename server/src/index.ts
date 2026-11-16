@@ -132,7 +132,7 @@ const WRITE_ACTIONS: Record<string, Set<string>> = {
   ]),
   x64dbg_ui: new Set(['click', 'realclick', 'clicktext', 'typeinto', 'type', 'key']),
   x64dbg_exceptions: new Set(['set', 'delete', 'skip', 'preset']),
-  x64dbg_antidebug: new Set(['hide_debugger', 'harden', 'probe_breakpoints', 'block_terminate']),
+  x64dbg_antidebug: new Set(['hide_debugger', 'harden', 'probe_breakpoints', 'spoof_cpuid', 'block_terminate']),
   x64dbg_dumping: new Set(['dump_module', 'rebuild', 'fix_iat', 'export_patch_file']),
   x64dbg_control_flow: new Set(['add_function', 'delete_function']),
   x64dbg_symbols: new Set(['set_label', 'set_comment', 'bookmark']),

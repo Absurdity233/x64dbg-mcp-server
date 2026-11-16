@@ -119,6 +119,157 @@ async function readHex(address: string, size: number): Promise<string | null> {
   }
 }
 
+interface SpoofRecord {
+  address: string;
+  instruction: string;
+  mode: 'hypervisor-bit' | 'hypervisor-vendor';
+  condition: string;
+  command: string;
+}
+
+function spoofFile(): string {
+  const inst = currentInstance();
+  const safe = (inst.id || `${inst.host}_${inst.port}`).replace(/[^A-Za-z0-9._-]/g, '_');
+  return join(patchDir(), `spoof_cpuid_${safe}.json`);
+}
+
+function readSpoofRecords(): SpoofRecord[] {
+  try {
+    const parsed = JSON.parse(readFileSync(spoofFile(), 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSpoofRecords(records: SpoofRecord[]): void {
+  mkdirSync(patchDir(), { recursive: true });
+  writeFileSync(spoofFile(), JSON.stringify(records, null, 2));
+}
+
+function clearSpoofRecords(): void {
+  try { unlinkSync(spoofFile()); } catch { /* already gone */ }
+}
+
+/**
+ * Spoof CPUID-based hypervisor detection.
+ *
+ * For every CPUID site that is followed by a check of ECX bit 31 (the
+ * hypervisor-present bit) arm a silent breakpoint that clears the bit and
+ * resumes. Sites that compare EAX with 0x40000000 (the hypervisor vendor leaf)
+ * instead get zeroed EAX/EBX/ECX/EDX. Only the debuggee is affected; a host
+ * with Hyper-V/VBS enabled still reports a hypervisor to any check outside
+ * these sites, and direct CPUID executed by a driver is not covered.
+ */
+async function spoofCpuid(args: {
+  restore?: boolean;
+  module?: string;
+  max_hits?: number;
+  vendor?: boolean;
+  only_checked?: boolean;
+}): Promise<any> {
+  if (args.restore) {
+    const records = readSpoofRecords();
+    const removed: string[] = [];
+    const failed: Array<{ address: string; error: string }> = [];
+    for (const rec of records) {
+      try {
+        await httpClient.post('/api/breakpoints/delete', { address: rec.address });
+        removed.push(rec.address);
+      } catch (err) {
+        failed.push({ address: rec.address, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    if (failed.length) writeSpoofRecords(records.filter((r) => failed.some((f) => f.address === r.address)));
+    else clearSpoofRecords();
+    return {
+      removed,
+      failed,
+      note: 'CPUID spoof breakpoints deleted.',
+    };
+  }
+
+  const state = await httpClient.get<{ state?: string }>('/api/debug/state');
+  if (state?.state !== 'paused') {
+    throw new Error('spoof_cpuid requires a paused debugger: pause before the target performs its VM check.');
+  }
+
+  const probes = await httpClient.get<any>('/api/antidebug/vm_probes', {
+    module: args.module ?? '',
+    max_hits: String(args.max_hits ?? 200),
+  });
+  const cpuidHits = (probes?.hits ?? []).filter((h: any) => h?.instruction === 'cpuid');
+  const vendor = args.vendor ?? true;
+  const onlyChecked = args.only_checked ?? true;
+  const armed: SpoofRecord[] = [];
+  const skipped: Array<{ address: string; reason: string }> = [];
+
+  for (const hit of cpuidHits) {
+    const address = String(hit.address ?? '');
+    if (!address) continue;
+
+    let text = '';
+    try {
+      const dis = await httpClient.get<any>('/api/disasm/at', { address, count: '24' });
+      text = (dis?.instructions ?? []).map((i: any) => String(i.instruction ?? '')).join('\n').toLowerCase();
+    } catch {
+      skipped.push({ address, reason: 'disassembly unavailable' });
+      continue;
+    }
+
+    const hasBit = /bt\s+ecx\s*,\s*0x1f|test\s+ecx\s*,\s*0x80000000|shr\s+ecx\s*,\s*0x1f|and\s+ecx\s*,\s*0x80000000/.test(text);
+    const hasVendor = /0x40000000/.test(text);
+
+    if (onlyChecked && !hasBit && !hasVendor) {
+      skipped.push({ address, reason: 'no hypervisor bit/vendor check nearby' });
+      continue;
+    }
+
+    // Prefer the bit spoof when both patterns are present: zeroing the vendor
+    // registers would destroy the feature bits the target may read next.
+    const mode: SpoofRecord['mode'] = hasVendor && !hasBit ? 'hypervisor-vendor' : 'hypervisor-bit';
+    if (mode === 'hypervisor-vendor' && !vendor) {
+      skipped.push({ address, reason: 'vendor spoof disabled' });
+      continue;
+    }
+
+    const condition = mode === 'hypervisor-bit' ? 'eax==1' : 'eax==0x40000000';
+    const command = mode === 'hypervisor-bit'
+      ? 'ecx=ecx&0x7FFFFFFF;run'
+      : 'eax=0;ebx=0;ecx=0;edx=0;run';
+
+    try {
+      await httpClient.post('/api/breakpoints/configure', {
+        address,
+        bp_type: 'software',
+        break_condition: condition,
+        command_text: command,
+        fast_resume: true,
+        silent: true,
+        name: `anti-vm cpuid (${mode})`,
+      });
+      armed.push({ address, instruction: 'cpuid', mode, condition, command });
+    } catch (err) {
+      skipped.push({ address, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (armed.length) writeSpoofRecords(armed);
+  else clearSpoofRecords();
+
+  return {
+    module: probes?.module ?? (args.module || '<main>'),
+    cpuid_sites: cpuidHits.length,
+    armed,
+    skipped,
+    spoof_file: spoofFile(),
+    note:
+      'Silent breakpoints clear ECX bit 31 (leaf 1) or zero the vendor leaf (0x40000000) and resume. ' +
+      'Only CPUID sites near a recognizable check are armed by default. Direct syscalls, RDTSC/SIDT ' +
+      'checks and host Hyper-V/VBS outside these sites are not covered. Use restore:true to remove them.',
+  };
+}
+
 async function blockTerminate(restore: boolean): Promise<any> {
   if (restore) {
     const records = readRecords();
@@ -240,11 +391,11 @@ async function blockTerminate(restore: boolean): Promise<any> {
 export function registerAntiDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_antidebug',
-    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (also clears heap flags and the DR registers; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back).',
+    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (also clears heap flags and the DR registers; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), spoof_cpuid (paused target: arm silent breakpoints on CPUID sites that check the hypervisor bit/vendor and rewrite the registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back).',
     {
       action: z.enum([
         'peb', 'teb', 'dep', 'hide_debugger', 'harden', 'vm_probes',
-        'probe_breakpoints', 'block_terminate',
+        'probe_breakpoints', 'spoof_cpuid', 'block_terminate',
       ]).describe('Operation to perform'),
       pid: z.string().optional().describe('peb: process id (default current)'),
       tid: z.string().optional().describe('teb: thread id (default current)'),
@@ -253,7 +404,13 @@ export function registerAntiDebugTools(server: McpServer) {
       log_text: z.string().optional().describe('probe_breakpoints: per-hit log format'),
       resume: z.boolean().optional().describe('probe_breakpoints: start the target after arming (default true)'),
       restore: z.boolean().optional().describe(
-        'block_terminate: write the original bytes back instead of applying the stubs.'
+        'block_terminate/spoof_cpuid: revert instead of applying (write original bytes / delete spoof breakpoints).'
+      ),
+      vendor: z.boolean().optional().describe(
+        'spoof_cpuid: also spoof the 0x40000000 hypervisor-vendor leaf (default true).'
+      ),
+      only_checked: z.boolean().optional().describe(
+        'spoof_cpuid: only arm CPUID sites near a recognizable hypervisor check (default true).'
       ),
     },
     async (args) => {
@@ -291,6 +448,16 @@ export function registerAntiDebugTools(server: McpServer) {
             max_hits: args.max_hits ?? 200,
             log_text: args.log_text ?? '',
             resume: args.resume ?? true,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'spoof_cpuid': {
+          const data = await spoofCpuid({
+            restore: args.restore,
+            module: args.module,
+            max_hits: args.max_hits,
+            vendor: args.vendor,
+            only_checked: args.only_checked,
           });
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
