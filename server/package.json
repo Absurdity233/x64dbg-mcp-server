@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test test/lease.test.mjs test/instances.test.mjs test/guards.test.mjs",
+    "test": "npm run build && node --test test/lease.test.mjs test/instances.test.mjs test/guards.test.mjs test/debug-state.test.mjs",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
     "dev": "tsc --watch"

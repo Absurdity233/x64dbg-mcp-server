@@ -14,7 +14,7 @@ dumps PEs, and bypasses anti-debug — live, inside the debugger.
 > discovery, CPUID spoofing and the write-action guards are this fork's addition.
 > See [Credits](#credits).
 
-**26 mega-tools** over **169 REST endpoints**, fully typed with Zod. A C++ plugin runs inside
+**27 mega-tools** over **169 REST endpoints**, fully typed with Zod. A C++ plugin runs inside
 x64dbg; a tiny TypeScript server bridges it to your client over stdio. Everything stays on
 `127.0.0.1` — nothing leaves your machine.
 
@@ -107,7 +107,7 @@ Open a target in x64dbg and start talking to your assistant.
 
 ## Tools at a glance
 
-26 action-based tools spanning the whole debugger:
+27 action-based tools spanning the whole debugger:
 
 - **Control** — run/step/pause, load/attach/detach, wait for pause or event, recovery, raw
   commands, scripts, expression eval

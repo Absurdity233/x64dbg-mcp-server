@@ -33,12 +33,12 @@ human at the mouse.**
   only `close`, `x64dbg_process` only `set_cmdline`. `X64DBG_MCP_AUDIT=1` appends one JSON line
   per write.
 
-26 mega-tools, 169 REST endpoints, all local.
+27 mega-tools, 169 REST endpoints, all local.
 
 Suggested one-liner:
 
 > "Shipped v2.4.0 of the x64dbg MCP server: multi-instance routing with leases, GUI driving,
-> session recovery, and CPUID spoofing. 26 mega-tools, all on localhost."
+> session recovery, and CPUID spoofing. 27 mega-tools, all on localhost."
 
 ---
 
@@ -68,7 +68,7 @@ What v2.4.0 added:
 - **Guards** — trace-in-progress refuses interfering actions without `force: true`; write
   actions are gated per tool and action, with opt-in audit logging.
 
-26 tools, 169 endpoints: breakpoints, memory read/write, disassembly, tracing, anti-debug,
+27 tools, 169 endpoints: breakpoints, memory read/write, disassembly, tracing, anti-debug,
 patching, dumping, instances, UI.
 
 GitHub: https://github.com/Absurdity233/x64dbg-mcp-server
@@ -79,12 +79,12 @@ GitHub: https://github.com/Absurdity233/x64dbg-mcp-server
 
 ### One-liner
 
-> MCP server for x64dbg — 26 tools, 169 endpoints. Breakpoints, memory, disassembly, tracing,
+> MCP server for x64dbg — 27 tools, 169 endpoints. Breakpoints, memory, disassembly, tracing,
 > anti-debug, multi-instance. All on `127.0.0.1`.
 
 ### With the anti-debug hook
 
-> Gave Claude hands inside x64dbg. 26 mega-tools over 169 REST endpoints, all local. Anti-debug
+> Gave Claude hands inside x64dbg. 27 mega-tools over 169 REST endpoints, all local. Anti-debug
 > bypass, CPUID spoofing, PE dumping with IAT fix, multi-instance leases, window OCR/click.
 > C++ plugin + TypeScript server over stdio.
 

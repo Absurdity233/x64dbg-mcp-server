@@ -157,7 +157,13 @@ export function registerDebugTools(server: McpServer) {
       path: z.string().optional().describe("load: absolute path of the executable to open"),
       cmdline: z.string().optional().describe("load: optional command line for the target"),
       pid: z.union([z.string(), z.number()]).optional().describe("attach: process id (decimal)"),
-      timeout_ms: z.number().optional().default(120000).describe("wait_for_pause/wait_for_event: maximum time to block (default 120000)"),
+      // No schema default on purpose. A single default cannot serve both
+      // callers: `wait_for_pause` legitimately parks for minutes, while `load`
+      // failing to reach the system breakpoint is worth knowing about in
+      // seconds. Each case applies its own fallback below.
+      timeout_ms: z.number().optional().describe(
+        "Maximum time to block. Defaults: wait_for_pause/wait_for_event 120000, load/attach/restart_debug 30000."
+      ),
       poll_ms: z.number().optional().default(200).describe("wait_for_pause/wait_for_event: state poll interval (default 200)"),
       include_health: z.boolean().optional().describe("state: also query plugin health"),
       wait: z.boolean().optional().describe("run: block until the target stops again (default true). Set false for fire-and-forget."),

@@ -6,7 +6,7 @@ quick tour; this is the exhaustive version (kept for humans doing deep work and 
 agents operating the plugin).
 
 - [How it works](#how-it-works)
-- [Tool reference (26 mega-tools)](#tool-reference-26-mega-tools)
+- [Tool reference (27 mega-tools)](#tool-reference-27-mega-tools)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Building from source](#building-from-source)
@@ -19,7 +19,7 @@ agents operating the plugin).
                          stdio                        HTTP (localhost)
  MCP Client  <───────────────────>  TypeScript MCP  <──────────────────>  C++ Plugin
  (Claude,                           Server            127.0.0.1:27042     (inside x64dbg)
-  Cursor,                           26 mega-tools                         169 REST endpoints
+  Cursor,                           27 mega-tools                         169 REST endpoints
   etc.)                             Zod validation                        Bridge/Plugin SDK
 ```
 
@@ -27,7 +27,7 @@ agents operating the plugin).
   server on `127.0.0.1:27042`. It wraps the x64dbg Bridge/Plugin SDK with 170 JSON endpoints
   across 23 handler files.
 - **TypeScript MCP Server** (`x64dbg-mcp-server` on npm) implements the MCP protocol over
-  stdio. The 26 mega-tools use flat Zod schemas (one `action` enum plus optional fields, with
+  stdio. The 27 mega-tools use flat Zod schemas (one `action` enum plus optional fields, with
   required-field checks at call time) to validate parameters, then route requests to the
   correct REST endpoint on the plugin via localhost HTTP.
 
@@ -39,6 +39,34 @@ with exponential backoff (timeouts are not retried).
 
 **Why stdio?** No SSE reconnection issues, no port conflicts, no dropped connections. The MCP
 client spawns the server as a child process — it just works.
+
+### Paging large results
+
+Several tools return whole tables rather than a count-limited page: a function's full
+instruction list, a module's symbol table, a PE's import/export tables. On an obfuscated or
+VM-protected target those run to hundreds of thousands of rows and will exhaust a model's
+context if returned whole.
+
+These tools accept `offset` / `limit` (`x64dbg_disassembly action=function`,
+`x64dbg_symbols action=search|list_module`, and `x64dbg_dumping` for
+`pe_header|sections|imports|exports|relocations`). The response keeps the plugin's own array
+key, and adds `total`, `returned`, `offset`, `limit` and `truncated` beside it:
+
+```json
+{
+  "instructions": [ ...200 rows... ],
+  "total": 51234,
+  "returned": 200,
+  "offset": 0,
+  "limit": 200,
+  "truncated": true
+}
+```
+
+Defaults are 200 rows; pass `offset` to walk the rest. `include_raw: true` also returns the
+unpaged plugin response when you need the whole thing in one shot. `x64dbg_search`,
+`x64dbg_handles` and `x64dbg_analysis` use the same shape, and `x64dbg_functions` pages
+plugin-side (`offset`/`limit` go straight to the plugin).
 
 ### Safety guards
 
@@ -64,7 +92,7 @@ Large list responses are paged: `x64dbg_database`, `x64dbg_analysis`
 `x64dbg_command get_events` takes `max_events` and leaves the rest buffered.
 Plugin errors are returned as `{"error":{"code","message","hint"}}`.
 
-## Tool reference (26 mega-tools)
+## Tool reference (27 mega-tools)
 
 Each tool accepts an `action` parameter that selects the specific operation. Parameters are
 validated with Zod schemas at runtime.
@@ -73,7 +101,8 @@ validated with Zod schemas at runtime.
 
 | Tool | Actions | Description |
 |------|---------|-------------|
-| `x64dbg_debug` | `run`, `pause`, `force_pause`, `step_into`, `step_over`, `step_out`, `stop_debug`, `restart_debug`, `run_to_address`, `state` | Control execution flow and query debugger state |
+| `x64dbg_debug` | `run`, `pause`, `force_pause`, `step_into`, `step_over`, `step_out`, `stop_debug`, `restart_debug`, `run_to_address`, `state`, `load`, `attach`, `detach`, `wait_for_pause`, `wait_for_event`, `recover` | Control execution flow and query debugger state. `load` runs `init` and lands on the system breakpoint, so it is the reliable way to get a pauseable session — attaching to a GUI-opened target can leave `pause` answering `success:false`. `timeout_ms` defaults to 30000 for load/attach and 120000 for the waiting actions |
+| `x64dbg_events` | `poll`, `wait`, `list` | Debugger event stream. `poll` drains what is buffered since the cursor, `wait` parks on the plugin's long-poll until a matching event arrives, `list` shows cursor and head sequence without consuming. Filter with `types` and `address`; `since` replays from a known point; `reset` moves the cursor to the head first. Types: `session_start`, `session_attach`, `session_stop`, `system_breakpoint`, `breakpoint`, `exception`, `dll_load`, `thread_create`, `process_create`, `process_exit`, `paused`, `resumed`, `stepped` |
 | `x64dbg_command` | `execute`, `script`, `evaluate`, `format`, `set_init_script`, `get_init_script`, `get_hash`, `get_events` | Execute raw x64dbg commands, batch scripts, and expression evaluation. `force` overrides the trace guard; `max_events` caps `get_events` |
 
 ### CPU & memory
@@ -202,7 +231,7 @@ The plugin also provides GUI dialogs accessible from `Plugins > x64dbg MCP Serve
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  TypeScript MCP Server (x64dbg-mcp-server)                      │
 │                                                                 │
-│  26 tools registered via @modelcontextprotocol/sdk              │
+│  27 tools registered via @modelcontextprotocol/sdk              │
 │  Flat Zod schemas: action enum + optional fields                │
 │  HttpClient: auto-reconnect, health checks, retry logic         │
 └──────────────────────────┬──────────────────────────────────────┘

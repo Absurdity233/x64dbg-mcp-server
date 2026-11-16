@@ -8,6 +8,7 @@ import { registerControlFlowTools } from './controlflow.js';
 import { registerDebugTools } from './debug.js';
 import { registerDisassemblyTools } from './disassembly.js';
 import { registerDumpingTools } from './dumping.js';
+import { registerEventTools } from './events.js';
 import { registerExceptionTools } from './exceptions.js';
 import { registerFunctionTools } from './functions.js';
 import { registerInstanceTools } from './instances.js';
@@ -40,6 +41,7 @@ export function registerAllTools(server: McpServer) {
   registerTracingTools(server);
   registerDumpingTools(server);
   registerAntiDebugTools(server);
+  registerEventTools(server);
   registerExceptionTools(server);
   registerProcessTools(server);
   registerHandleTools(server);

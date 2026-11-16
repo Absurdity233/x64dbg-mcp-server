@@ -8,7 +8,7 @@
 or any MCP client in plain English and it sets breakpoints, reads memory, disassembles, traces,
 dumps PEs, and bypasses anti-debug — live, inside the debugger.
 
-**26 mega-tools** over **169 REST endpoints**, fully typed with Zod. This package is the
+**27 mega-tools** over **169 REST endpoints**, fully typed with Zod. This package is the
 TypeScript MCP server; it bridges your client to a C++ plugin running inside x64dbg. Everything
 stays on `127.0.0.1`.
 
@@ -76,7 +76,7 @@ stdio transport — spawn `npx -y x64dbg-mcp-server` and speak the
 
 ## Tools
 
-26 action-based tools: **control** (run/step/commands), **CPU & memory** (registers, read/write/
+27 action-based tools: **control** (run/step/commands), **CPU & memory** (registers, read/write/
 alloc/protect, map), **stack** (call stack, SEH), **analysis** (disasm/assemble, xrefs, CFG,
 loops), **breakpoints & tracing** (sw/hw/memory/conditional/logging/batch), **symbols & search**
 (labels, comments, AOB + string scan), **process & system** (threads, handles, TCP, PEB,

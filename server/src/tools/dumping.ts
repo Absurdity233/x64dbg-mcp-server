@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { httpClient } from '../http_client.js';
-import { requireString } from './util.js';
+import { requireString, pageResult } from './util.js';
 
 export function registerDumpingTools(server: McpServer) {
   server.tool(
@@ -19,20 +19,29 @@ export function registerDumpingTools(server: McpServer) {
       oep: z.string().optional().describe('fix_iat/rebuild: original entry point address'),
       filename: z.string().optional().describe('export_patch_file: output path for the .1337 patch file'),
       fix_section_flags: z.boolean().optional().describe('rebuild: clear MEM_WRITE from section flags (default true)'),
+      // relocations and the import/export tables of a large module run to
+      // thousands of rows; the plugin returns them all, so page here.
+      offset: z.number().int().min(0).optional().describe('pe_header/sections/imports/exports/relocations: skip this many rows (default 0)'),
+      limit: z.number().int().min(1).max(5000).optional().describe('pe_header/sections/imports/exports/relocations: return at most this many rows (default 200)'),
+      include_raw: z.boolean().optional().describe('Also return the unpaged plugin response'),
     },
     async (args) => {
       switch (args.action) {
         case 'pe_header':
         case 'relocations': {
           const data = await httpClient.get(`/api/dump/${args.action}`, { address: requireString(args.address, 'address') });
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          const paged = pageResult(data, args.offset ?? 0, args.limit ?? 200);
+          if (args.include_raw) return { content: [{ type: 'text', text: JSON.stringify({ paged, raw: data }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(paged, null, 2) }] };
         }
         case 'sections':
         case 'imports':
         case 'exports':
         case 'entry_point': {
           const data = await httpClient.get(`/api/dump/${args.action}`, { module: requireString(args.module, 'module') });
-          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+          const paged = pageResult(data, args.offset ?? 0, args.limit ?? 200);
+          if (args.include_raw) return { content: [{ type: 'text', text: JSON.stringify({ paged, raw: data }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(paged, null, 2) }] };
         }
         case 'dump_module': {
           const data = await httpClient.post('/api/dump/module', {
