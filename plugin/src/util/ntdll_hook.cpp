@@ -224,6 +224,35 @@ struct emitter {
         }
     }
 
+    // Write N bytes from an embedded pattern, honouring the buffer register.
+    //
+    // Emitted as a run of byte stores rather than a mov, because the length is a
+    // property of the class (2 bytes for SystemKernelDebuggerInformation, 4 or 8
+    // elsewhere) and a mov would need a size chosen per class anyway. A null buffer
+    // pointer is skipped: a caller that passes NULL and a length of 0 is legal for
+    // some classes, and faulting there would be a crash we caused.
+    void store_bytes_at_buffer(const std::vector<uint8_t>& pattern, bool buffer_is_rdx) {
+        if (pattern.empty()) return;
+        for (size_t i = 0; i < pattern.size(); ++i) {
+            // test r8, r8 / test rdx, rdx  then jz over the stores
+            if (buffer_is_rdx) { u8(0x48); u8(0x85); u8(0xD2); }
+            else               { u8(0x4D); u8(0x85); u8(0xC0); }
+            u8(0x74); const size_t jz_at = code.size(); u8(0);
+
+            // mov byte ptr [reg+disp8], imm8  -> 41 C6 40 xx ii   (r8)
+            //                                   C6 42 xx ii       (rdx)
+            if (buffer_is_rdx) {
+                u8(0xC6); u8(0x42); u8(static_cast<uint8_t>(i)); u8(pattern[i]);
+            } else {
+                u8(0x41); u8(0xC6); u8(0x40); u8(static_cast<uint8_t>(i)); u8(pattern[i]);
+            }
+
+            const size_t after = code.size();
+            code[jz_at] = static_cast<uint8_t>(static_cast<int>(after) -
+                                               static_cast<int>(jz_at + 1));
+        }
+    }
+
     void mov_eax(uint32_t v) { u8(0xB8); u32(v); }
     void ret() { u8(0xC3); }
     void real_path(uint32_t ssn, uint64_t syscall_addr, bool need_r10) {
@@ -293,6 +322,8 @@ std::vector<uint8_t> build_dispatcher(const std::vector<target_spec>& specs,
                 e.store_dword_at_buffer(0, buf_in_rdx); e.mov_eax(0); break;
             case action::fake_nonzero_success:
                 e.store_dword_at_buffer(1, buf_in_rdx); e.mov_eax(0); break;
+            case action::fake_pattern_success:
+                e.store_bytes_at_buffer(spec.pattern, buf_in_rdx); e.mov_eax(0); break;
             case action::return_success:
                 // Deliberately leaves the buffer alone.
                 e.mov_eax(0); break;
@@ -381,14 +412,49 @@ nlohmann::json install_defaults(const std::vector<std::string>& functions, bool 
         const char* function;
         unsigned long cls;
         action what;
+        // Bytes for fake_pattern_success; unused otherwise.
+        std::vector<uint8_t> pattern;
     };
     static const def defaults[] = {
-        {"NtQueryInformationProcess", 7,     action::fake_zero_success},
-        {"NtQueryInformationProcess", 0x1E,  action::fake_zero_success},
-        {"NtQueryInformationProcess", 0x1F,  action::fake_nonzero_success},
-        {"NtQueryObject",             1,     action::return_invalid_parameter},
-        {"NtQuerySystemInformation",  0x23,  action::fake_zero_success},
-        {"NtSetInformationThread",    0x11,  action::return_success},
+        // ProcessDebugPort (7) -> a NULL port, succeed. This is the kernel field
+        // NtQueryInformationProcess reads, and 0 means "not being debugged".
+        {"NtQueryInformationProcess", 7,     action::fake_zero_success, {}},
+
+        // ProcessDebugObject (0x0D) -> a zeroed DEBUG_OBJECT, succeed.
+        //
+        // This is NOT a duplicate of 0x1E. 0x1E returns the debug object HANDLE;
+        // 0x0D returns the whole DEBUG_OBJECT structure, whose LEADING HANDLE field
+        // is the value every consumer looks at but which is reached by a different
+        // branch of the real function. Leaving 0x0D unstubbed means a target asking
+        // for it gets the true answer while every other check is already defeated.
+        //
+        // The pattern is 8 bytes, matching the HANDLE at offset 0. Measured: the
+        // caller passes sizeof(DEBUG_OBJECT) and reads the first 8 bytes, so a
+        // shorter write leaves the original handle visible in the upper half - which
+        // is exactly what the first attempt did (status went to SUCCESS but the
+        // handle field still read 0xAAAA...).
+        {"NtQueryInformationProcess", 0x0D,  action::fake_pattern_success,
+         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+
+        // ProcessDebugObjectHandle (0x1E) -> a NULL handle, succeed.
+        {"NtQueryInformationProcess", 0x1E,  action::fake_zero_success, {}},
+
+        // ProcessDebugFlags (0x1F) -> a non-zero flag, succeed.
+        {"NtQueryInformationProcess", 0x1F,  action::fake_nonzero_success, {}},
+
+        // ObjectTypeInformation (1) -> refuse. A wrong type name is worse than no
+        // answer: callers index a table by it.
+        {"NtQueryObject",             1,     action::return_invalid_parameter, {}},
+
+        // SystemKernelDebuggerInformation (0x23) -> { DebuggerPresent=0,
+        // DebuggerNotPresent=1 }. Exactly two bytes, because that is the whole
+        // structure - and a zeroed pair is a state no real machine reports.
+        {"NtQuerySystemInformation",  0x23,  action::fake_pattern_success, {0x00, 0x01}},
+
+        // ThreadHideFromDebugger (0x11) -> succeed without acting. Letting this one
+        // take effect would hide the current thread from the debugger and break the
+        // session outright.
+        {"NtSetInformationThread",    0x11,  action::return_success, {}},
     };
 
     std::vector<target_spec> specs;
@@ -407,7 +473,7 @@ nlohmann::json install_defaults(const std::vector<std::string>& functions, bool 
         bool added = false;
         for (const auto& d : defaults) {
             if (want == d.function) {
-                specs.push_back({d.function, d.cls, d.what, regs});
+                specs.push_back({d.function, d.cls, d.what, regs, d.pattern});
                 added = true;
             }
         }

@@ -121,10 +121,61 @@ filter_bytes none_filter(const std::string& why) {
 
 } // namespace
 
+// KUSER_SHARED_DATA read -> frozen value in the same register.
+//
+// These sites need a fundamentally simpler treatment than cpuid/rdtsc, and the
+// difference is worth stating: the instruction is a pure load of one absolute
+// address into one register, so it can be replaced IN PLACE by an immediate move
+// to that same register. No stub page, no jump, no displaced instructions, no
+// range constraint, no relocation - and none of the two bugs that dominated the
+// instruction stubs (filter ordering and RIP displacement).
+//
+//   original:  8B 04 25 04 00 FE 7F     mov eax,[0x7FFE0004]      (7 bytes)
+//   replaced:  B8 xx xx xx xx 90 90     mov eax,imm32 ; nop nop   (7 bytes)
+//
+// The equal length is the whole trick: the next instruction keeps its address, so
+// nothing else in the target's code shifts.
+//
+// The destination register is in the modrm byte, which is why the catalog has one
+// entry per destination instead of a wildcard - the replacement must name the same
+// register.
+filter_bytes kuser_filter(const std::vector<uint8_t>& original, uint32_t frozen_value) {
+    filter_bytes f;
+
+    // The modrm byte is at index 1; its register field is bits 3..5.
+    if (original.size() < 7 || original[0] != 0x8B) {
+        f.what = "not a KUSER load";
+        return f;   // an empty body means "cannot build"
+    }
+    const uint8_t reg = static_cast<uint8_t>((original[1] >> 3) & 0x07);
+
+    f.code.push_back(static_cast<uint8_t>(0xB8 + reg));   // mov r32, imm32
+    for (int i = 0; i < 4; ++i) {
+        f.code.push_back(static_cast<uint8_t>((frozen_value >> (8 * i)) & 0xFF));
+    }
+    while (f.code.size() < original.size()) f.code.push_back(0x90);
+
+    f.what = "KUSER tick read replaced by a frozen immediate (in place, same length)";
+    return f;
+}
+
 std::string default_spoof_for(const std::string& probe) {
     if (probe == "cpuid")  return "ecx bit31 cleared, vendor leaf zeroed";
     if (probe == "rdtsc" || probe == "rdtscp") return "timestamps forced to 0 (zero delta)";
     if (probe == "vmware_backdoor") return "backdoor IN not taken: EBX left non-'VMXh'";
+    if (probe == "kuser_addrload") {
+        // Measured on this toolchain: `*(volatile DWORD*)0x7FFE0004` compiles to
+        //   mov ebx, 0x7FFE0004
+        //   mov edi, dword ptr [rbx]      <- register-indirect, no address in the bytes
+        // The load cannot be patched (the target needs that address to read the
+        // page) and the read cannot be recognised from its own bytes, so this is
+        // discovery: it tells a caller where the shared page address enters the
+        // target, which is the one instruction before the read they need to trap.
+        return "KUSER shared-page address load: discovery only - the register-indirect "
+               "read that follows carries no address, so patch the read site (find it "
+               "with a breakpoint on this instruction and follow the register) or use "
+               "timers to cover the API path";
+    }
     return "memory-operand probe - needs a per-site filter, discovery only";
 }
 
@@ -187,6 +238,71 @@ nlohmann::json arm(c_bridge_executor& bridge, const std::string& module,
 
         // ---- choose the filter -------------------------------------------
         filter_bytes filter;
+
+        // KUSER_SHARED_DATA loads are handled first and differently: replace the
+        // load in place with an immediate move of the same length. No stub page,
+        // no jump, no relocation - see kuser_filter().
+        const int kuser_off = hit.value("kuser_offset", -1);
+        if (kuser_off >= 0) {
+            auto orig = bridge.read_memory(site, static_cast<size_t>(hit.value("size", 0)));
+            if (!orig.has_value() || orig->size() < 7) {
+                skipped.push_back({{"probe", probe}, {"address", addr_str},
+                                   {"reason", "cannot read the KUSER load"}});
+                continue;
+            }
+
+            // The frozen value must not be zero: a tick counter reading exactly 0
+            // after boot is its own fingerprint. Derived from the site address so
+            // different sites differ, and stable for the session so every delta is
+            // still exactly zero.
+            const uint32_t frozen =
+                (static_cast<uint32_t>(site >> 4) ^ 0x9E3779B9u) | 1u;
+
+            filter = kuser_filter(*orig, frozen);
+            if (filter.code.empty()) {
+                skipped.push_back({{"probe", probe}, {"address", addr_str},
+                                   {"reason", "not the expected mov-from-absolute form"}});
+                continue;
+            }
+
+            if (!bridge.write_memory(site, filter.code).has_value()) {
+                skipped.push_back({{"probe", probe}, {"address", addr_str},
+                                   {"reason", "in-place write failed"}});
+                continue;
+            }
+            auto after_inplace = bridge.read_memory(site, filter.code.size());
+            if (!after_inplace.has_value() || *after_inplace != filter.code) {
+                (void)bridge.write_memory(site, *orig);
+                skipped.push_back({{"probe", probe}, {"address", addr_str},
+                                   {"reason", "the in-place patch did not stick - reverted"}});
+                continue;
+            }
+
+            armed.push_back({
+                {"probe",     probe},
+                {"address",   addr_str},
+                {"stub",      "in-place (no stub page)"},
+                {"spoof",     filter.what},
+                {"frozen_at", format_utils::format_hex(frozen)},
+                {"verified",  true},
+                {"displaced", 0}
+            });
+
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                armed_stub rec_inplace;
+                rec_inplace.probe = probe;
+                rec_inplace.site = site;
+                rec_inplace.stub = 0;          // no stub page
+                rec_inplace.spoof = filter.what;
+                rec_inplace.patch = filter.code;
+                rec_inplace.original = *orig;
+                g_armed[site] = rec_inplace;
+            }
+            ++per_probe;
+            continue;
+        }
+
         if (probe == "cpuid") {
             filter = cpuid_filter();
         } else if (probe == "rdtsc" || probe == "rdtscp") {

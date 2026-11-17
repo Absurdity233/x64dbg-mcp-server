@@ -290,6 +290,77 @@ hook 后: NtQuerySystemInformation(0x23) present=0 notpresent=0
 
 响应里新增 `disasm_calls`,可以对比命中数看实际节省。
 
+---
+
+## 10. KUSER_SHARED_DATA 直接读时钟（2.7.0）
+
+这是计时侧信道里最隐蔽的一层：共享页在所有进程里以只读方式映射在 `0x7FFE0000`,
+目标可以用**一条指令**读到 tick,不经过任何导出、没有系统调用、也没有任何 API hook
+能看到。实测 `kernel32.GetTickCount64` 本身就是 `mov ecx,[0x7FFE0004]`。
+
+### 两种形态,只有一种能按地址匹配
+
+| 形态 | 编码 | 能否按模式定位 |
+|---|---|---|
+| 绝对寻址 | `8B 04 25 04 00 FE 7F` (`mov eax,[0x7FFE0004]`) | **能** —— 地址在指令字节里 |
+| 寄存器间接 | `BB 04 00 FE 7F` 然后 `8B 3B` | **不能** —— 读取指令里没有地址 |
+
+第二种是编译器实际生成的形态。我用 `dumpbin` 确认过：
+
+```
+mov ebx, 7FFE0004h
+mov edi, dword ptr [rbx]      <- 读取在这里，字节里只有 8B 3B
+```
+
+所以「扫描 KUSER 绝对读」在真实目标上一个都找不到,而扫描 `mov <reg>, 0x7FFE0004`
+能找到——但那是**地址加载**,不是读取本身。
+
+### 打桩的边界,以及为什么共享页不能直接改
+
+第一反应是"直接冻结 `0x7FFE0000` 页"。实测**不可行**：
+
+```
+VirtualProtect 改 RW         -> 成功
+DbgMemWrite 到 0x7FFE0014    -> 失败
+```
+
+该页是共享映射,写入不能按进程隔离。改它会影响宿主,得不偿失。
+
+绝对寻址的读取可以**原地替换**为等长立即数(`B8+r imm32` + NOP 填充),这是唯一
+不需要重定位、不需要桩页、也不会踩到前面那两个坑的处理方式。寄存器间接的读取
+无法从字节识别,只报告地址加载点供人工定位。
+
+响应里对这一点说得很直白,不假装覆盖了没覆盖的情况。
+
+---
+
+## 11. ntdll 类扩展（2.7.0）
+
+补上了 `ProcessDebugObject (0x0D)` —— 它**不是** `0x1E` 的重复：`0x1E` 返回调试对象
+句柄,`0x0D` 返回整个 `DEBUG_OBJECT` 结构(首字段是同一个句柄),走的是真实函数里
+另一条分支。漏掉它就意味着目标换一个类号就能拿到真答案。
+
+`SystemKernelDebuggerInformation (0x23)` 改用显式字节模式 `{0x00, 0x01}`,而不是
+清零。原因：结构是 `{DebuggerPresent, DebuggerNotPresent}`,「无内核调试器」是
+`{0,1}`,全零是一个任何真实机器都不会报告的状态,本身就是指纹。
+
+为此新增了 `fake_pattern_success` 动作：按调用方给定的字节串写入,并**逐字节检查
+缓冲区指针非空**——某些类允许 `Buffer=NULL, Length=0`,在那里解引用会造成我们
+自己制造的崩溃。写入长度等于模式长度,不会溢出短缓冲区。
+
+实测(目标自报)：
+
+```
+未 hook: ProcessDebugObject(0x0D)  status=0xC0000003  handle=0xAAAA...  DETECTED
+hook 后: ProcessDebugObject(0x0D)  status=0x00000000  handle=0            clean
+未 hook: KernelDebugger(0x23)      present=0 notpresent=1                 clean
+hook 后: KernelDebugger(0x23)      present=0 notpresent=1  (显式写入，不再是清零)
+```
+
+`0x0D` 第一次修的时候只写了 4 字节(`fake_zero_success`),`status` 变成成功但 handle
+字段的高 4 字节仍是 `0xAAAA……`——因为调用方传的是 `sizeof(DEBUG_OBJECT)` 并读取
+前 8 字节。改用 8 字节模式后才真正清零。
+
 复现命令：
 
 ```powershell

@@ -17,35 +17,35 @@ const std::vector<probe_spec>& catalog() {
         // --- CPU identity ---------------------------------------------------
         {"cpuid",  "cpuid",  "hypervisor-present bit (leaf 1, ecx bit 31) and the vendor leaf "
                    "0x40000000; the most-used VM check there is",
-         {0x0F, 0xA2}, false, true},
+         {0x0F, 0xA2}, false, true, -1, 0},
 
         // --- Timing ---------------------------------------------------------
         {"rdtsc",  "rdtsc", "cycle counter; a delta across a region exposes single-stepping, "
                    "breakpoint traps and a slow (emulated) hypervisor",
-         {0x0F, 0x31}, false, true},
+         {0x0F, 0x31}, false, true, -1, 0},
         {"rdtscp", "rdtscp", "serialising timing variant; same checks as rdtsc, harder to fool "
                    "with a plain instruction counter",
-         {0x0F, 0x01, 0xF9}, false, true},
+         {0x0F, 0x01, 0xF9}, false, true, -1, 0},
 
         // --- Descriptor tables ----------------------------------------------
         // sidt/sgdt take a memory operand, so the ModRM/displacement bytes vary;
         // match only the fixed 0F 01 prefix and let the disassembler confirm.
         {"sidt",   "sidt", "IDT base; a hypervisor that relocates the IDT is visible here "
                    "(the classic Red Pill check)",
-         {0x0F, 0x01, 0x0D}, true, true},
+         {0x0F, 0x01, 0x0D}, true, true, -1, 0},
         {"sidt",   "sidt", "IDT base via the alternate ModRM form",
-         {0x0F, 0x01, 0x1D}, true, true},
+         {0x0F, 0x01, 0x1D}, true, true, -1, 0},
         {"sgdt",   "sgdt", "GDT base; relocated by hypervisors",
-         {0x0F, 0x01, 0x05}, true, true},
+         {0x0F, 0x01, 0x05}, true, true, -1, 0},
         {"sgdt",   "sgdt", "GDT base via the alternate ModRM form",
-         {0x0F, 0x01, 0x15}, true, true},
+         {0x0F, 0x01, 0x15}, true, true, -1, 0},
         {"sldt",   "sldt", "LDT selector; zero or an implausible value under a hypervisor",
-         {0x0F, 0x00, 0xC0}, false, true},
+         {0x0F, 0x00, 0xC0}, false, true, -1, 0},
         {"str",    "str", "task register; 0 under many hypervisors, and the classic "
                    "VMware-backdoor companion check",
-         {0x0F, 0x00, 0xC8}, false, true},
+         {0x0F, 0x00, 0xC8}, false, true, -1, 0},
         {"smsw",   "smsw", "CR0 via SMSW; the VM86/monitor bit differs on some hypervisors",
-         {0x0F, 0x01, 0xE0}, false, true},
+         {0x0F, 0x01, 0xE0}, false, true, -1, 0},
 
         // --- VMware backdoor port --------------------------------------------
         // The detection is `mov dx, 0x5658` followed by `in eax, dx`: the IN is
@@ -57,7 +57,128 @@ const std::vector<probe_spec>& catalog() {
         // would hit ordinary code.
         {"vmware_backdoor", "mov dx, 0x5658", "VMware backdoor probe: DX=0x5658 then IN; on a guest EBX becomes 'VMXh', "
          "on metal the IN faults - the strongest single VM indicator there is",
-         {0x66, 0xBA, 0x58, 0x56}, false, true},
+         {0x66, 0xBA, 0x58, 0x56}, false, true, -1, 0},
+
+        // --- KUSER_SHARED_DATA direct reads -----------------------------------
+        //
+        // The timing checks that never call a timer API. The shared page is mapped
+        // read-only at 0x7FFE0000 in every process, so a target can read the tick
+        // counter with ONE instruction - no export, no syscall, and nothing for an
+        // inline API hook to see.
+        //
+        // Measured on 26200: kernel32.GetTickCount64 is literally
+        // `8B 0C 25 04 00 FE 7F` (mov ecx, dword [0x7FFE0004]), and a scan of a
+        // running process finds 20+ such sites. The encoding is
+        // `8B <modrm mod=00 rm=100> 25 <disp32>` - modrm selects the destination
+        // register, SIB 0x25 means "no base, no index, absolute disp32".
+        //
+        //     8B 04 25 04 00 FE 7F   mov eax, dword [0x7FFE0004]
+        //     8B 0C 25 ...           mov ecx, ...
+        //     8B 14 25 ...           mov edx, ...
+        //     8B 1C 25 ...           mov ebx, ...
+        //
+        // The destination is in the modrm, which is what makes these patchable in
+        // place: the load can be replaced by an immediate move to the same register.
+        {"kuser_ticklow",
+         "mov eax, dword ptr ds:[0x000000007FFE0004]",
+         "reads the low tick counter straight from KUSER_SHARED_DATA - no timer API, "
+         "so api-level stubs never see it",
+         {0x8B, 0x04, 0x25, 0x04, 0x00, 0xFE, 0x7F}, false, true, 0x004, 0},
+        {"kuser_ticklow",
+         "mov ecx, dword ptr ds:[0x000000007FFE0004]",
+         "reads the low tick counter straight from KUSER_SHARED_DATA",
+         {0x8B, 0x0C, 0x25, 0x04, 0x00, 0xFE, 0x7F}, false, true, 0x004, 0},
+        {"kuser_ticklow",
+         "mov edx, dword ptr ds:[0x000000007FFE0004]",
+         "reads the low tick counter straight from KUSER_SHARED_DATA",
+         {0x8B, 0x14, 0x25, 0x04, 0x00, 0xFE, 0x7F}, false, true, 0x004, 0},
+        {"kuser_ticklow",
+         "mov ebx, dword ptr ds:[0x000000007FFE0004]",
+         "reads the low tick counter straight from KUSER_SHARED_DATA",
+         {0x8B, 0x1C, 0x25, 0x04, 0x00, 0xFE, 0x7F}, false, true, 0x004, 0},
+
+        // The 64-bit tick is assembled from two dwords the target reads separately,
+        // so matching the low half is what catches it. (TickCountQuad at 0x7FFE0320
+        // exists too, but the compiler almost always emits the two-dword form.)
+        {"kuser_ticklow",
+         "mov eax, dword ptr ds:[0x000000007FFE0320]",
+         "reads the 64-bit tick counter straight from KUSER_SHARED_DATA",
+         {0x8B, 0x04, 0x25, 0x20, 0x03, 0xFE, 0x7F}, false, true, 0x320, 0},
+        {"kuser_ticklow",
+         "mov ecx, dword ptr ds:[0x000000007FFE0320]",
+         "reads the 64-bit tick counter straight from KUSER_SHARED_DATA",
+         {0x8B, 0x0C, 0x25, 0x20, 0x03, 0xFE, 0x7F}, false, true, 0x320, 0},
+        {"kuser_ticklow",
+         "mov edx, dword ptr ds:[0x000000007FFE0324]",
+         "reads the high dword of the 64-bit tick counter from KUSER_SHARED_DATA",
+         {0x8B, 0x14, 0x25, 0x24, 0x03, 0xFE, 0x7F}, false, true, 0x324, 0},
+
+        // Interrupt time and system time are the other two shared-page clocks a
+        // timing check can reach without an API.
+        {"kuser_systime",
+         "mov eax, dword ptr ds:[0x000000007FFE0014]",
+         "reads InterruptTime from KUSER_SHARED_DATA - a second clock the target can "
+         "use for the same measurement",
+         {0x8B, 0x04, 0x25, 0x14, 0x00, 0xFE, 0x7F}, false, true, 0x014, 0},
+        {"kuser_systime",
+         "mov ecx, dword ptr ds:[0x000000007FFE0014]",
+         "reads InterruptTime from KUSER_SHARED_DATA",
+         {0x8B, 0x0C, 0x25, 0x14, 0x00, 0xFE, 0x7F}, false, true, 0x014, 0},
+
+        // --- KUSER_SHARED_DATA address LOAD (the form compilers actually emit) --
+        //
+        // Measured on this toolchain: reading `*(volatile DWORD*)0x7FFE0004` does not
+        // produce the absolute form above. It produces
+        //
+        //     mov edi, 0x7FFE0004        ; BF 04 00 FE 7F   (or BE/BA/BB/... per reg)
+        //     ...
+        //     mov esi, dword [rdi]       ; the actual read, via the register
+        //
+        // So the absolute-displacement patterns miss the common case entirely, and a
+        // scan of the test target found ZERO of them while the compiler had emitted
+        // four address loads. These entries cover the load, which is the site worth
+        // patching: replacing it with `mov <reg>, <frozen address>` is impossible
+        // (the target then reads the wrong page), so this is DISCOVERY ONLY - it
+        // reports where the target gets the shared page address, which is what a
+        // caller needs to find the read that follows.
+        {"kuser_addrload",
+         "mov eax, 0x7FFE0004",
+         "loads the KUSER_SHARED_DATA tick address into a register; the read that "
+         "follows uses that register, so the absolute-form patterns never match it. "
+         "Discovery only: the read itself is what must be neutralised",
+         {0xB8, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov ecx, 0x7FFE0004",
+         "loads the KUSER tick address into ecx (register-indirect read follows)",
+         {0xB9, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov edx, 0x7FFE0004",
+         "loads the KUSER tick address into edx (register-indirect read follows)",
+         {0xBA, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov ebx, 0x7FFE0004",
+         "loads the KUSER tick address into ebx (register-indirect read follows)",
+         {0xBB, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov edi, 0x7FFE0004",
+         "loads the KUSER tick address into edi (register-indirect read follows)",
+         {0xBF, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov esi, 0x7FFE0004",
+         "loads the KUSER tick address into esi (register-indirect read follows)",
+         {0xBE, 0x04, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov eax, 0x7FFE0324",
+         "loads the KUSER 64-bit tick address into a register",
+         {0xB8, 0x24, 0x03, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov edi, 0x7FFE0324",
+         "loads the KUSER 64-bit tick address into edi",
+         {0xBF, 0x24, 0x03, 0xFE, 0x7F}, false, false, -1, 0},
+        {"kuser_addrload",
+         "mov eax, 0x7FFE0014",
+         "loads the KUSER InterruptTime address into a register",
+         {0xB8, 0x14, 0x00, 0xFE, 0x7F}, false, false, -1, 0},
     };
     return specs;
 }
@@ -206,6 +327,8 @@ nlohmann::json scan(c_bridge_executor& bridge, const std::string& module_name,
                     {"offset",      format_utils::format_hex(c.offset)},
                     {"disasm",      std::string(di.instruction)},
                     {"size",        di.instr_size},
+                    {"kuser_offset", p.kuser_offset},
+                    {"kuser_dest64", p.dest_is_64},
                     {"stubbable",   p.stubbable}
                 });
             }

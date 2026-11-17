@@ -38,7 +38,7 @@ namespace ntdll_hook {
 // after the API, because the API is an implementation detail of the check.
 enum class action {
     // Write a zeroed dword through the info buffer, return STATUS_SUCCESS.
-    // ProcessDebugPort / ProcessDebugObjectHandle.
+    // ProcessDebugPort / ProcessDebugObjectHandle / ProcessDebugObject.
     fake_zero_success,
 
     // Write 1 through the info buffer, return STATUS_SUCCESS.
@@ -55,6 +55,17 @@ enum class action {
     // Refuse the query with STATUS_INVALID_PARAMETER. Used where a wrong answer
     // is worse than no answer.
     return_invalid_parameter,
+
+    // Write an explicit byte pattern through the buffer, return STATUS_SUCCESS.
+    //
+    // Needed because a single zero is not always the right answer. The clearest
+    // case is SystemKernelDebuggerInformation (0x23): the structure is
+    // { BOOLEAN DebuggerPresent; BOOLEAN DebuggerNotPresent; }, and "no kernel
+    // debugger" is {0, 1} - not {0, 0}. Writing all zeros produces a state no real
+    // machine reports, which is itself detectable. `pattern` is copied to the
+    // buffer, and only as many bytes as it holds, so a caller passing a 2-byte
+    // buffer is not overrun.
+    fake_pattern_success,
 };
 
 // Where an argument lives.
@@ -79,6 +90,9 @@ struct target_spec {
     unsigned long info_class; // the class value to intercept
     action       what;
     arg_regs     args;        // where class/buffer live for this function
+    // For fake_pattern_success: the exact bytes to place in the buffer. Empty for
+    // every other action.
+    std::vector<uint8_t> pattern;
 };
 
 // The register convention for a known function, so callers do not have to
