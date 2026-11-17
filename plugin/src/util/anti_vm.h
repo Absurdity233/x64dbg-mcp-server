@@ -57,6 +57,21 @@ nlohmann::json arm(c_bridge_executor& bridge, const std::string& module,
 // Write every original byte back. Returns what was restored and what failed.
 nlohmann::json disarm(c_bridge_executor& bridge);
 
+// Session-teardown variant.
+//
+// The difference from disarm() is not cosmetic: disarm() insists on a paused
+// target because writing a *running* process races its own code. At session end
+// there is no correct state to demand - the process may already be gone (the
+// debugger killed it) or still alive (detach). So this:
+//
+//   * writes the original bytes only when the process still exists, and
+//   * ALWAYS clears the registry, because stale entries would otherwise be
+//     restored into an unrelated process in the next session at the same address.
+//
+// Returns the count of stubs whose bytes were actually written back (0 on a
+// terminated target, which is the normal case and not an error).
+nlohmann::json teardown(c_bridge_executor& bridge);
+
 // Currently armed stubs.
 nlohmann::json list();
 

@@ -631,6 +631,58 @@ nlohmann::json restore() {
     return nlohmann::json{{"ok", failed.empty()}, {"restored", restored}, {"failed", failed}};
 }
 
+// Session-teardown path. Same reasoning as anti_vm::teardown: write back what the
+// still-live process allows, and clear the registry regardless, so a terminated
+// session cannot leave a hook record that the next session would re-apply to an
+// unrelated process at the same address.
+nlohmann::json teardown() {
+    auto& bridge = get_bridge();
+
+    std::map<std::string, installed_hook> taken;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        taken.swap(g_hooks);
+    }
+
+    if (taken.empty()) {
+        return nlohmann::json{{"ok", true}, {"restored", nlohmann::json::array()},
+                              {"count", 0}, {"message", "nothing was hooked"}};
+    }
+
+    const bool live = bridge.is_debugging();
+    nlohmann::json restored = nlohmann::json::array();
+    size_t written = 0;
+
+    if (live) {
+        for (auto& [name, h] : taken) {
+            bool ok = false;
+            if (h.kind == "hotpatch-slot") {
+                std::vector<uint8_t> orig(sizeof(duint));
+                std::memcpy(orig.data(), &h.slot_original, sizeof(duint));
+                ok = bridge.write_memory(h.slot, orig).has_value();
+            } else {
+                ok = bridge.write_memory(h.entry, h.original).has_value();
+            }
+            if (ok) {
+                ++written;
+                restored.push_back({{"function", name},
+                                    {"entry", format_utils::format_address(h.entry)},
+                                    {"layout", h.kind}});
+            }
+        }
+    }
+
+    return nlohmann::json{
+        {"ok", true},
+        {"restored", restored},
+        {"count", written},
+        {"process_gone", !live},
+        {"message", live
+            ? "original bytes/pointer written back for " + std::to_string(written) + " hook(s)"
+            : "the target had already exited; registry cleared"}
+    };
+}
+
 nlohmann::json list() {
     std::lock_guard<std::mutex> lock(g_mutex);
     nlohmann::json out = nlohmann::json::array();

@@ -23,6 +23,30 @@
 
 namespace code_stub {
 
+// Permutation of a displaced relative branch/call.
+//
+// A relative branch encodes "next instruction + displacement", so copying its
+// bytes into a stub changes where it goes. The fix is to recompute the
+// displacement for the new location, which is exact for a rel32 jmp/call and
+// needs a little care for the shorter forms:
+//
+//   rel8  jcc/loop/jrcxz  -> widen to the rel32 form (0F 8x / E9) because the
+//                            original ±127 window does not survive the move
+//   rel32 jmp/call        -> same size, new displacement
+//
+// Widening changes the instruction's length, which the caller must add to the
+// stub layout - `reloc.size_delta` reports it.
+struct relocation {
+    size_t offset = 0;        // byte offset inside `displaced`
+    size_t old_size = 0;      // original instruction length
+    std::vector<uint8_t> replacement;  // bytes to use instead
+    int    size_delta = 0;    // replacement.size() - old_size
+    // Absolute destination in the ORIGINAL image. The branch still has to reach
+    // here, but measured from its new address in the stub.
+    duint  original_target = 0;
+    std::string what;         // mnemonic/encoding, for reporting
+};
+
 // x64 only: the emit sequences are written for the x64 call/return shape.
 bool supported();
 
@@ -48,18 +72,37 @@ std::vector<uint8_t> jump_patch(duint from, duint to);
 // Whole instructions at `site` covering at least `min_bytes`, plus the patch
 // that replaces them.
 //
-// Refuses (rather than producing a broken trampoline) when a displaced
-// instruction is RIP-relative, a relative branch, or a call: copying those
-// changes their meaning, and a silently wrong trampoline shows up as a crash
-// deep inside the target's own code path.
+// Refuses when a displaced instruction genuinely cannot be moved: a RIP-relative
+// memory operand addresses data by its distance from the instruction, and there
+// is no general way to re-express that without knowing what the operand means.
+//
+// Relative branches and calls ARE handled now: they are recomputed for their new
+// location (widening a rel8 form to rel32 when needed) and reported through
+// `relocations`. That matters in practice - the cpuid sites inside a real
+// detection routine are frequently followed by a `jnz` within the bytes the patch
+// has to displace, and refusing those skipped exactly the site that decided the
+// check.
 struct prepared {
     std::vector<uint8_t> patch;      // bytes to write at site
     std::vector<uint8_t> original;   // what was there
     std::vector<uint8_t> displaced;  // whole instructions copied for the stub
+    // Relocated branches inside `displaced`. The caller writing a stub must use
+    // `displaced_with_relocations()` instead of `displaced`, and must account for
+    // the size change when placing whatever follows.
+    std::vector<relocation> relocations;
     duint    site = 0;
     duint    stub = 0;               // where the stub body goes
+    // Where the stub must jump back to: the first byte after the region the patch
+    // overwrote. This is patch.size(), NOT displaced.size(), because a widening
+    // relocation and NOP fill both change how much of the original instruction
+    // stream the stub has already accounted for.
     size_t   patch_len = 0;          // == patch.size(), == original.size()
-    size_t   resume_at = 0;          // site + displaced.size()
+    duint    resume_at = 0;
+
+    // The displaced instruction stream with every branch re-encoded for `stub`.
+    // Compute after `stub` is known; prepare() already did it once using the
+    // address it allocated.
+    [[nodiscard]] std::vector<uint8_t> displaced_with_relocations() const;
 };
 
 std::expected<prepared, std::string> prepare(c_bridge_executor& bridge, duint site,

@@ -30,52 +30,58 @@ struct filter_bytes {
 
 // cpuid: clear ECX bit 31 (hypervisor-present) and blank the vendor leaf.
 //
-// This is the layout the target sees as the instant after the real cpuid ran:
-//
-//   cmp eax, 0x40000000
-//   jne  .not_vendor
-//   xor eax,eax / xor ebx,ebx / xor ecx,ecx / xor edx,edx   ; vendur leaf -> absent
-//   jmp  .done
-// .not_vendor:
-//   and ecx, 0x7FFFFFFF                                     ; clear bit 31
-// .done:
-//
 // The branch displacements are COMPUTED, not written by hand. Hand-counted rel8
 // offsets are how this first shipped broken: a two-byte miscount made `jne` land
 // in the middle of `and ecx, imm32`, and the target died with
 // STATUS_ILLEGAL_INSTRUCTION (0xC000001D) at the stub. A patch cannot express the
 // intent, so the offsets are derived from the actual instruction lengths.
+//
+// On the vendor leaf the filter zeroes eax/ebx/ecx/edx, which makes leaf
+// 0x40000000 answer like a CPU with no hypervisor vendor. That also destroys the
+// `r8d = edi`-style follow-up bookkeeping the compiler emits, but those registers
+// are the caller's to reload, not ours to invent.
 filter_bytes cpuid_filter() {
     filter_bytes f;
 
-    // cmp eax, 0x40000000
-    f.code.insert(f.code.end(), {0x3D, 0x00, 0x00, 0x00, 0x40});
-    const size_t jne_at = f.code.size();
-    f.code.insert(f.code.end(), {0x75, 0x00});          // jne rel8, patched below
+    // Detect "this was a hypervisor-vendor query" AFTER the cpuid has already run,
+    // which means eax no longer holds the requested leaf - cpuid overwrites it with
+    // the answer. For a vendor query that answer is the highest hypervisor leaf
+    // (0x4000000C on this host), so it lands in the 0x40000000..0x400000FF range
+    // while leaf 0 (max basic leaf) and leaf 1 (version, ~0x000BEAxx) do not.
+    //
+    // Comparing `eax == 0x40000000` is the natural-looking mistake and it never
+    // matches: that is the leaf the caller ASKED for, not what cpuid returned. It
+    // made every vendor-leaf stub silently ineffective while leaving the
+    // hypervisor-bit stub working, which is exactly the split observed.
+    //
+    //   cmp eax, 0x40000000     ; 3D 00 00 00 40
+    //   jb  .not_vendor         ; 72 xx   (unsigned: below the vendor space)
+    //   xor eax,eax / xor ebx,ebx / xor ecx,ecx / xor edx,edx
+    //   jmp .done
+    // .not_vendor:
+    //   and ecx, 0x7FFFFFFF     ; clear the hypervisor-present bit only
+    // .done:
+    f.code.insert(f.code.end(), {0x3D, 0x00, 0x00, 0x00, 0x40});   // cmp eax, 0x40000000
+    const size_t jb_at = f.code.size();
+    f.code.insert(f.code.end(), {0x72, 0x00});                     // jb rel8, patched below
 
-    // vendor leaf -> all four registers zeroed ("no hypervisor vendor")
     f.code.insert(f.code.end(), {0x31, 0xC0, 0x31, 0xDB, 0x31, 0xC9, 0x31, 0xD2});
     const size_t jmp_at = f.code.size();
-    f.code.insert(f.code.end(), {0xEB, 0x00});          // jmp rel8, patched below
+    f.code.insert(f.code.end(), {0xEB, 0x00});                     // jmp rel8, patched below
 
-    // not the vendor leaf: clear the hypervisor-present bit only, so the feature
-    // bits the target reads next stay intact
     const size_t and_at = f.code.size();
-    f.code.insert(f.code.end(), {0x81, 0xE1, 0xFF, 0xFF, 0xFF, 0x7F});   // and ecx, 0x7FFFFFFF
+    f.code.insert(f.code.end(), {0x81, 0xE1, 0xFF, 0xFF, 0xFF, 0x7F});  // and ecx, 0x7FFFFFFF
 
     const size_t done_at = f.code.size();
 
-    // jne -> .not_vendor (the `and`)
-    const auto jne_disp = static_cast<int8_t>(static_cast<int>(and_at) -
-                                              static_cast<int>(jne_at + 2));
-    f.code[jne_at + 1] = static_cast<uint8_t>(jne_disp);
-
-    // jmp -> .done (past the `and`)
-    const auto jmp_disp = static_cast<int8_t>(static_cast<int>(done_at) -
+    // A vendor leaf at or above 0x40000000 falls to the zeroing; anything below
+    // (leaf 0, leaf 1, ...) only has its hypervisor bit cleared.
+    f.code[jb_at + 1] = static_cast<uint8_t>(static_cast<int>(and_at) -
+                                             static_cast<int>(jb_at + 2));
+    f.code[jmp_at + 1] = static_cast<uint8_t>(static_cast<int>(done_at) -
                                               static_cast<int>(jmp_at + 2));
-    f.code[jmp_at + 1] = static_cast<uint8_t>(jmp_disp);
 
-    f.what = "ecx bit31 cleared (leaf 1), vendor leaf 0x40000000 zeroed";
+    f.what = "ecx bit31 cleared (leaf 1), hypervisor vendor leaves zeroed";
     return f;
 }
 
@@ -247,18 +253,24 @@ nlohmann::json arm(c_bridge_executor& bridge, const std::string& module,
 
         auto& p = *prepared;
 
-        // Split the displaced region at the probe instruction. `displaced` holds
-        // whole instructions starting at the site, and the probe is the first of
-        // them, so its length is the split point.
-        if (p.displaced.size() < probe_len) {
+        // Build the instruction stream the stub will actually run, with every
+        // displaced relative branch re-encoded for its new home. Using the raw
+        // `displaced` bytes would send those branches to an address measured from
+        // the stub instead of from the site.
+        std::vector<uint8_t> relocated = p.displaced_with_relocations();
+
+        // Split at the probe. The probe itself is never a branch (it is cpuid /
+        // rdtsc / the VMware `in`), so no relocation applies to it and the first
+        // `probe_len` bytes are the original encoding.
+        if (relocated.size() < probe_len || probe_len == 0) {
             skipped.push_back({{"probe", probe}, {"address", addr_str},
                                {"reason", "displaced region shorter than the probe"}});
             continue;
         }
-        const std::vector<uint8_t> probe_bytes(p.displaced.begin(),
-                                               p.displaced.begin() + probe_len);
-        const std::vector<uint8_t> following(p.displaced.begin() + probe_len,
-                                             p.displaced.end());
+        const std::vector<uint8_t> probe_bytes(relocated.begin(),
+                                              relocated.begin() + probe_len);
+        const std::vector<uint8_t> following(relocated.begin() + probe_len,
+                                             relocated.end());
 
         // Stub layout: [probe] [filter] [following instructions] [jmp resume]
         //
@@ -269,6 +281,8 @@ nlohmann::json arm(c_bridge_executor& bridge, const std::string& module,
         body.insert(body.end(), filter.code.begin(), filter.code.end());
         body.insert(body.end(), following.begin(), following.end());
 
+        // Where the stub jumps back to. This is patch-derived (see prepared::
+        // resume_at), not displaced-derived: a widened branch makes the two differ.
         const duint resume = p.resume_at;
         const auto back = code_stub::jump_patch(p.stub + body.size(), resume);
         body.insert(body.end(), back.begin(), back.end());
@@ -385,6 +399,61 @@ nlohmann::json disarm(c_bridge_executor& bridge) {
     }
 
     return nlohmann::json{{"ok", failed.empty()}, {"restored", restored}, {"failed", failed}};
+}
+
+// Session-teardown path.
+//
+// Restoring needs a live process AND a writable page; neither is guaranteed here.
+// What IS guaranteed to matter is that the registry is emptied: a stale entry
+// would be restored into whatever process occupies that address next session.
+// So the bytes are written back only when the session is still alive, and the
+// registry is cleared unconditionally.
+nlohmann::json teardown(c_bridge_executor& bridge) {
+    std::map<duint, armed_stub> taken;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        taken.swap(g_armed);
+    }
+
+    if (taken.empty()) {
+        return nlohmann::json{{"ok", true}, {"restored", nlohmann::json::array()},
+                              {"count", 0}, {"message", "no stubs were armed"}};
+    }
+
+    // A terminated target cannot be written to; that is the ordinary case (the
+    // debugger killed it) and is not a failure worth reporting as one.
+    const bool live = bridge.is_debugging();
+    const bool paused = live && !bridge.is_running();
+
+    nlohmann::json restored = nlohmann::json::array();
+    nlohmann::json failed = nlohmann::json::array();
+    size_t written = 0;
+
+    if (live) {
+        for (auto& [site, rec] : taken) {
+            if (bridge.write_memory(site, rec.original).has_value()) {
+                ++written;
+                restored.push_back({{"probe", rec.probe},
+                                    {"address", format_utils::format_address(site)}});
+            } else if (paused) {
+                failed.push_back({{"probe", rec.probe},
+                                  {"address", format_utils::format_address(site)},
+                                  {"reason", "write failed"}});
+            }
+        }
+    }
+
+    return nlohmann::json{
+        {"ok", failed.empty()},
+        {"restored", restored},
+        {"failed", failed},
+        {"count", written},
+        {"process_gone", !live},
+        {"message", live
+            ? "original bytes written back for " + std::to_string(written) + " stub(s)"
+            : "the target had already exited; registry cleared so the addresses are not "
+              "restored into a future process"}
+    };
 }
 
 nlohmann::json list() {

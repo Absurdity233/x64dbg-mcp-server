@@ -16,6 +16,8 @@
 #include "util/trace_auto.h"
 #include "util/event_log.h"
 #include "util/antidebug_hard.h"
+#include "util/anti_vm.h"
+#include "util/ntdll_hook.h"
 #include "resources/plugin_icon.h"
 #include "ui/settings_dialog.h"
 #include "ui/about_dialog.h"
@@ -192,6 +194,23 @@ static void cb_init_debug(CBTYPE, void* cb_info) {
 
 static void cb_stop_debug(CBTYPE, void*) {
     mcp::trace_mark_stopped();
+    // Put the target back the way we found it before the session ends.
+    //
+    // Why it matters: a patched target that outlives the debugger keeps the patch.
+    // If it were reopened elsewhere - or shipped - the code would carry a jump into
+    // a page that no longer exists, and the failure would surface as an access
+    // violation inside the target rather than as a note here.
+    //
+    // Note the unconditional call. This callback runs AFTER the debug session is
+    // torn down, so DbgIsDebugging() is already false; guarding on it (as the first
+    // version did) skipped the restore every single time while still logging
+    // session_stop, which made the feature look implemented and test clean.
+    // teardown() therefore has to work with a dead session: it restores what it can
+    // and always empties its registry.
+    (void)anti_vm::teardown(get_bridge());
+    (void)ntdll_hook::teardown();
+    // The PEB guard writes on pause; it must stop before the session disappears.
+    antidebug_hard::shutdown();
     event_log::push("session_stop");
 }
 

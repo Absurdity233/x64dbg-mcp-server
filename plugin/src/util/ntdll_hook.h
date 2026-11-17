@@ -67,6 +67,12 @@ nlohmann::json install(const std::vector<target_spec>& targets, bool dry_run);
 // Write the original bytes (or the original slot pointer) back.
 nlohmann::json restore();
 
+// Session-teardown variant: restore what can be restored, and ALWAYS clear the
+// registry. restore() requires a paused target; at session end the process may
+// already be gone, and a stale registry entry would be written into an unrelated
+// process next session.
+nlohmann::json teardown();
+
 // What is currently hooked, without touching the target.
 nlohmann::json list();
 

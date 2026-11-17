@@ -101,20 +101,109 @@ duint alloc_near_target(DWORD pid, duint hint, size_t size) {
 
 // Instructions whose bytes cannot be relocated as-is. Kept as a function so the
 // list reads as documentation rather than a magic condition.
+//
+// Relative branches and calls are NOT in this list any more: they are re-encoded
+// for their new address (see relocate_branch). Only RIP-relative memory operands
+// remain unhandled, because "the data is N bytes from here" has no meaning once
+// the instruction moves and there is no generic rewrite for it.
 bool is_unrelocatable(const DISASM_INSTR& di) {
-    // Any relative branch or call carries a displacement that is only valid at
-    // the original address.
-    if (di.type == instr_branch) return true;
-
-    const std::string mn = di.instruction;   // full text, e.g. "jmp 0x..."
-    if (mn.rfind("call", 0) == 0 || mn.rfind("loop", 0) == 0) return true;
-
-    // RIP-relative memory operands are encoded as a displacement from the next
-    // instruction; moving the instruction moves the target.
-    if (mn.find("[rip") != std::string::npos || mn.find("[eip") != std::string::npos) return true;
-
+    const std::string mn = di.instruction;   // full text, e.g. "mov rax,[rip+8]"
+    if (mn.find("[rip") != std::string::npos || mn.find("[eip") != std::string::npos) {
+        return true;
+    }
+    (void)di.type;
     return false;
 }
+
+// Re-encode a relative branch or call so it still reaches the same target from
+// `new_at` instead of `old_at`.
+//
+// Two shapes:
+//
+//   E9/E8 rel32        -> same length, displacement recomputed
+//   0F 8x rel32        -> same length, displacement recomputed
+//   7x rel8  (jcc)     -> widened to 0F 8x rel32. The ±127 window almost never
+//                         survives a move into a different page, and a truncated
+//                         rel8 would branch into arbitrary code.
+//   EB rel8  (jmp)     -> widened to E9 rel32, same reason
+//   E3 rel8  (jrcxz)   -> NOT widened: jrcxz has no rel32 form, so it stays
+//                         unhandled and the site is refused.
+//
+// `target` is the absolute destination in the ORIGINAL image, which the caller
+// computes from the original bytes and the original address.
+// Re-encode a relative branch or call so it reaches the same absolute target from
+// a new location. Returns the replacement bytes and the resulting size change.
+//
+// Two shapes:
+//
+//   E9/E8 rel32, 0F 8x rel32  -> same length, displacement recomputed
+//   7x rel8 (jcc), EB rel8    -> widened to the rel32 form. The ±127-byte window
+//                                almost never survives a move into another page,
+//                                and a truncated rel8 would branch into arbitrary
+//                                code - so widening is the only safe option. That
+//                                is why `size_delta` exists.
+//   E3 rel8 (jrcxz/jecxz)     -> refused: no rel32 equivalent exists.
+//
+// The caller patches the displacement once the destination address is known,
+// because it depends on where the stub was allocated.
+std::expected<relocation, std::string> relocate_branch(const std::vector<uint8_t>& orig) {
+    relocation r;
+    r.old_size = orig.size();
+
+    if (orig.size() == 2 && (orig[0] & 0xF0) == 0x70) {
+        r.replacement = {0x0F, static_cast<uint8_t>(0x80 | (orig[0] & 0x0F)), 0, 0, 0, 0};
+        r.what = "jcc rel8 -> rel32";
+    } else if (orig.size() == 2 && orig[0] == 0xEB) {
+        r.replacement = {0xE9, 0, 0, 0, 0};
+        r.what = "jmp rel8 -> rel32";
+    } else if (orig.size() == 5 && (orig[0] == 0xE9 || orig[0] == 0xE8)) {
+        r.replacement = {orig[0], 0, 0, 0, 0};
+        r.what = (orig[0] == 0xE8) ? "call rel32" : "jmp rel32";
+    } else if (orig.size() == 6 && orig[0] == 0x0F && (orig[1] & 0xF0) == 0x80) {
+        r.replacement = {orig[0], orig[1], 0, 0, 0, 0};
+        r.what = "jcc rel32";
+    } else {
+        return std::unexpected("branch form has no rel32 equivalent "
+                               "(jrcxz/jecxz or an unrecognised encoding)");
+    }
+
+    r.size_delta = static_cast<int>(r.replacement.size()) - static_cast<int>(orig.size());
+    return r;
+}
+
+// Original absolute destination of a relative branch at `at`.
+duint branch_target(const std::vector<uint8_t>& orig, duint at) {
+    if (orig.size() == 5 && (orig[0] == 0xE9 || orig[0] == 0xE8)) {
+        const auto rel = static_cast<int32_t>(
+            static_cast<uint32_t>(orig[1]) | (static_cast<uint32_t>(orig[2]) << 8) |
+            (static_cast<uint32_t>(orig[3]) << 16) | (static_cast<uint32_t>(orig[4]) << 24));
+        return at + 5 + static_cast<duint>(static_cast<int64_t>(rel));
+    }
+    if (orig.size() == 6 && orig[0] == 0x0F && (orig[1] & 0xF0) == 0x80) {
+        const auto rel = static_cast<int32_t>(
+            static_cast<uint32_t>(orig[2]) | (static_cast<uint32_t>(orig[3]) << 8) |
+            (static_cast<uint32_t>(orig[4]) << 16) | (static_cast<uint32_t>(orig[5]) << 24));
+        return at + 6 + static_cast<duint>(static_cast<int64_t>(rel));
+    }
+    if (orig.size() == 2 && ((orig[0] & 0xF0) == 0x70 || orig[0] == 0xEB)) {
+        return at + 2 + static_cast<duint>(static_cast<int64_t>(static_cast<int8_t>(orig[1])));
+    }
+    return 0;
+}
+
+// True when the instruction is a relative branch, call or jcc/loop worth
+// relocating rather than refusing.
+bool is_relative_branch(const DISASM_INSTR& di, const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) return false;
+    if (bytes.size() == 2 && (bytes[0] & 0xF0) == 0x70) return true;
+    if (bytes.size() == 2 && bytes[0] == 0xEB) return true;
+    if (bytes.size() == 5 && (bytes[0] == 0xE9 || bytes[0] == 0xE8)) return true;
+    if (bytes.size() == 6 && bytes[0] == 0x0F && (bytes[1] & 0xF0) == 0x80) return true;
+    (void)di;
+    return false;
+}
+
+duint branch_target_duint(const std::vector<uint8_t>& orig, duint at);
 
 } // namespace
 
@@ -222,6 +311,8 @@ std::expected<prepared, std::string> prepare(c_bridge_executor& bridge, duint si
     // Walk whole instructions until the displaced region can hold the jump.
     duint cur = site;
     std::vector<uint8_t> displaced;
+    std::vector<relocation> relocs;
+
     while (displaced.size() < min_bytes) {
         DISASM_INSTR di{};
         DbgDisasmAt(cur, &di);
@@ -231,21 +322,40 @@ std::expected<prepared, std::string> prepare(c_bridge_executor& bridge, duint si
                                    " - the site is not valid code, so a stub cannot be "
                                    "placed without guessing instruction boundaries");
         }
-        if (is_unrelocatable(di)) {
-            return std::unexpected(
-                "the instruction at " + format_utils::format_address(cur) + " (\"" +
-                std::string(di.instruction) + "\") cannot be relocated: it is a relative "
-                "branch, a call, or RIP-relative, so copying it into a stub would change "
-                "what it addresses. Move the stub site, or use a logging breakpoint "
-                "instead of a stub.");
-        }
 
         auto bytes = bridge.read_memory(cur, static_cast<size_t>(di.instr_size));
         if (!bytes.has_value()) {
             return std::unexpected("cannot read the instruction at " +
                                    format_utils::format_address(cur));
         }
-        displaced.insert(displaced.end(), bytes->begin(), bytes->end());
+
+        if (is_unrelocatable(di)) {
+            return std::unexpected(
+                "the instruction at " + format_utils::format_address(cur) + " (\"" +
+                std::string(di.instruction) + "\") uses RIP-relative addressing: its operand "
+                "is addressed by distance from the instruction, so it cannot be moved into a "
+                "stub. Move the stub site, or use probe_breakpoints (a logging breakpoint) "
+                "for this site.");
+        }
+
+        // A relative branch or call has to be re-encoded for its new address.
+        // Keeping the original bytes would make it branch relative to the stub.
+        if (is_relative_branch(di, *bytes)) {
+            auto reloc = relocate_branch(*bytes);
+            if (!reloc.has_value()) {
+                return std::unexpected(
+                    "the branch at " + format_utils::format_address(cur) + " (\"" +
+                    std::string(di.instruction) + "\") cannot be re-encoded: " +
+                    reloc.error());
+            }
+            reloc->offset = displaced.size();
+            reloc->original_target = branch_target(*bytes, cur);
+            relocs.push_back(*reloc);
+            displaced.insert(displaced.end(), reloc->replacement.begin(),
+                             reloc->replacement.end());
+        } else {
+            displaced.insert(displaced.end(), bytes->begin(), bytes->end());
+        }
 
         cur += static_cast<duint>(di.instr_size);
         if (displaced.size() > 48) {
@@ -308,9 +418,45 @@ std::expected<prepared, std::string> prepare(c_bridge_executor& bridge, duint si
     p.patch = patch;
     p.original = *original;
     p.displaced = displaced;
+    p.relocations = relocs;
     p.patch_len = patch.size();
+    // The stub resumes after everything the patch overwrote. patch.size() is now
+    // the authority: a widened relocation can make `displaced` longer than the
+    // original instruction stream, and the NOP fill can make the patch longer than
+    // `displaced`. Using displaced.size() here would resume mid-instruction in
+    // either case.
     p.resume_at = site + patch.size();
     return p;
+}
+
+std::vector<uint8_t> prepared::displaced_with_relocations() const {
+    // prepare() emitted the widened replacements with zero displacements, so all
+    // that is missing is the real displacement for each one - recomputed from the
+    // stub address, which only the caller knows.
+    std::vector<uint8_t> out = displaced;
+
+    for (const auto& r : relocations) {
+        if (r.replacement.size() < 5) continue;   // placeholders are all >= 5 bytes
+        if (r.offset + r.replacement.size() > out.size()) continue;
+
+        // The new displacement is measured from the END of the replacement, in its
+        // new home inside the stub.
+        const duint new_next = stub + static_cast<duint>(r.offset) + r.replacement.size();
+        const long long disp = static_cast<long long>(r.original_target) -
+                               static_cast<long long>(new_next);
+        const auto d = static_cast<int32_t>(disp);
+
+        // The displacement always occupies the trailing 4 bytes: E9/E8 and 0F 8x
+        // already end in rel32, and the widened forms end in rel32 too.
+        const size_t disp_at = r.offset + r.replacement.size() - 4;
+        if (disp_at + 4 <= out.size()) {
+            for (int i = 0; i < 4; ++i) {
+                out[disp_at + static_cast<size_t>(i)] =
+                    static_cast<uint8_t>((static_cast<uint32_t>(d) >> (8 * i)) & 0xFF);
+            }
+        }
+    }
+    return out;
 }
 
 } // namespace code_stub
