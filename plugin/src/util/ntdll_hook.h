@@ -13,9 +13,9 @@
 //   1. Direct syscall stub (ntdll's own .text)
 //        mov r10, rcx / mov eax, ssn / test..jne..ret / syscall / ret
 //      Here the entry is real code, so it is displaced into a trampoline that
-//      re-enters the real syscall for any info class we do not intercept.
+//      re-enters the real syscall for any class we do not intercept.
 //
-//   2. Hotpatch jump thunk (what Windows 11 ships for NtQueryInformationProcess)
+//   2. Hotpatch jump thunk (what Windows 11 ships for the Nt* exports)
 //        nop / jmp qword ptr [rip+0] / <absolute address of the real body>
 //      The entry is not code, it is a pointer slot. Displacing it is impossible
 //      (the jump is RIP-relative) and unnecessary: rewriting the pointer is the
@@ -37,13 +37,19 @@ namespace ntdll_hook {
 // The behaviours a stub can implement. Named after the check they defeat, not
 // after the API, because the API is an implementation detail of the check.
 enum class action {
-    // Write a zeroed pointer-sized value through the info buffer, return
-    // STATUS_SUCCESS. ProcessDebugPort / ProcessDebugObjectHandle.
+    // Write a zeroed dword through the info buffer, return STATUS_SUCCESS.
+    // ProcessDebugPort / ProcessDebugObjectHandle.
     fake_zero_success,
 
-    // Return STATUS_SUCCESS without touching the buffer. ProcessDebugFlags
-    // reads its value as the INVERSE of the debug state, so a zero already
-    // means "not being debugged" - writing anything would be wrong.
+    // Write 1 through the info buffer, return STATUS_SUCCESS.
+    // ProcessDebugFlags reads its value as the INVERSE of the debug state, so a
+    // non-zero means "not being debugged". Writing it explicitly is what makes the
+    // answer independent of what the caller left in the buffer.
+    fake_nonzero_success,
+
+    // Return STATUS_SUCCESS without touching the buffer. For callers that already
+    // zero their buffer and treat any non-zero as "debugged", this is the same
+    // answer as fake_nonzero_success with no risk of overflowing a short buffer.
     return_success,
 
     // Refuse the query with STATUS_INVALID_PARAMETER. Used where a wrong answer
@@ -51,11 +57,33 @@ enum class action {
     return_invalid_parameter,
 };
 
+// Where an argument lives.
+//
+// The Nt* functions are not uniform, and getting this wrong is silent: the stub
+// compares the wrong register, never matches, and falls through to the default -
+// which looks identical to "the hook did not install". Measured:
+//
+//   NtQueryInformationProcess(handle, class, buf, len, ret)  class=rdx  buf=r8
+//   NtQuerySystemInformation(class, buf, len, ret)           class=rcx  buf=rdx
+//   NtQueryObject(handle, class, buf, len, ret)              class=rdx  buf=r8
+struct arg_regs {
+    std::string class_reg;   // "rdx" or "rcx"
+    std::string buffer_reg;  // "r8" or "rdx"
+};
+
+// A register the stub can write a 32-bit value into.
+enum class reg { eax, ebx, ecx, edx, eax_at_buf, edx_at_buf };
+
 struct target_spec {
     std::string function;     // "NtQueryInformationProcess"
-    unsigned long info_class; // the class value to intercept, as seen in EDX
+    unsigned long info_class; // the class value to intercept
     action       what;
+    arg_regs     args;        // where class/buffer live for this function
 };
+
+// The register convention for a known function, so callers do not have to
+// remember the table above. Returns false for an unknown name.
+bool arg_regs_for(const std::string& function, arg_regs* out);
 
 // Install stubs for `targets`.
 //
@@ -63,6 +91,10 @@ struct target_spec {
 // like the target's own bugs. If any requested function cannot be prepared, the
 // whole set is rolled back.
 nlohmann::json install(const std::vector<target_spec>& targets, bool dry_run);
+
+// Convenience: build the default spec set for the named functions, each with the
+// classes that matter for anti-debugging. Unknown names are reported, not ignored.
+nlohmann::json install_defaults(const std::vector<std::string>& functions, bool dry_run);
 
 // Write the original bytes (or the original slot pointer) back.
 nlohmann::json restore();

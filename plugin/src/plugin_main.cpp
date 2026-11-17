@@ -18,6 +18,7 @@
 #include "util/antidebug_hard.h"
 #include "util/anti_vm.h"
 #include "util/ntdll_hook.h"
+#include "util/time_hook.h"
 #include "resources/plugin_icon.h"
 #include "ui/settings_dialog.h"
 #include "ui/about_dialog.h"
@@ -209,6 +210,7 @@ static void cb_stop_debug(CBTYPE, void*) {
     // and always empties its registry.
     (void)anti_vm::teardown(get_bridge());
     (void)ntdll_hook::teardown();
+    (void)time_hook::teardown();
     // The PEB guard writes on pause; it must stop before the session disappears.
     antidebug_hard::shutdown();
     event_log::push("session_stop");

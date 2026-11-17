@@ -101,6 +101,33 @@ nlohmann::json scan(c_bridge_executor& bridge, const std::string& module_name,
     nlohmann::json results = nlohmann::json::array();
     size_t total = 0;
 
+    // Two passes, because the first pass is O(bytes) and the second is O(hits).
+    //
+    // The obvious implementation disassembles at every byte that matches an
+    // opcode prefix. On a few-hundred-MB protected section that is hundreds of
+    // thousands of DbgDisasmAt calls, each one crossing into the debugger - the
+    // scan becomes unusable exactly on the binaries this feature exists for.
+    //
+    // So: collect every raw prefix match first (pure buffer work, no bridge
+    // calls), sort by address, then disassemble ONCE per address and let that one
+    // disassembly serve every probe that matched there. Overlapping prefixes at
+    // the same address are common - `0F 01` is the prefix of sidt, sgdt and smsw -
+    // so this collapses a large fraction of the calls outright.
+
+    struct candidate {
+        duint   at = 0;
+        uint32_t offset = 0;      // section-relative, for reporting
+        int     section = -1;
+        std::vector<size_t> probes;   // indexes into catalog()
+    };
+
+    std::vector<candidate> candidates;
+
+    // Keep the per-section buffer metadata so the second pass can name the
+    // section without re-reading the header table.
+    struct section_info { std::string name; uint32_t va = 0; };
+    std::vector<section_info> exec_sections;
+
     for (uint16_t i = 0; i < num_sections; ++i) {
         const size_t off = static_cast<size_t>(i) * 40;
         uint32_t va = 0, vsize = 0, raw_size = 0, chars = 0;
@@ -120,41 +147,73 @@ nlohmann::json scan(c_bridge_executor& bridge, const std::string& module_name,
         if (!code.has_value()) continue;
         const auto& buf = *code;
 
-        for (const auto& p : catalog()) {
-            size_t hits = 0;
+        const int section_index = static_cast<int>(exec_sections.size());
+        exec_sections.push_back({name, va});
+
+        // Pass 1: raw prefix matches only.
+        const auto& specs = catalog();
+        for (size_t pi = 0; pi < specs.size(); ++pi) {
+            const auto& p = specs[pi];
             if (buf.size() < p.bytes.size()) continue;
 
             for (size_t k = 0; k + p.bytes.size() <= buf.size(); ++k) {
                 if (std::memcmp(buf.data() + k, p.bytes.data(), p.bytes.size()) != 0) continue;
-
-                // A raw byte match is not an instruction. Ask the disassembler
-                // what actually starts here and require the mnemonic to agree.
-                const duint at = base + va + k;
-                DISASM_INSTR di{};
-                DbgDisasmAt(at, &di);
-                if (di.instr_size <= 0 || _stricmp(di.instruction, p.mnemonic) != 0) {
-                    continue;
-                }
-
-                if (hits < max_hits_per_pattern) {
-                    results.push_back({
-                        {"probe",       std::string(p.name)},
-                        {"instruction", std::string(di.instruction)},
-                        {"detects",     std::string(p.detects)},
-                        {"section",     name},
-                        {"address",     format_utils::format_address(at)},
-                        {"offset",      format_utils::format_hex(va + k)},
-                        {"disasm",      std::string(di.instruction)},
-                        {"size",        di.instr_size},
-                        {"stubbable",   p.stubbable}
-                    });
-                }
-                ++hits;
-                ++total;
+                candidates.push_back({base + va + static_cast<duint>(k),
+                                      va + static_cast<uint32_t>(k),
+                                      section_index, {pi}});
                 k += p.bytes.size() - 1;
             }
         }
     }
+
+    // Collapse same-address matches so one disassembly serves them all.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const candidate& a, const candidate& b) { return a.at < b.at; });
+
+    std::vector<candidate> merged;
+    merged.reserve(candidates.size());
+    for (auto& c : candidates) {
+        if (!merged.empty() && merged.back().at == c.at) {
+            for (size_t pi : c.probes) merged.back().probes.push_back(pi);
+        } else {
+            merged.push_back(c);
+        }
+    }
+
+    // Pass 2: one disassembly per distinct address.
+    const auto& specs = catalog();
+    std::vector<size_t> hits_per_probe(specs.size(), 0);
+
+    for (const auto& c : merged) {
+        DISASM_INSTR di{};
+        DbgDisasmAt(c.at, &di);
+        if (di.instr_size <= 0) continue;
+
+        for (size_t pi : c.probes) {
+            const auto& p = specs[pi];
+            // A raw byte match is not an instruction: the same bytes occur inside
+            // displacements, immediates and data. Require the mnemonic to agree.
+            if (_stricmp(di.instruction, p.mnemonic) != 0) continue;
+
+            if (hits_per_probe[pi] < max_hits_per_pattern) {
+                const auto& sec = exec_sections[static_cast<size_t>(c.section)];
+                results.push_back({
+                    {"probe",       std::string(p.name)},
+                    {"instruction", std::string(di.instruction)},
+                    {"detects",     std::string(p.detects)},
+                    {"section",     sec.name},
+                    {"address",     format_utils::format_address(c.at)},
+                    {"offset",      format_utils::format_hex(c.offset)},
+                    {"disasm",      std::string(di.instruction)},
+                    {"size",        di.instr_size},
+                    {"stubbable",   p.stubbable}
+                });
+            }
+            ++hits_per_probe[pi];
+            ++total;
+        }
+    }
+
 
     return nlohmann::json{
         {"module",        module_name},
@@ -163,6 +222,7 @@ nlohmann::json scan(c_bridge_executor& bridge, const std::string& module_name,
         {"count",         results.size()},
         {"total_matches", total},
         {"truncated",     results.size() < total},
+        {"disasm_calls",  merged.size()},
         {"note", "Locations only - nothing was patched or faked. Set a breakpoint on an "
                  "address above and inspect the registers when it fires to see what the "
                  "check decides; use anti_vm to make the check return something else."}

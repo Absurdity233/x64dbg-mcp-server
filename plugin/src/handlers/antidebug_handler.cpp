@@ -7,6 +7,7 @@
 #include "util/kernel_driver.h"
 #include "util/ntdll_hook.h"
 #include "util/probe_scan.h"
+#include "util/time_hook.h"
 
 #include <algorithm>
 #include <cstring>
@@ -41,45 +42,22 @@ std::string resolve_module(c_bridge_executor& bridge, const std::string& request
     return main_name;
 }
 
-// The ntdll stub set, parsed from the request. Unknown names are rejected rather
-// than ignored: a caller that asks for a hook and silently does not get it will
-// draw the wrong conclusion from the result.
-bool parse_hook_list(const nlohmann::json& body, std::vector<ntdll_hook::target_spec>* out,
-                     std::string* error) {
-    struct known {
-        const char* name;
-        unsigned long info_class;
-        ntdll_hook::action what;
-    };
-    // ProcessDebugPort / ProcessDebugObjectHandle / ProcessDebugFlags. The class
-    // numbers are the ones NtQueryInformationProcess dispatch compares against.
-    // ProcessDebugFlags is the inverted one: it reports "not being debugged" as a
-    // non-zero value, so the correct stub returns success and leaves the caller's
-    // zeroed buffer alone.
-    static const known catalog[] = {
-        {"NtQueryInformationProcess",          7, ntdll_hook::action::fake_zero_success},
-        {"NtQueryInformationProcess",       0x1E, ntdll_hook::action::fake_zero_success},
-        {"NtQueryInformationProcess",       0x1F, ntdll_hook::action::return_success},
-    };
-
-    std::vector<std::string> requested;
+// The ntdll stub set, parsed from the request.
+//
+// Delegates the class table and the per-function register conventions to
+// ntdll_hook::install_defaults(), so this route and the default set used by
+// harden(level=paranoid) cannot drift apart. A second copy of "which class number
+// means what, and which register holds it" is exactly the kind of duplication that
+// produces a hook which installs cleanly and never matches.
+bool parse_hook_list(const nlohmann::json& body, std::vector<std::string>* functions) {
     if (body.contains("functions") && body["functions"].is_array()) {
-        for (const auto& f : body["functions"]) requested.push_back(f.get<std::string>());
+        for (const auto& f : body["functions"]) functions->push_back(f.get<std::string>());
+        return true;
     }
-
-    for (const auto& k : catalog) {
-        if (!requested.empty() &&
-            std::find(requested.begin(), requested.end(), k.name) == requested.end()) {
-            continue;
-        }
-        out->push_back({k.name, k.info_class, k.what});
-    }
-
-    if (out->empty()) {
-        *error = "none of the requested functions is supported; supported: "
-                 "NtQueryInformationProcess";
-        return false;
-    }
+    // No list: the default set, which is the useful answer for "just hook the
+    // obvious oracles".
+    *functions = {"NtQueryInformationProcess", "NtQueryObject",
+                  "NtQuerySystemInformation", "NtSetInformationThread"};
     return true;
 }
 
@@ -558,15 +536,71 @@ void register_antidebug_routes(c_http_router& router) {
             return s_http_response::ok(result);
         }
 
-        std::vector<ntdll_hook::target_spec> specs;
-        std::string error;
-        if (!parse_hook_list(body, &specs, &error)) {
-            return s_http_response::bad_request(error);
-        }
+        std::vector<std::string> functions;
+        parse_hook_list(body, &functions);
 
-        nlohmann::json out = ntdll_hook::install(specs, body.value("dry_run", false));
+        nlohmann::json out = ntdll_hook::install_defaults(functions,
+                                                          body.value("dry_run", false));
         out["active"] = ntdll_hook::list();
         return s_http_response::ok(out);
+    });
+
+    // POST /api/antidebug/timers - Neutralise the API-level timing side channels
+    //
+    // Body: { "timers": ["qpc","tick64","tick32"], "synthetic_step": bool,
+    //         "restore": bool }
+    //
+    // RDTSC is handled by anti_vm as an instruction stub. The API timers are a
+    // different shape: QueryPerformanceCounter writes through a pointer, so the stub
+    // writes memory rather than registers, and freezing the counter makes every
+    // measured delta zero - the same answer a bare-metal machine gives.
+    router.post("/api/antidebug/timers", [](const s_http_request& req) -> s_http_response {
+        auto& bridge = get_bridge();
+        if (!bridge.require_debugging()) {
+            return s_http_response::conflict("No active debug session");
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) body = nlohmann::json::object();
+
+        if (body.value("restore", false)) {
+            auto result = time_hook::disarm();
+            result["remaining"] = time_hook::list();
+            return s_http_response::ok(result);
+        }
+
+        // Default: the ones a check actually reaches for. QPC first because it is
+        // the calibrated clock, then the tick counters.
+        std::vector<std::string> names;
+        if (body.contains("timers") && body["timers"].is_array()) {
+            for (const auto& t : body["timers"]) names.push_back(t.get<std::string>());
+        } else {
+            names = {"qpc", "tick64", "tick32"};
+        }
+
+        std::vector<time_hook::timer> timers;
+        nlohmann::json unknown = nlohmann::json::array();
+        for (const auto& n : names) {
+            if (n == "qpc")         timers.push_back(time_hook::timer::qpc);
+            else if (n == "tick64") timers.push_back(time_hook::timer::tick64);
+            else if (n == "tick32") timers.push_back(time_hook::timer::tick32);
+            else if (n == "qpc_freq") timers.push_back(time_hook::timer::qpc_freq);
+            else unknown.push_back({{"timer", n},
+                                    {"reason", "unknown; supported: qpc, tick64, tick32, qpc_freq"}});
+        }
+
+        time_hook::options opt{};
+        opt.synthetic_step = body.value("synthetic_step", false);
+
+        auto out = time_hook::arm(timers, opt);
+        if (!unknown.empty()) out["unsupported"] = unknown;
+        out["active"] = time_hook::list();
+        return s_http_response::ok(out);
+    });
+
+    // GET /api/antidebug/timers/list - Which timers are currently stubbed
+    router.get("/api/antidebug/timers/list", [](const s_http_request&) -> s_http_response {
+        return s_http_response::ok(time_hook::list());
     });
 
     // GET /api/antidebug/artifacts - What a VM check sees on this host

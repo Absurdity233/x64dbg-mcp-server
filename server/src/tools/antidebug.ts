@@ -398,6 +398,9 @@ const NTDLL_HOOKS = [
 
 const ANTI_VM_ARMS = ['cpuid', 'rdtsc', 'sidt', 'sgdt', 'sldt', 'str', 'smsw', 'vmx', 'in'] as const;
 
+/** API-level timing clocks. RDTSC is handled by anti_vm, not here. */
+const TIMER_ARMS = ['qpc', 'tick64', 'tick32', 'qpc_freq'] as const;
+
 const HARDEN_LEVELS = ['basic', 'deep', 'paranoid'] as const;
 
 interface KernelVersion {
@@ -467,12 +470,12 @@ async function antiVmArtifacts() {
 export function registerAntiDebugTools(server: McpServer) {
   server.tool(
     'x64dbg_antidebug',
-    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (clears heap flags and the DR registers; level=basic|deep|paranoid, threads:boolean and hooks[] extend it into NTDLL hooking; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), spoof_cpuid (paused target: arm silent breakpoints on CPUID sites that check the hypervisor bit/vendor and rewrite the registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back), hook_ntdll (inline-hook NtQueryInformationProcess/NtSetInformationThread/NtQueryObject/NtQuerySystemInformation inside the debuggee and report stub_form_ok per function; dry_run:true probes without patching, restore:true writes the original bytes back), anti_vm (arm silent spoofing breakpoints on the given probe arms - cpuid, rdtsc, sidt, sgdt, sldt, str, smsw, vmx, in - and report armed/skipped/restored), kernel_status (GET: is the .sys anti-debug driver loaded, its path and detected ABI/build/EP-DebugPort offset - driver_present:false is the normal first-run state, load the .sys to continue), kernel_attach (POST: read DebugPort/Flags from the kernel for pid, empty pid = current process), kernel_apply (POST: write a mask of DEBUGPORT|FLAGS|CROSSSESSION, default 0x7, with optional per-build offsets), kernel_detach (POST: stop kernel-side modifications, restoring the original pointers), artifacts (GET: host-side VM fingerprints the target can read - registry keys, services, device paths, MAC OUI, disk model, ACPI/BIOS strings, window classes and process names - grouped by category as "what the target will see").',
+    'Anti-debugging analysis. Actions: peb, teb, dep, hide_debugger (clears BeingDebugged/NtGlobalFlag and verifies by read-back), harden (clears heap flags and the DR registers; level=basic|deep|paranoid, threads:boolean and hooks[] extend it into NTDLL hooking; reports what needs a kernel component), vm_probes (locates cpuid/rdtsc/sidt/str and other anti-VM instructions in a module - discovery only, nothing is patched), probe_breakpoints (arms a silent logging breakpoint on every probe found so each hit lands in the event log with its registers), spoof_cpuid (paused target: arm silent breakpoints on CPUID sites that check the hypervisor bit/vendor and rewrite the registers), block_terminate (paused target: stub TerminateProcess/ExitProcess/NtTerminateProcess/TerminateThread/NtTerminateThread/RtlExitUserProcess/RtlExitUserThread so the target cannot kill the agent or itself; restore:true writes the original bytes back), hook_ntdll (inline-hook NtQueryInformationProcess/NtSetInformationThread/NtQueryObject/NtQuerySystemInformation inside the debuggee and report stub_form_ok per function; dry_run:true probes without patching, restore:true writes the original bytes back), anti_vm (arm silent spoofing breakpoints on the given probe arms - cpuid, rdtsc, sidt, sgdt, sldt, str, smsw, vmx, in - and report armed/skipped/restored), kernel_status (GET: is the .sys anti-debug driver loaded, its path and detected ABI/build/EP-DebugPort offset - driver_present:false is the normal first-run state, load the .sys to continue), kernel_attach (POST: read DebugPort/Flags from the kernel for pid, empty pid = current process), kernel_apply (POST: write a mask of DEBUGPORT|FLAGS|CROSSSESSION, default 0x7, with optional per-build offsets), kernel_detach (POST: stop kernel-side modifications, restoring the original pointers), timers (paused target: freeze QueryPerformanceCounter/GetTickCount64/GetTickCount so any measured delta is zero - every module exporting a timer with its own body is stubbed separately, because kernel32.GetTickCount64 does not go through kernelbase; restore:true writes the original bytes back), artifacts (GET: host-side VM fingerprints the target can read - registry keys, services, device paths, MAC OUI, disk model, ACPI/BIOS strings, window classes and process names - grouped by category as "what the target will see").',
     {
       action: z.enum([
         'peb', 'teb', 'dep', 'hide_debugger', 'harden', 'vm_probes',
         'probe_breakpoints', 'spoof_cpuid', 'block_terminate',
-        'hook_ntdll', 'anti_vm', 'kernel_status', 'kernel_attach',
+        'hook_ntdll', 'anti_vm', 'timers', 'kernel_status', 'kernel_attach',
         'kernel_apply', 'kernel_detach', 'artifacts',
       ]).describe('Operation to perform'),
       pid: z.string().optional().describe('peb/kernel_attach: process id (default current)'),
@@ -505,6 +508,16 @@ export function registerAntiDebugTools(server: McpServer) {
       // hook_ntdll
       functions: z.array(z.enum(NTDLL_HOOKS)).optional().describe(
         'hook_ntdll: functions to hook (default all four).'
+      ),
+
+      // timers
+      timers: z.array(z.enum(TIMER_ARMS)).optional().describe(
+        'timers: which API-level clocks to freeze (default qpc, tick64, tick32). ' +
+        'qpc_freq is accepted but always refused - it defines the unit of every QPC delta.'
+      ),
+      synthetic_step: z.boolean().optional().describe(
+        'timers: advance by 1 tick per call instead of freezing, for targets that ' +
+        'require the clock to keep moving (deltas become constant rather than zero).'
       ),
       dry_run: z.boolean().optional().describe(
         'hook_ntdll: verify the stub prologue matches without writing anything (default false).'
@@ -599,6 +612,15 @@ export function registerAntiDebugTools(server: McpServer) {
           };
           if (args.arms?.length) body.arms = args.arms;
           const data = await httpClient.post('/api/antidebug/anti_vm', body);
+          return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+        }
+        case 'timers': {
+          const body: Record<string, unknown> = {
+            restore: args.restore ?? false,
+            synthetic_step: args.synthetic_step ?? false,
+          };
+          if (args.timers?.length) body.timers = args.timers;
+          const data = await httpClient.post('/api/antidebug/timers', body);
           return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
         }
         case 'kernel_status': {

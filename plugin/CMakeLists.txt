@@ -60,6 +60,7 @@ set(SOURCES
     src/util/kernel_driver.cpp
     src/util/ntdll_hook.cpp
     src/util/probe_scan.cpp
+    src/util/time_hook.cpp
     src/handlers/debug_handler.cpp
     src/handlers/register_handler.cpp
     src/handlers/memory_handler.cpp

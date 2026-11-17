@@ -199,6 +199,97 @@ trace 行会**折叠连续重复**：x64dbg 会重复记录同一指令,不折�
 一次都没执行过。现在无条件调用,teardown 自身能处理"进程已消失"的情况:
 能写就写回,写不了就只清登记表(否则这些地址会被下一次会话还原进无关进程)。
 
+---
+
+## 7. 计时侧信道：API 层（2.6.0 新增）
+
+RDTSC 只是最有名的那一个。真正被现代保护大量使用的是 API 层计时器,原因很实际：
+RDTSC 的频率取决于主机,原始差值必须先标定才有意义;而 `QueryPerformanceCounter`
+已经是固定标定单位。测一段代码"花了多久"的检查,第一反应是 QPC。
+
+三类计时器形态不同,所以 stub 也不同：
+
+| 计时器 | 返回方式 | stub 做什么 |
+|---|---|---|
+| `QueryPerformanceCounter` | 通过**指针**参数写出 | 写内存,不是寄存器 |
+| `GetTickCount64` / `GetTickCount` | 返回值在 rax/eax | 让两次调用返回同一个数 |
+| `QueryPerformanceFrequency` | 返回值 | **故意不动** |
+
+共同目标：让被测量区间的计数器"不前进",于是每个 delta 读出来都是 0 —— 这是最紧的
+答案,也是快机器会给出的答案。
+
+`QueryPerformanceFrequency` 故意不桩：它定义了 QPC 差值的单位,改它会让目标算出的
+每个时长按这个比例失真,那是比计数器停住**更响**的信号。
+
+### 实测踩到的四个坑
+
+1. **`kernel32.GetTickCount64` 不是转发。** 本机实测它是独立实现
+   (`8B 0C 25 04 00 FE 7F` 直接读 `KUSER_SHARED_DATA`),不走 kernelbase。
+   只桩 kernelbase 时,程序 import 的是 kernel32,调用**完全没被碰到**——hook 装上、
+   verify 通过、delta 一点没变。现在遍历**所有**导出该名字且地址不同的模块分别安装。
+
+2. **种子必须写在代码之后。** 生成的 stub 末尾就是 8 字节数据槽,生成器用 0 填充。
+   先写种子再写代码,代码会把种子清零,于是冻结的时钟返回 0 —— 而所有报告都写着
+   "installed, verified"。现在先写代码、再写种子、再读回校验。
+
+3. **冻结值不能是 0。** 开机后时钟读数恰好为 0 本身就是指纹,而且看起来像 hook 坏了
+   (正是这样发现的)。但 x64dbg 的表达式引擎**不调用目标内的函数**,暂停时
+   `eval_expression("GetTickCount64()")` 返回 0,所以读不到真值。最终用由桩地址推导
+   出的非零常量：会话内稳定、每个计时器不同、看起来很单调。
+
+4. **`mov rax,[rip+disp32]` 的位移基准。** RIP 指向**下一条**指令。算错基准会让 load
+   读取自己后面几个字节(新分配页里就是 0),计数器永远返回 0 而 hook 显示一切正常。
+   现在位移由指令起止位置计算,不再手数。
+
+实测（`plugin/test/timetest.cpp`,目标自报）：
+
+```
+加桩前:  QPC delta=39    tick64 delta=63  tick32 delta=62   全部 DETECTED
+加桩后:  QPC delta=0     tick64 delta=0   tick32 delta=0    全部 clean
+```
+
+---
+
+## 8. ntdll 覆盖面扩展（2.6.0 新增）
+
+原来只支持 `NtQueryInformationProcess`。现在加了三类常见 oracle,**参数寄存器位置不同**：
+
+| 函数 | class 寄存器 | buffer 寄存器 | 拦截的 class |
+|---|---|---|---|
+| `NtQueryInformationProcess` | rdx | r8 | 7 / 0x1E / 0x1F |
+| `NtQueryObject` | rdx | r8 | 1（ObjectTypeInformation）|
+| `NtQuerySystemInformation` | **rcx** | **rdx** | 0x23（内核调试器状态）|
+| `NtSetInformationThread` | rdx | r8 | 0x11（ThreadHideFromDebugger）|
+
+`NtQuerySystemInformation` 是特殊的：它没有 handle 参数,所有参数左移一个寄存器。
+把寄存器搞错是**静默失败**——桩比较了错的寄存器、从不匹配、落到默认分支,现象和
+"hook 没装上"一模一样。
+
+实测（`plugin/test/nttest.cpp`）：
+
+```
+未 hook: NtQueryObject status=0x00000000   (成功,泄露对象类型)
+hook 后: NtQueryObject status=0xC000000D   (拒绝)
+未 hook: NtQuerySystemInformation(0x23) present=0 notpresent=1
+hook 后: NtQuerySystemInformation(0x23) present=0 notpresent=0
+```
+
+`NtSetInformationThread(ThreadHideFromDebugger)` 一旦被目标成功调用,当前线程会对
+调试器隐身——那会直接毁掉会话,所以它的 stub 是**返回成功但不执行**。
+
+---
+
+## 9. 扫描性能（2.6.0 新增）
+
+`probe_scan` 原来对每个字节前缀匹配都调一次 `DbgDisasmAt`。在几百 MB 的保护段上这是
+几十万次跨进程调用——恰好在这个功能最有用的目标上不可用。
+
+现在分两趟：先在缓冲区里收全部原始前缀匹配(纯内存操作,零 API 调用),按地址排序,
+**每个地址只反汇编一次**,这一次同时服务所有在该地址命中的探针。重叠前缀很常见
+(`0F 01` 同时是 sidt/sgdt/smsw 的前缀),所以这一趟直接消掉很大比例的调用。
+
+响应里新增 `disasm_calls`,可以对比命中数看实际节省。
+
 复现命令：
 
 ```powershell

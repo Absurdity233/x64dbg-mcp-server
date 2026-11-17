@@ -244,36 +244,25 @@ nlohmann::json apply(c_bridge_executor& bridge, level lvl, bool all_threads,
     };
 
     if (lvl == level::paranoid) {
-        // The ntdll stubs are what actually defeat the ProcessDebugPort family.
-        // Build the request from the caller's function list (or the default set
-        // when empty).
-        std::vector<ntdll_hook::target_spec> specs;
+        // The ntdll stubs are what actually defeat the ProcessDebugPort family and
+        // the debug-object / kernel-debugger queries.
+        //
+        // The class table and the per-function register conventions come from
+        // ntdll_hook::install_defaults(), the same entry point the explicit
+        // hook_ntdll route uses. Keeping one table matters: two copies of "which
+        // class number, in which register" is how you get a hook that installs and
+        // never matches.
+        const std::vector<std::string> wanted = hooks.empty()
+            ? std::vector<std::string>{"NtQueryInformationProcess", "NtQueryObject",
+                                       "NtQuerySystemInformation"}
+            : hooks;
 
-        auto add = [&](const char* fn, unsigned long cls, ntdll_hook::action a) {
-            if (!hooks.empty() &&
-                std::find(hooks.begin(), hooks.end(), fn) == hooks.end()) {
-                return;
-            }
-            specs.push_back({fn, cls, a});
-        };
-
-        // ProcessDebugPort (7) -> write a zero, succeed: the check reads the
-        // buffer, so both halves matter.
-        add("NtQueryInformationProcess", 7, ntdll_hook::action::fake_zero_success);
-        // ProcessDebugFlags (0x1F) -> success without touching the buffer; the
-        // value is the inverse of the debug port, so a zero already means "no".
-        add("NtQueryInformationProcess", 0x1F, ntdll_hook::action::return_success);
-        // ProcessDebugObjectHandle (0x1E) -> zero the handle, succeed.
-        add("NtQueryInformationProcess", 0x1E, ntdll_hook::action::fake_zero_success);
-
-        if (!specs.empty()) {
-            if (!paused) {
-                out["hooks"] = {{"ok", false},
-                                {"error", "ntdll stubs need a paused target; pause and re-run "
-                                          "harden at level=paranoid"}};
-            } else {
-                out["hooks"] = ntdll_hook::install(specs, false);
-            }
+        if (!paused) {
+            out["hooks"] = {{"ok", false},
+                            {"error", "ntdll stubs need a paused target; pause and re-run "
+                                      "harden at level=paranoid"}};
+        } else {
+            out["hooks"] = ntdll_hook::install_defaults(wanted, false);
         }
 
         // The kernel component, when the driver is loaded: this is the only way

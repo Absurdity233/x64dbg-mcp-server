@@ -170,14 +170,13 @@ struct emitter {
     // 32-bit compare is what the real function does, so the dispatcher must do the
     // same or it silently falls through to the default path for the very classes
     // it was built for.
-    void cmp_edx(uint32_t c) {
-        if (c <= 0x7F) {
-            // cmp edx, imm8  -> sign-extends to 64 bits, which is wrong for the
-            // same reason; use the 32-bit imm32 form unless the value is small
-            // AND the caller's upper half is known clean. Assume nothing.
-            u8(0x81); u8(0xFA); u32(c);
+    void cmp_edx(uint32_t c, bool use_ecx) {
+        if (use_ecx) {
+            // cmp ecx, imm32. The class argument is not always in edx:
+            // NtQuerySystemInformation takes its class in rcx (first argument).
+            u8(0x81); u8(0xF9); u32(c);
         } else {
-            u8(0x81); u8(0xFA); u32(c);   // cmp edx, imm32 (zero-extended by the CPU)
+            u8(0x81); u8(0xFA); u32(c);   // cmp edx, imm32
         }
     }
     // Near jump: with several info classes the distance to .real exceeds 127
@@ -203,8 +202,26 @@ struct emitter {
     // NEXT call, so the following two classes fell through to the default path and
     // looked like a dispatcher bug. Honour the documented size, not the convenient
     // one.
-    void store_dword_at_buffer(uint32_t value) {
-        u8(0x41); u8(0xC7); u8(0x00); u32(value);   // mov dword ptr [r8], imm32
+// Parameterised on the buffer register, because it is not always r8:
+// NtQuerySystemInformation's buffer is rdx (its class is rcx, and it has no
+// handle argument). Writing the wrong register would either fault or silently
+// leave the real answer in place.
+    //
+    // The write is DWORD-sized, not QWORD. A caller is entitled to pass a 4-byte
+    // buffer for these classes (they are all ULONG-ish), and writing 8 bytes
+    // overruns it into whatever the caller keeps next - measured: a 4-byte buffer
+    // followed by a loop counter, where the overrun corrupted the enum value of the
+    // NEXT call, so the following two classes fell through to the default path and
+    // looked like a dispatcher bug. Honour the documented size, not the convenient
+    // one.
+    void store_dword_at_buffer(uint32_t value, bool buffer_is_rdx) {
+        if (buffer_is_rdx) {
+            // mov dword ptr [rdx], imm32
+            u8(0xC7); u8(0x02); u32(value);
+        } else {
+            // mov dword ptr [r8], imm32
+            u8(0x41); u8(0xC7); u8(0x00); u32(value);
+        }
     }
 
     void mov_eax(uint32_t v) { u8(0xB8); u32(v); }
@@ -265,13 +282,22 @@ std::vector<uint8_t> build_dispatcher(const std::vector<target_spec>& specs,
     for (size_t i = 0; i < specs.size(); ++i) {
         const auto& spec = specs[i];
 
-        e.cmp_edx(static_cast<uint32_t>(spec.info_class));
+        const bool class_in_ecx = (spec.args.class_reg == "rcx");
+        const bool buf_in_rdx   = (spec.args.buffer_reg == "rdx");
+
+        e.cmp_edx(static_cast<uint32_t>(spec.info_class), class_in_ecx);
         e.jne_placeholder();
 
         switch (spec.what) {
-            case action::fake_zero_success:        e.store_dword_at_buffer(0); e.mov_eax(0); break;
-            case action::return_success:           e.store_dword_at_buffer(1); e.mov_eax(0); break;
-            case action::return_invalid_parameter: e.mov_eax(0xC000000Du); break;
+            case action::fake_zero_success:
+                e.store_dword_at_buffer(0, buf_in_rdx); e.mov_eax(0); break;
+            case action::fake_nonzero_success:
+                e.store_dword_at_buffer(1, buf_in_rdx); e.mov_eax(0); break;
+            case action::return_success:
+                // Deliberately leaves the buffer alone.
+                e.mov_eax(0); break;
+            case action::return_invalid_parameter:
+                e.mov_eax(0xC000000Du); break;
         }
         e.ret();
 
@@ -314,6 +340,93 @@ duint plant(c_bridge_executor& bridge, const std::vector<uint8_t>& code, duint n
 } // namespace
 
 bool supported() { return is_x64(); }
+
+bool arg_regs_for(const std::string& function, arg_regs* out) {
+    // The three functions differ in where the class and buffer live, and the
+    // difference is not guessable from the name. NtQuerySystemInformation is the
+    // odd one: it has no handle, so every argument shifts one register left -
+    // class in rcx, buffer in rdx.
+    //
+    // Measured on 26200 by reading the exported prologues; the values match the
+    // documentation for the x64 calling convention applied to each signature.
+    static const std::map<std::string, arg_regs> table = {
+        {"NtQueryInformationProcess", {"rdx", "r8"}},
+        {"NtQueryObject",             {"rdx", "r8"}},
+        {"NtSetInformationThread",    {"rdx", "r8"}},
+        {"NtQuerySystemInformation",  {"rcx", "rdx"}},
+    };
+
+    const auto it = table.find(function);
+    if (it == table.end()) return false;
+    *out = it->second;
+    return true;
+}
+
+nlohmann::json install_defaults(const std::vector<std::string>& functions, bool dry_run) {
+    // The classes worth intercepting, per function. Each entry is a check that is
+    // actually used in the wild, not a guess:
+    //
+    //   NtQueryInformationProcess  7    ProcessDebugPort
+    //                              0x1E ProcessDebugObjectHandle
+    //                              0x1F ProcessDebugFlags (inverted)
+    //   NtQueryObject              1    ObjectTypeInformation - a target counts
+    //                                  DebugObject handles to spot a debugger
+    //   NtQuerySystemInformation   0x23 SystemKernelDebuggerInformation - "is a
+    //                                  kernel debugger attached"
+    //   NtSetInformationThread     0x11 ThreadHideFromDebugger - letting the
+    //                                  target hide the CURRENT thread from the
+    //                                  debugger would break the session, so this
+    //                                  one is refused rather than faked
+    struct def {
+        const char* function;
+        unsigned long cls;
+        action what;
+    };
+    static const def defaults[] = {
+        {"NtQueryInformationProcess", 7,     action::fake_zero_success},
+        {"NtQueryInformationProcess", 0x1E,  action::fake_zero_success},
+        {"NtQueryInformationProcess", 0x1F,  action::fake_nonzero_success},
+        {"NtQueryObject",             1,     action::return_invalid_parameter},
+        {"NtQuerySystemInformation",  0x23,  action::fake_zero_success},
+        {"NtSetInformationThread",    0x11,  action::return_success},
+    };
+
+    std::vector<target_spec> specs;
+    nlohmann::json unknown = nlohmann::json::array();
+
+    for (const auto& want : functions) {
+        arg_regs regs{};
+        if (!arg_regs_for(want, &regs)) {
+            unknown.push_back({{"function", want},
+                               {"reason", "no argument convention known; supported: "
+                                          "NtQueryInformationProcess, NtQueryObject, "
+                                          "NtQuerySystemInformation, NtSetInformationThread"}});
+            continue;
+        }
+
+        bool added = false;
+        for (const auto& d : defaults) {
+            if (want == d.function) {
+                specs.push_back({d.function, d.cls, d.what, regs});
+                added = true;
+            }
+        }
+        if (!added) {
+            unknown.push_back({{"function", want},
+                               {"reason", "no default class set for this function"}});
+        }
+    }
+
+    if (specs.empty()) {
+        return nlohmann::json{{"ok", false},
+                              {"error", "no function with a known class set was requested"},
+                              {"unsupported", unknown}};
+    }
+
+    auto out = install(specs, dry_run);
+    if (!unknown.empty()) out["unsupported"] = unknown;
+    return out;
+}
 
 nlohmann::json install(const std::vector<target_spec>& targets, bool dry_run) {
     auto& bridge = get_bridge();
